@@ -100,6 +100,17 @@ int main(void)
   HAL_Init();
   SystemClock_Config();
 
+#if BOARD_YARDFORCE500B_LFP
+  /* CLOUDY: free PB3 from SWD TRACESWO so it can drive the soft-I2C SCL (the J18 IMU bus).
+   * openocd enables SWO trace at flash time (sets DBGMCU_CR.TRACE_IOEN), which hands PB3 to
+   * the trace controller and overrides its open-drain GPIO use as the I2C clock - so the
+   * MPU6050 never gets clocked, fails detection, and reads blank/NaN. DBGMCU is reset only
+   * by a power-on reset, so that state survives every warm reset / NVIC reboot (this is why
+   * the IMU appeared to "need a full power-cycle"). Clearing TRACE_IOEN reclaims PB3 on
+   * every boot, before SW_I2C_Init runs. */
+  DBGMCU->CR &= ~DBGMCU_CR_TRACE_IOEN;
+#endif
+
 #if BOARD_YARDFORCE500_VARIANT_ORIG
   __HAL_RCC_AFIO_CLK_ENABLE();
   __HAL_RCC_PWR_CLK_ENABLE();

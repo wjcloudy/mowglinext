@@ -14,6 +14,7 @@
  * Includes
  *******************************************************************************/
 #include "main.h"
+#include "board.h"
 #include "perimeter.h"
 #include "adc.h"
 #include <math.h>
@@ -320,11 +321,21 @@ void ADC_input(void)
 
     /* battery volatge calculation */
     l_fTmp = ((float)raw_battery / 4095.0f) * 3.3f * 10.09 + 0.6f;
+#if BOARD_YARDFORCE500B_LFP
+    //CLOUDY heavier IIR smoothing so a load-induced spike can't trip the CC<->CV logic
+    battery_voltage = V_BATT_SMOOTH_ALPHA * l_fTmp + (1.0f - V_BATT_SMOOTH_ALPHA) * battery_voltage;
+#else
     battery_voltage = 0.2 * l_fTmp + 0.8 * battery_voltage;
+#endif
 
      /*charger voltage calculation */
     l_fTmp = ((float)raw_charger / 4095.0f) * 3.3f * 16;
+#if BOARD_YARDFORCE500B_LFP
+    //CLOUDY the PWM-switched charge rail is the noisiest signal - smooth it hard
+    charge_voltage = V_CHARGE_SMOOTH_ALPHA * l_fTmp + (1.0f - V_CHARGE_SMOOTH_ALPHA) * charge_voltage;
+#else
     charge_voltage = 0.8 * l_fTmp + 0.2 * charge_voltage;
+#endif
 
     /*charge current calculation */
     l_fTmp = (((float)raw_current / 4095.0f) * 3.3f - 2.5f) * 100 / 12.0;

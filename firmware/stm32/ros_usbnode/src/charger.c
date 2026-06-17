@@ -49,6 +49,9 @@ uint8_t  chargecontrol_is_charging  = 0;
 
 static CHARGER_STATE_e charger_state = CHARGER_STATE_IDLE;
 static float charge_end_voltage=BAT_CHARGE_CUTOFF_VOLTAGE ;
+#if BOARD_YARDFORCE500B_LFP
+static uint16_t cv_entry_debounce = 0; //CLOUDY consecutive CC cycles with battery_voltage >= trip
+#endif
 
 /******************************************************************************
  * Function Prototypes
@@ -239,8 +242,19 @@ void ChargeController(void)
             }
         }
 
-        //CLOUDY switch to CV on the actual battery voltage (not the charge-rail voltage)
-        if(battery_voltage >= charge_end_voltage) {
+        //CLOUDY switch to CV on the actual battery voltage (not the charge-rail voltage),
+        //but DEBOUNCE it. LFP's IR drop at high charge current lifts the terminal voltage
+        //~1.5 V above the resting/SoC voltage, so a transient trip must not latch CV while
+        //the pack is only part full. Require the trip to hold CV_ENTRY_DEBOUNCE_CYCLES.
+        if (battery_voltage >= charge_end_voltage) {
+            if (cv_entry_debounce < CV_ENTRY_DEBOUNCE_CYCLES) {
+                cv_entry_debounce++;
+            }
+        } else {
+            cv_entry_debounce = 0;
+        }
+        if (cv_entry_debounce >= CV_ENTRY_DEBOUNCE_CYCLES) {
+            cv_entry_debounce = 0;
             charger_state = CHARGER_STATE_CHARGING_CV;
         }
 #else
@@ -264,6 +278,17 @@ void ChargeController(void)
     case CHARGER_STATE_CHARGING_CV:
 #if BOARD_YARDFORCE500B_LFP
     {
+        //CLOUDY CV->CC fallback. If the (heavily smoothed) pack voltage has sagged well
+        //below the CV trip, we latched CV early on a load-induced spike while the pack was
+        //not actually full - resume bulk CC instead of floating at FLOAT_CV_CURRENT forever.
+        //CC re-entry is debounced (CV_ENTRY_DEBOUNCE_CYCLES) so this won't thrash; raise
+        //CV_EXIT_HYSTERESIS if you see top-of-charge hunting.
+        if (battery_voltage < (charge_end_voltage - CV_EXIT_HYSTERESIS))
+        {
+            charger_state = CHARGER_STATE_CHARGING_CC;
+        }
+        else
+        {
         //CLOUDY hold an LFP-friendly float voltage that never exceeds the runtime target.
         //(LFP must not be held at a high CV like Li-ion; float a little lower.)
         float cv_target = (charge_end_voltage < MAX_FLOAT_CV_VOLTAGE) ? charge_end_voltage : MAX_FLOAT_CV_VOLTAGE;
@@ -292,6 +317,7 @@ void ChargeController(void)
           /*consider as the battery full */
           ampere_acc.f = BATTERY_CAPACITY;
           SOC = 100;
+        }
         }
     }
 #else
