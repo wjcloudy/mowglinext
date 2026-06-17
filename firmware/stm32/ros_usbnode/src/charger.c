@@ -187,9 +187,25 @@ void ChargeController(void)
   static uint32_t timestamp = 0;
 
   /*charger disconnected force idle state*/
+#if BOARD_YARDFORCE500B_LFP
+  /* CLOUDY: debounce the undock detection. A CC current overshoot (or a noisy charger-input
+     reading) can momentarily sag chargerInputVoltage below MIN_DOCKED_VOLTAGE; without a
+     debounce that instantly forces IDLE -> PWM 0 -> CONNECTED re-cal, breaking the charge for
+     no reason. Require the input to stay low for UNDOCK_DEBOUNCE_CYCLES before declaring it. */
+  static uint16_t undock_debounce = 0;
+  if (chargerInputVoltage < MIN_DOCKED_VOLTAGE) {
+    if (undock_debounce < UNDOCK_DEBOUNCE_CYCLES) undock_debounce++;
+  } else {
+    undock_debounce = 0;
+  }
+  if (undock_debounce >= UNDOCK_DEBOUNCE_CYCLES) {
+    charger_state = CHARGER_STATE_IDLE;
+  }
+#else
   if(( chargerInputVoltage < MIN_DOCKED_VOLTAGE) ){
     charger_state = CHARGER_STATE_IDLE;
   }
+#endif
     
     switch (charger_state)
     {
@@ -220,26 +236,21 @@ void ChargeController(void)
 
     case CHARGER_STATE_CHARGING_CC:
 #if BOARD_YARDFORCE500B_LFP
-        // cap charge current at MAX_CHARGE_CURRENT
-        if ((battery_voltage > charge_end_voltage && (chargecontrol_pwm_val > 0)) || ((current > MAX_CHARGE_CURRENT) && (chargecontrol_pwm_val > MIN_PWM_VALUE)))
+        // CLOUDY single-step CC regulation toward MAX_CHARGE_CURRENT, with a +/-0.1A current
+        // deadband. The previous +/-2 "fast" step overshot on the LFP's low ESR (a small duty
+        // change makes the current jump), and that current spike sagged the charger input
+        // enough to trip the undock detection -> PWM 0. Single steps ramp gently with no
+        // overshoot. The decrement is floored at MIN_PWM_VALUE so CC never drives PWM to zero -
+        // it ramps down to the floor and hands off to CV / IDLE rather than slamming off.
+        if (((current > (MAX_CHARGE_CURRENT + 0.1f)) || (battery_voltage > charge_end_voltage))
+            && (chargecontrol_pwm_val > MIN_PWM_VALUE))
         {
-            //CLOUDY proportional step: 2 steps for a big current error, 1 for a small one
-            if ((current - MAX_CHARGE_CURRENT) > 0.4f) {
-                chargecontrol_pwm_val--;
-                chargecontrol_pwm_val--;
-            } else if ((current - MAX_CHARGE_CURRENT) > 0.1f) {
-                chargecontrol_pwm_val--;
-            }
+            chargecontrol_pwm_val--;
         }
-        if ((battery_voltage < charge_end_voltage) && (current < MAX_CHARGE_CURRENT) && (chargecontrol_pwm_val < MAX_PWM_VALUE))
+        if ((battery_voltage < charge_end_voltage) && (current < (MAX_CHARGE_CURRENT - 0.1f))
+            && (chargecontrol_pwm_val < MAX_PWM_VALUE))
         {
-            //CLOUDY proportional step (LFP's low ESR makes current jump quickly with duty)
-            if ((MAX_CHARGE_CURRENT - current) > 0.4f) {
-                chargecontrol_pwm_val++;
-                chargecontrol_pwm_val++;
-            } else if ((MAX_CHARGE_CURRENT - current) > 0.1f) {
-                chargecontrol_pwm_val++;
-            }
+            chargecontrol_pwm_val++;
         }
 
         //CLOUDY switch to CV on the actual battery voltage (not the charge-rail voltage),

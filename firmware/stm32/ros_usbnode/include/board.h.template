@@ -180,6 +180,10 @@ extern "C"
 #define V_CHARGE_SMOOTH_ALPHA 0.1f   /* ~90 ms time constant (rail is the noisiest) */
 // if charger-input voltage is greater than this assume we are docked [V]
 #define MIN_DOCKED_VOLTAGE 22.0f
+/// CLOUDY: ChargeController cycles (~10ms each) the charger input must stay below
+/// MIN_DOCKED_VOLTAGE before we declare "undocked" and drop to IDLE (PWM 0). Debounced so a
+/// transient input sag (e.g. a CC current overshoot, or a noisy reading) can't drop PWM to 0.
+#define UNDOCK_DEBOUNCE_CYCLES 20
 // if voltage is lower this assume battery is disconnected [V]
 #define MIN_BATTERY_VOLTAGE 5.0f
 
