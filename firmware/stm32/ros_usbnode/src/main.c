@@ -888,6 +888,33 @@ void chirp(uint8_t count)
   }
 }
 
+#if DEBUG_TYPE == DEBUG_TYPE_SWO
+/*
+ * CLOUDY: bounded SWO/ITM character send.
+ * Stock CMSIS ITM_SendChar() busy-waits forever on ITM->PORT[0] when ITM is left
+ * enabled (a debugger/openocd set ITM_TCR.ITMENA + TER) but nothing drains the SWO
+ * FIFO - which a clone ST-Link cannot. That hangs the firmware on the very first
+ * DB_TRACE at boot until a power cycle clears ITM. Cap the wait so a stuck/undrained
+ * FIFO drops the character instead of dead-locking the MCU. When a debugger IS
+ * draining SWO the FIFO frees almost immediately, so normal SWO tracing still works.
+ */
+static void itm_send_char_safe(uint8_t ch)
+{
+  if (((ITM->TCR & ITM_TCR_ITMENA_Msk) != 0UL) && ((ITM->TER & 1UL) != 0UL))
+  {
+    uint32_t guard = 100000U;
+    while ((ITM->PORT[0U].u32 == 0UL) && (--guard != 0U))
+    {
+      __NOP();
+    }
+    if (guard != 0U)
+    {
+      ITM->PORT[0U].u8 = ch;
+    }
+  }
+}
+#endif
+
 /*
  * Debug print via MASTER USART
  */
@@ -899,7 +926,7 @@ void vprint(const char *fmt, va_list argp)
 #if DEBUG_TYPE == DEBUG_TYPE_SWO
     for (int i = 0; i < strlen(string); i++)
     {
-      ITM_SendChar(string[i]);
+      itm_send_char_safe(string[i]);
     }
 #elif DEBUG_TYPE == DEBUG_TYPE_UART
 #if BOARD_YARDFORCE500_VARIANT_ORIG
