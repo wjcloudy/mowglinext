@@ -86,8 +86,14 @@ int32_t I2C_platform_read(void *handle, uint8_t reg, uint8_t *bufp, uint16_t len
 {
   /* Read multiple command */
   reg |= 0x80;
+#if BOARD_YARDFORCE500B_LFP
+  /* CLOUDY: propagate the I2C status so callers (e.g. the tilt INT read) can fail safe
+     instead of trusting a possibly-stale/uninitialised buffer after a NACK/timeout. */
+  return (HAL_I2C_Mem_Read(handle, LIS3DH_I2C_ADD_L, reg, I2C_MEMADD_SIZE_8BIT, bufp, len, 1000) == HAL_OK) ? 0 : -1;
+#else
   HAL_I2C_Mem_Read(handle, LIS3DH_I2C_ADD_L, reg, I2C_MEMADD_SIZE_8BIT, bufp, len, 1000);
   return 0;
+#endif
 }
 
 /*
@@ -195,10 +201,23 @@ uint8_t I2C_TestZLowINT(void)
     dev_ctx.read_reg = I2C_platform_read;
     dev_ctx.handle = &I2C_Handle;
 
-    lis3dh_int1_src_t int1_src;
-    lis3dh_int1_gen_source_get(&dev_ctx, &int1_src); 
-    
+#if BOARD_YARDFORCE500B_LFP
+    /* CLOUDY fail-safe: a flaky/absent onboard LIS3DH read must NEVER assert a phantom tilt.
+       Init the source struct and bail to "no tilt" if the I2C read errors. Otherwise an
+       uninitialised/garbage int1_src can latch a spurious TILT emergency on the dock (and,
+       since the emergency release is gated on the live sensors, briefly block its clearing).
+       A real tilt still asserts normally - this only suppresses bad/failed reads. */
+    lis3dh_int1_src_t int1_src = {0};
+    if (lis3dh_int1_gen_source_get(&dev_ctx, &int1_src) != 0) {
+        return 0;
+    }
     return(int1_src.zl && int1_src.ia);
+#else
+    lis3dh_int1_src_t int1_src;
+    lis3dh_int1_gen_source_get(&dev_ctx, &int1_src);
+
+    return(int1_src.zl && int1_src.ia);
+#endif
 }
 
 /*
