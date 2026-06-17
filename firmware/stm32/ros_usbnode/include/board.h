@@ -73,7 +73,11 @@ extern "C"
 #define WHEEL_BASE  0.325		// The distance between the center of the wheels in meters
 
 #define OPTION_ULTRASONIC 0
+#if BOARD_YARDFORCE500B_LFP
+#define OPTION_BUMPER 1 // CLOUDY LFP build: blue wheel-lift remapped as front bump sensor (gated on BOARD_YARDFORCE500B_LFP)
+#else
 #define OPTION_BUMPER 0
+#endif
 
 #define BOARD_HAS_MASTER_USART 0
 #elif defined(BOARD_LUV1000RI) // TODO: This currently can't be selected via platformio
@@ -95,6 +99,54 @@ extern "C"
 
 //#define I_DONT_NEED_MY_FINGERS              1      // disables EmergencyController() (no wheel lift, or tilt sensing and stopping the blade anymore)
 
+#if BOARD_YARDFORCE500B_LFP
+/* ===========================================================================
+ * CLOUDY LFP charging profile (transposed from the ROS1 500B mainboard build)
+ * Pack: 8S LiFePO4, ~4.8 Ah  (stock firmware targets 7S Li-ion, ~2.8 Ah).
+ * These are hard-coded (not GUI-config) so they survive both a direct
+ * platformio build AND a GUI re-render of this file from board.h.template.
+ * Keep board.h and board.h.template in sync.
+ * =========================================================================== */
+
+/// PWM safety ceiling (TIM1 period is 1400; stock cap was 1350).
+/// An 8S LFP at ~28.5V on the ~29-30V rail has little buck headroom, so it
+/// needs more duty to reach full current ("different charge-current/PWM curve").
+#define MAX_PWM_VALUE 1395
+/// PWM floor kept while still actively regulating (was the magic value 39)
+#define MIN_PWM_VALUE 39
+/// Fixed current-sensor offset [A]. Replaces auto-zeroing at dock, which is wrong
+/// here because the Pi/electronics still draw current at the assumed "zero" point.
+/// NOTE: re-measure on the actual hardware if the current reading looks biased.
+#define CURRENT_OFFSET -0.20f
+/// Usable pack capacity [Ah] for SOC coulomb counting (LFP voltage-based SOC is useless)
+#define BATTERY_CAPACITY 4.8f
+
+/// nominal max charge current [A] (~0.375C on a 4.8 Ah pack)
+#define MAX_CHARGE_CURRENT 1.8f
+/// Max charge-rail voltage allowed [V] (8S * 3.56 V/cell)
+#define MAX_CHARGE_VOLTAGE 28.5f
+/// CC->CV transition threshold [V] - kept for reference; the runtime
+/// charge_end_voltage actually drives the transition (default = cutoff below)
+#define LIMIT_VOLTAGE_150MA 28.5f
+/// Default max battery voltage [V] - initial value of the runtime charge_end_voltage
+#define BAT_CHARGE_CUTOFF_VOLTAGE 28.5f
+/// CV/float battery ceiling [V] (8S * 3.44 V/cell). Effective target = min(this, charge_end_voltage).
+#define MAX_FLOAT_CV_VOLTAGE 27.5f
+/// CV/float current limit [A] - fixed, replaces the stock MAX_CHARGE_CURRENT/10
+#define FLOAT_CV_CURRENT 0.30f
+/// We consider the battery full when CV current drops below this [A] (LFP has a flat tail)
+#define CHARGE_END_LIMIT_CURRENT 0.25f
+// if charger-input voltage is greater than this assume we are docked [V]
+#define MIN_DOCKED_VOLTAGE 22.0f
+// if voltage is lower this assume battery is disconnected [V]
+#define MIN_BATTERY_VOLTAGE 5.0f
+
+// if current is greater than this assume the battery is charging [A]
+#define MIN_CHARGE_CURRENT 0.1f
+#define LOW_BAT_THRESHOLD 24.0f /* 8S LFP ~3.0 V/cell */
+#define LOW_CRI_THRESHOLD 23.0f /* 8S LFP ~2.88 V/cell */
+#else
+/* ===== Stock 7S Li-ion charging profile (upstream defaults) ===== */
 /// nominal max charge current is 1.0 Amp
 #define MAX_CHARGE_CURRENT 1.0f
 /// Max voltage allowed
@@ -114,6 +166,7 @@ extern "C"
 #define MIN_CHARGE_CURRENT 0.1f
 #define LOW_BAT_THRESHOLD 25.2f /* near 20% SOC */
 #define LOW_CRI_THRESHOLD 23.5f /* near 0% SOC */
+#endif
 
 // Emergency sensor timeouts
 #define ONE_WHEEL_LIFT_EMERGENCY_MILLIS 2000
@@ -122,6 +175,19 @@ extern "C"
 #define STOP_BUTTON_EMERGENCY_MILLIS 100
 #define PLAY_BUTTON_CLEAR_EMERGENCY_MILLIS 2000
 #define IMU_ONBOARD_INCLINATION_THRESHOLD 0x38 // stock firmware uses 0x2C (way more allowed inclination)
+
+#if BOARD_YARDFORCE500B_LFP
+// --- CLOUDY bump sensor: blue wheel-lift input remapped as a front bump sensor ---
+// On this build Emergency_WheelLiftBlue() is disabled and HALLSTOP_Left/Right_Sense()
+// read the blue wheel-lift pin instead (only one physical bump sensor). The remap is
+// gated on BOARD_YARDFORCE500B_LFP directly in emergency.c / main.c / drivemotor.c.
+// TEMPORARY: this drives a low-level reverse reflex only (drivemotor.c). The ROS2
+// high level (Nav2 collision_monitor -> StuckBackoff) is meant to own obstacle
+// recovery; plan to remove the firmware reflex once lidar/costmap recovery is trusted.
+#define BUMP_MILLIS_WHILE_MOWING 100  // sustained-bump debounce while mowing [ms]
+#define BUMP_MILLIS_WHILE_DOCKING 500 // sustained-bump debounce while docking [ms]
+#define BUMP_REVERSE_MILLIS 1000      // how long to back off after a bump [ms] (was 2000; kept short on purpose)
+#endif
 
 // Enable Emergency debugging
 //#define EMERGENCY_DEBUG

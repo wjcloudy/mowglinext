@@ -446,7 +446,11 @@ void HALLSTOP_Sensor_Init()
 int HALLSTOP_Left_Sense(void)
 {
 #if OPTION_BUMPER == 1
+#if BOARD_YARDFORCE500B_LFP
+  return (HAL_GPIO_ReadPin(WHEEL_LIFT_BLUE_PORT, WHEEL_LIFT_BLUE_PIN)); //CLOUDY (LFP build) single bump sensor wired to the blue wheel-lift pin
+#else
   return (HAL_GPIO_ReadPin(HALLSTOP_PORT, GPIO_PIN_2));
+#endif
 #else
   return 0;
 #endif
@@ -459,7 +463,11 @@ int HALLSTOP_Left_Sense(void)
 int HALLSTOP_Right_Sense(void)
 {
 #if OPTION_BUMPER == 1
+#if BOARD_YARDFORCE500B_LFP
+  return (HAL_GPIO_ReadPin(WHEEL_LIFT_BLUE_PORT, WHEEL_LIFT_BLUE_PIN)); //CLOUDY (LFP build) single bump sensor wired to the blue wheel-lift pin
+#else
   return (HAL_GPIO_ReadPin(HALLSTOP_PORT, GPIO_PIN_3));
+#endif
 #else
   return 0;
 #endif
