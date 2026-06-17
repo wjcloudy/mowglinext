@@ -143,16 +143,21 @@ extern "C"
 /// while it is only part full (observed: stuck at ~0.3 A with the pack at 26.9 V).
 /// Number of ChargeController cycles (~10 ms each) the CC->CV trip must hold before latching.
 #define CV_ENTRY_DEBOUNCE_CYCLES 50
-/// CV->CC fallback: if the (smoothed) pack voltage sags this far below the CV trip while
-/// in CV, we latched early on a load spike - drop back to bulk CC. Raise to reduce
-/// top-of-charge hunting. [V]
-#define CV_EXIT_HYSTERESIS 1.0f
+/// CV->CC fallback: only drop back to bulk CC if the (smoothed) pack voltage sags this far
+/// below the CV trip - i.e. the pack is genuinely under-charged, NOT just floating. Must sit
+/// well below where a full LFP floats (~27.5-28V), else normal float ripple bounces CV<->CC
+/// and the pack hunts on its steep top-of-charge knee (observed 27.5<->28.7V at ~1Hz). [V]
+#define CV_EXIT_HYSTERESIS 2.0f
+/// CLOUDY CV voltage deadband: don't nudge PWM while within +/- this of the float target, so
+/// the CV loop stops limit-cycling around it (the LFP knee turns a tiny ripple into a big
+/// terminal-voltage swing). [V]
+#define CV_VOLTAGE_DEADBAND 0.2f
 /// CLOUDY ADC IIR smoothing weight on each NEW sample (~10 ms apart) for the voltages the
 /// charge loop acts on. Lower = more smoothing / more lag. The PWM-switched charge rail and
-/// the LFP pack's load-induced voltage swing are noisy, so smooth them harder than stock
-/// (battery was 0.2, charge rail was 0.8) to stop transient spikes tripping CC<->CV.
-#define V_BATT_SMOOTH_ALPHA   0.1f   /* ~90 ms time constant */
-#define V_CHARGE_SMOOTH_ALPHA 0.2f   /* ~40 ms time constant (rail is the noisiest) */
+/// the LFP pack's load-induced voltage swing are noisy, so smooth them hard (stock was
+/// battery 0.2, charge rail 0.8).
+#define V_BATT_SMOOTH_ALPHA   0.05f  /* ~190 ms time constant */
+#define V_CHARGE_SMOOTH_ALPHA 0.1f   /* ~90 ms time constant (rail is the noisiest) */
 // if charger-input voltage is greater than this assume we are docked [V]
 #define MIN_DOCKED_VOLTAGE 22.0f
 // if voltage is lower this assume battery is disconnected [V]

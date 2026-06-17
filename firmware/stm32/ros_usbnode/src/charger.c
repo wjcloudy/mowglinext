@@ -293,14 +293,18 @@ void ChargeController(void)
         //(LFP must not be held at a high CV like Li-ion; float a little lower.)
         float cv_target = (charge_end_voltage < MAX_FLOAT_CV_VOLTAGE) ? charge_end_voltage : MAX_FLOAT_CV_VOLTAGE;
 
-        if ((battery_voltage < cv_target) && (charge_voltage < (MAX_CHARGE_VOLTAGE)) && (chargecontrol_pwm_val < MAX_PWM_VALUE))
+        //CLOUDY deadband around cv_target (+/- CV_VOLTAGE_DEADBAND): don't step PWM while the
+        //pack is already near the float target. Without it the bang-bang nudges every cycle and
+        //limit-cycles - and on the LFP's steep top-of-charge knee a tiny ripple becomes a big
+        //terminal-voltage swing (observed 27.5<->28.7V at ~1Hz).
+        if ((battery_voltage < (cv_target - CV_VOLTAGE_DEADBAND)) && (charge_voltage < (MAX_CHARGE_VOLTAGE)) && (chargecontrol_pwm_val < MAX_PWM_VALUE))
         {
           //CLOUDY only push more current while we are below the float-current target
           if (current < FLOAT_CV_CURRENT) {
             chargecontrol_pwm_val++;
           }
         }
-        if ((battery_voltage > cv_target && (chargecontrol_pwm_val > MIN_PWM_VALUE)) || (charge_voltage > (MAX_CHARGE_VOLTAGE) && (chargecontrol_pwm_val > MIN_PWM_VALUE)))
+        if ((battery_voltage > (cv_target + CV_VOLTAGE_DEADBAND) && (chargecontrol_pwm_val > MIN_PWM_VALUE)) || (charge_voltage > (MAX_CHARGE_VOLTAGE) && (chargecontrol_pwm_val > MIN_PWM_VALUE)))
         {
           chargecontrol_pwm_val--;
         }
