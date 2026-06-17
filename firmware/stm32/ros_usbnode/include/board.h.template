@@ -153,6 +153,23 @@ extern "C"
 #define FLOAT_CV_CURRENT 0.30f
 /// We consider the battery full when CV current drops below this [A] (LFP has a flat tail)
 #define CHARGE_END_LIMIT_CURRENT 0.25f
+/// CLOUDY CC<->CV anti-latch. An 8S LFP has a very flat SoC curve and low ESR, so the
+/// terminal voltage under ~1.8 A charge current sits ~1.5 V above the resting/SoC voltage.
+/// Without these guards that loaded voltage trips CC->CV early and the one-way latch
+/// (charger_set_end_voltage is never called) floats the pack at FLOAT_CV_CURRENT forever
+/// while it is only part full (observed: stuck at ~0.3 A with the pack at 26.9 V).
+/// Number of ChargeController cycles (~10 ms each) the CC->CV trip must hold before latching.
+#define CV_ENTRY_DEBOUNCE_CYCLES 50
+/// CV->CC fallback: if the (smoothed) pack voltage sags this far below the CV trip while
+/// in CV, we latched early on a load spike - drop back to bulk CC. Raise to reduce
+/// top-of-charge hunting. [V]
+#define CV_EXIT_HYSTERESIS 1.0f
+/// CLOUDY ADC IIR smoothing weight on each NEW sample (~10 ms apart) for the voltages the
+/// charge loop acts on. Lower = more smoothing / more lag. The PWM-switched charge rail and
+/// the LFP pack's load-induced voltage swing are noisy, so smooth them harder than stock
+/// (battery was 0.2, charge rail was 0.8) to stop transient spikes tripping CC<->CV.
+#define V_BATT_SMOOTH_ALPHA   0.1f   /* ~90 ms time constant */
+#define V_CHARGE_SMOOTH_ALPHA 0.2f   /* ~40 ms time constant (rail is the noisiest) */
 // if charger-input voltage is greater than this assume we are docked [V]
 #define MIN_DOCKED_VOLTAGE 22.0f
 // if voltage is lower this assume battery is disconnected [V]

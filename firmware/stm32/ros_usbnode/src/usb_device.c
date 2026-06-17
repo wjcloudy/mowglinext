@@ -64,25 +64,29 @@ USBD_HandleTypeDef hUsbDeviceFS;
 void MX_USB_DEVICE_Init(void)
 {
   /* USER CODE BEGIN USB_DEVICE_Init_PreTreatment */
-#if !(BOARD_YARDFORCE500_VARIANT_B)
-  /* Rendering hardware reset harmless (no need to replug USB cable): */
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* Force a clean USB re-enumeration at every boot by holding USB_DP (PA12) low
+   * briefly before the USB core claims the pin. Without this, an SWD flash+reset
+   * doesn't present a long-enough disconnect to the host, so the CDC link stays
+   * stale until a physical power cycle. CLOUDY: enabled for the 500B too (was
+   * ORIG-only) so the mainboard no longer needs power-cycling after each flash. */
+  {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOA_CLK_ENABLE();
+    /* GPIO Ports Clock Enable */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
+    /*Configure GPIO pin Output Level */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : PA12, a.k.a. USB_DP */
-  GPIO_InitStruct.Pin = GPIO_PIN_12;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    /*Configure GPIO pin : PA12, a.k.a. USB_DP */
+    GPIO_InitStruct.Pin = GPIO_PIN_12;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  HAL_Delay(5);
-#endif
+    HAL_Delay(20); /* hold D+ low long enough for the host to register a disconnect */
+  }
   /* Hardware reset rendered harmless! */
 
   /* USER CODE END USB_DEVICE_Init_PreTreatment */
