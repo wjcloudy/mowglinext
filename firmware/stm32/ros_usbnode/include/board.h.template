@@ -212,7 +212,16 @@ extern "C"
 #define TILT_EMERGENCY_MILLIS {{.TiltEmergencyMillis}} // used for both the mechanical and accelerometer based detection
 #define STOP_BUTTON_EMERGENCY_MILLIS {{.StopButtonEmergencyMillis}}
 #define PLAY_BUTTON_CLEAR_EMERGENCY_MILLIS {{.PlayButtonClearEmergencyMillis}}
+#if BOARD_YARDFORCE500B_LFP
+// CLOUDY relaxed 0x38 (~26 deg, Z<0.896g) -> 0x2C (~45 deg, Z<0.704g, = stock). At 0x38 the
+// onboard LIS3DH Z-low tilt INT false-tripped at the board's resting/dock orientation (chassis
+// is level per the IMU, but the GForce board mounts at a slight tilt so its Z sat just under
+// 0.896g), latching a TILT emergency on the dock that the host's release couldn't clear.
+// 0x2C still protects against a real tip-over.
+#define IMU_ONBOARD_INCLINATION_THRESHOLD 0x2C
+#else
 #define IMU_ONBOARD_INCLINATION_THRESHOLD 0x38 // stock firmware uses 0x2C (way more allowed inclination)
+#endif
 
 #if BOARD_YARDFORCE500B_LFP
 // --- CLOUDY bump sensor: blue wheel-lift input remapped as a front bump sensor ---
