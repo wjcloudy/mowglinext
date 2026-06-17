@@ -132,8 +132,11 @@ extern "C"
 #define BAT_CHARGE_CUTOFF_VOLTAGE 28.5f
 /// CV/float battery ceiling [V] (8S * 3.44 V/cell). Effective target = min(this, charge_end_voltage).
 #define MAX_FLOAT_CV_VOLTAGE 27.5f
-/// CV/float current limit [A] - fixed, replaces the stock MAX_CHARGE_CURRENT/10
-#define FLOAT_CV_CURRENT 0.30f
+/// CV/float current limit [A] - fixed, replaces the stock MAX_CHARGE_CURRENT/10.
+/// CLOUDY raised 0.30 -> 0.40: 300mA couldn't cover the docked standby draw, so the pack
+/// sagged off the 27.5V float until the 26.5V CC fallback re-engaged (slow sawtooth). This is
+/// a cap; in CV the loop targets the float VOLTAGE and only draws what's needed to hold it.
+#define FLOAT_CV_CURRENT 0.40f
 /// We consider the battery full when CV current drops below this [A] (LFP has a flat tail)
 #define CHARGE_END_LIMIT_CURRENT 0.25f
 /// CLOUDY CC<->CV anti-latch. An 8S LFP has a very flat SoC curve and low ESR, so the
