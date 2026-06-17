@@ -120,6 +120,10 @@ int16_t left_wheel_speed_val = 0;
 uint8_t right_power = 0;
 uint8_t left_power = 0;
 
+#if BOARD_YARDFORCE500B_LFP
+static uint32_t bump_started = 0; //CLOUDY debounce timer for the (remapped) bump sensor
+#endif
+
 uint32_t DRIVEMOTOR_u32ErrorCnt = 0;
 
 static uint8_t left_speed_req;
@@ -273,6 +277,9 @@ void DRIVEMOTOR_App_10ms(void)
 {
 
     static uint32_t l_u32Timestamp = 0;
+#if BOARD_YARDFORCE500B_LFP
+    uint32_t now = HAL_GetTick(); //CLOUDY for bump debounce timing
+#endif
 
     switch (drivemotor_eState)
     {
@@ -297,6 +304,58 @@ void DRIVEMOTOR_App_10ms(void)
         }
 
         /* todo add also accelerometer detection*/
+#if BOARD_YARDFORCE500B_LFP
+        //CLOUDY low-level bump reflex (TEMPORARY): on contact, back off a short distance.
+        //This is a stop-gap. The ROS2 high level (Nav2 collision_monitor -> StuckBackoff in
+        //mowgli_behavior) is intended to own obstacle recovery, and the bump is NOT reported
+        //up to ROS2. TODO: remove this reflex once the lidar/costmap recovery path is trusted,
+        //so the firmware doesn't fight Nav2's cmd_vel. (We removed the bump-count->simulate-HOME
+        //escalation - the behavior tree's MarkSegmentBlocked/FailedCoverageDock owns that now.)
+        if ((HALLSTOP_Left_Sense() || HALLSTOP_Right_Sense()) && (left_dir_req || right_dir_req))
+        {
+            if (bump_started == 0)
+            {
+                bump_started = now; //CLOUDY start the bump debounce timer
+            }
+            switch (main_eOpenmowerStatus)
+            {
+            case OPENMOWER_STATUS_MOWING:
+                if (now - bump_started >= BUMP_MILLIS_WHILE_MOWING)
+                {
+                    /*hit something, back off a little */
+                    drivemotor_eState = DRIVEMOTOR_BACKWARD;
+                    l_u32Timestamp = HAL_GetTick();
+                }
+                break;
+            case OPENMOWER_STATUS_DOCKING:
+                /* Get voltage from dock, stop the mower*/
+                if (chargerInputVoltage > MIN_DOCKED_VOLTAGE)
+                {
+                    drivemotor_prepareMsg(0, 0, 0, 0);
+                }
+                else
+                { /*hit something, back off a little */
+                    if (now - bump_started >= BUMP_MILLIS_WHILE_DOCKING)
+                    {
+                        drivemotor_eState = DRIVEMOTOR_BACKWARD;
+                        l_u32Timestamp = HAL_GetTick();
+                    }
+                }
+
+                break;
+            case OPENMOWER_STATUS_UNDOCKING:
+            case OPENMOWER_STATUS_IDLE:
+            case OPENMOWER_STATUS_RECORD:
+            default:
+                /* nothing to do in these modes*/
+                break;
+            }
+        }
+        else
+        {
+            bump_started = 0; //CLOUDY bump cleared: reset the debounce so it triggers on every fresh bump
+        }
+#else
         if ((HALLSTOP_Left_Sense() || HALLSTOP_Right_Sense()) && (left_dir_req || right_dir_req))
         {
 
@@ -328,6 +387,7 @@ void DRIVEMOTOR_App_10ms(void)
                 break;
             }
         }
+#endif
 
         HAL_UART_Transmit_DMA(&DRIVEMOTORS_USART_Handler, (uint8_t *)drivemotor_pu8RqstMessage, DRIVEMOTOR_LENGTH_RQST_MSG);
 
@@ -339,7 +399,11 @@ void DRIVEMOTOR_App_10ms(void)
         drivemotor_prepareMsg(100, 100, 0, 0); /* set to -0.33m/s  */
         HAL_UART_Transmit_DMA(&DRIVEMOTORS_USART_Handler, (uint8_t *)drivemotor_pu8RqstMessage, DRIVEMOTOR_LENGTH_RQST_MSG);
 
+#if BOARD_YARDFORCE500B_LFP
+        if ((HAL_GetTick() - l_u32Timestamp) > BUMP_REVERSE_MILLIS) //CLOUDY shorter back-off on bump (was 2000ms)
+#else
         if ((HAL_GetTick() - l_u32Timestamp) > 2000)
+#endif
         {
             drivemotor_eState = DRIVEMOTOR_WAIT;
             l_u32Timestamp = HAL_GetTick();

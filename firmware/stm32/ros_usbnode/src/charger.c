@@ -197,7 +197,13 @@ void ChargeController(void)
 
         /* wait 100ms to read current */
         if( (HAL_GetTick() - timestamp) > 100){
+#if BOARD_YARDFORCE500B_LFP
+          //CLOUDY use a fixed hardware offset instead of auto-zeroing at dock:
+          //the Pi/electronics still draw current at the "zero" point, so auto-cal is wrong here.
+          charge_current_offset.f = CURRENT_OFFSET;
+#else
           charge_current_offset.f = current_without_offset;
+#endif
           // Writes a data in a RTC Backup data Register 3&4
           HAL_PWR_EnableBkUpAccess();
           HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR3, charge_current_offset.u[0]);    
@@ -210,6 +216,34 @@ void ChargeController(void)
         break;
 
     case CHARGER_STATE_CHARGING_CC:
+#if BOARD_YARDFORCE500B_LFP
+        // cap charge current at MAX_CHARGE_CURRENT
+        if ((battery_voltage > charge_end_voltage && (chargecontrol_pwm_val > 0)) || ((current > MAX_CHARGE_CURRENT) && (chargecontrol_pwm_val > MIN_PWM_VALUE)))
+        {
+            //CLOUDY proportional step: 2 steps for a big current error, 1 for a small one
+            if ((current - MAX_CHARGE_CURRENT) > 0.4f) {
+                chargecontrol_pwm_val--;
+                chargecontrol_pwm_val--;
+            } else if ((current - MAX_CHARGE_CURRENT) > 0.1f) {
+                chargecontrol_pwm_val--;
+            }
+        }
+        if ((battery_voltage < charge_end_voltage) && (current < MAX_CHARGE_CURRENT) && (chargecontrol_pwm_val < MAX_PWM_VALUE))
+        {
+            //CLOUDY proportional step (LFP's low ESR makes current jump quickly with duty)
+            if ((MAX_CHARGE_CURRENT - current) > 0.4f) {
+                chargecontrol_pwm_val++;
+                chargecontrol_pwm_val++;
+            } else if ((MAX_CHARGE_CURRENT - current) > 0.1f) {
+                chargecontrol_pwm_val++;
+            }
+        }
+
+        //CLOUDY switch to CV on the actual battery voltage (not the charge-rail voltage)
+        if(battery_voltage >= charge_end_voltage) {
+            charger_state = CHARGER_STATE_CHARGING_CV;
+        }
+#else
         // cap charge current at 1.5 Amps
         if ((battery_voltage > charge_end_voltage && (chargecontrol_pwm_val > 0)) || ((current > MAX_CHARGE_CURRENT) && (chargecontrol_pwm_val > 39)))
         {
@@ -223,15 +257,49 @@ void ChargeController(void)
         if(charge_voltage >= charge_end_voltage) {
             charger_state = CHARGER_STATE_CHARGING_CV;
         }
+#endif
 
         break;
 
     case CHARGER_STATE_CHARGING_CV:
+#if BOARD_YARDFORCE500B_LFP
+    {
+        //CLOUDY hold an LFP-friendly float voltage that never exceeds the runtime target.
+        //(LFP must not be held at a high CV like Li-ion; float a little lower.)
+        float cv_target = (charge_end_voltage < MAX_FLOAT_CV_VOLTAGE) ? charge_end_voltage : MAX_FLOAT_CV_VOLTAGE;
+
+        if ((battery_voltage < cv_target) && (charge_voltage < (MAX_CHARGE_VOLTAGE)) && (chargecontrol_pwm_val < MAX_PWM_VALUE))
+        {
+          //CLOUDY only push more current while we are below the float-current target
+          if (current < FLOAT_CV_CURRENT) {
+            chargecontrol_pwm_val++;
+          }
+        }
+        if ((battery_voltage > cv_target && (chargecontrol_pwm_val > MIN_PWM_VALUE)) || (charge_voltage > (MAX_CHARGE_VOLTAGE) && (chargecontrol_pwm_val > MIN_PWM_VALUE)))
+        {
+          chargecontrol_pwm_val--;
+        }
+
+        //CLOUDY fixed float/CV current limit (was MAX_CHARGE_CURRENT/10), floored at MIN_PWM_VALUE
+        if ((current > FLOAT_CV_CURRENT) && chargecontrol_pwm_val > MIN_PWM_VALUE)
+        {
+            chargecontrol_pwm_val--;
+        }
+
+        /* battery full ? */
+        if (current < CHARGE_END_LIMIT_CURRENT) {
+          //charger_state = CHARGER_STATE_END_CHARGING;
+          /*consider as the battery full */
+          ampere_acc.f = BATTERY_CAPACITY;
+          SOC = 100;
+        }
+    }
+#else
         // set PWM to approach 29.4V  charge voltage
         if ((battery_voltage < charge_end_voltage) && (charge_voltage < (MAX_CHARGE_VOLTAGE)) && (chargecontrol_pwm_val < 1350))
         {
           chargecontrol_pwm_val++;
-        }            
+        }
         if ((battery_voltage > charge_end_voltage && (chargecontrol_pwm_val > 0)) || (charge_voltage > (MAX_CHARGE_VOLTAGE) && (chargecontrol_pwm_val > 39)))
         {
           chargecontrol_pwm_val--;
@@ -250,6 +318,7 @@ void ChargeController(void)
           ampere_acc.f = 2.8;
           SOC = 100;
         }
+#endif
 
         break;
 
@@ -263,7 +332,11 @@ void ChargeController(void)
     case CHARGER_STATE_IDLE:
     default:
        
+#if BOARD_YARDFORCE500B_LFP
+        if (chargerInputVoltage >= MIN_DOCKED_VOLTAGE ) { //CLOUDY was hard-coded 30.0 (could miss a docked 8S LFP)
+#else
         if (chargerInputVoltage >= 30.0 ) {
+#endif
             charger_state = CHARGER_STATE_CONNECTED;
             HAL_GPIO_WritePin(TF4_GPIO_PORT, TF4_PIN, 0); /* Power off the battery  Powerbus */
             timestamp = HAL_GetTick();
@@ -273,8 +346,13 @@ void ChargeController(void)
     }
     
     ampere_acc.f += ((current - charge_current_offset.f)/(100*60*60));
+#if BOARD_YARDFORCE500B_LFP
+    if(ampere_acc.f >= BATTERY_CAPACITY)ampere_acc.f = BATTERY_CAPACITY;
+    SOC = ampere_acc.f/BATTERY_CAPACITY;
+#else
     if(ampere_acc.f >= 2.8)ampere_acc.f = 2.8;
     SOC = ampere_acc.f/2.8;
+#endif
 
     // Writes a data in a RTC Backup data Register 1
     HAL_PWR_EnableBkUpAccess();
@@ -285,10 +363,16 @@ void ChargeController(void)
     chargecontrol_is_charging = charger_state;
 
     /*Check the PWM value for safety */
+#if BOARD_YARDFORCE500B_LFP
+    if (chargecontrol_pwm_val > MAX_PWM_VALUE){  //CLOUDY raised from 1350 (TIM1 period is 1400)
+        chargecontrol_pwm_val = MAX_PWM_VALUE;
+    }
+#else
     if (chargecontrol_pwm_val > 1350){
         chargecontrol_pwm_val = 1350;
     }
-    TIM1->CCR1 = chargecontrol_pwm_val;  
+#endif
+    TIM1->CCR1 = chargecontrol_pwm_val;
     
 }
 

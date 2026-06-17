@@ -100,7 +100,11 @@ int Emergency_StopButtonWhite(void)
  */
 int Emergency_WheelLiftBlue(void)
 {
+#if BOARD_YARDFORCE500B_LFP
+   return 0; //CLOUDY (LFP build) blue wheel-lift is remapped as a bump sensor, so never report it as a lift
+#else
    return(HAL_GPIO_ReadPin(WHEEL_LIFT_BLUE_PORT, WHEEL_LIFT_BLUE_PIN));
+#endif
 }
 
 /**
