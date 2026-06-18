@@ -59,8 +59,17 @@ volatile uint16_t adc_u16ChargerVoltage       = 0;
 volatile uint16_t adc_u16ChargerInputVoltage  = 0;
 volatile uint16_t adc_u16Input_NTC            = 0;
 #if BOARD_YARDFORCE500_VARIANT_B
-// CLOUDY: circular-DMA target for the full channel scan; ADC_input() reads it directly
-volatile uint16_t adc_inputDmaBuf[ADC_CHARGING_CHANNEL_MAX] = {0};
+/* CLOUDY: how many full channel scans the circular DMA buffer holds. On LFP we
+ * keep N recent scans so ADC_input() can boxcar-average the noisy battery and
+ * charge-voltage columns (~sqrt(N) noise rejection ahead of the IIR); the F401
+ * has no hardware oversampler. Stock stays at 1 scan -> byte-identical. */
+#if BOARD_YARDFORCE500B_LFP
+#define ADC_DMA_OVERSAMPLE 8
+#else
+#define ADC_DMA_OVERSAMPLE 1
+#endif
+// CLOUDY: circular-DMA target for the full channel scan(s); ADC_input() reads it directly
+volatile uint16_t adc_inputDmaBuf[ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX] = {0};
 #endif
 
 float battery_voltage;
@@ -261,7 +270,7 @@ void ADC_Charging_Init(void)
         Error_Handler();
     }
     __HAL_LINKDMA(&ADC_Charging_Handle, DMA_Handle, hdma_adc1);
-    HAL_ADC_Start_DMA(&ADC_Charging_Handle, (uint32_t *)&adc_inputDmaBuf[0], ADC_CHARGING_CHANNEL_MAX);
+    HAL_ADC_Start_DMA(&ADC_Charging_Handle, (uint32_t *)&adc_inputDmaBuf[0], ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX);
     __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT);
 #endif
     HAL_TIM_OC_Start(&TIM2_Handle, TIM_CHANNEL_2);
@@ -308,6 +317,21 @@ void ADC_input(void)
     uint16_t raw_current       = adc_inputDmaBuf[ADC_CHARGING_CHANNEL_CURRENT];
     uint16_t raw_chargerInput  = adc_inputDmaBuf[ADC_CHARGING_CHANNEL_CHARGERINPUTVOLTAGE];
     uint16_t raw_ntc           = adc_inputDmaBuf[ADC_CHARGING_CHANNEL_NTC];
+#if BOARD_YARDFORCE500B_LFP && (ADC_DMA_OVERSAMPLE > 1)
+    /* Boxcar-average the two noisy rails over the N scans the circular buffer holds.
+     * DMA may be mid-write while we read, but for an average a torn sample is
+     * harmless. Other channels keep their latest single scan above. */
+    {
+        uint32_t batt_acc = 0, chg_acc = 0;
+        for (uint16_t s = 0; s < ADC_DMA_OVERSAMPLE; s++)
+        {
+            batt_acc += adc_inputDmaBuf[s * ADC_CHARGING_CHANNEL_MAX + ADC_CHARGING_CHANNEL_BATTERYVOLTAGE];
+            chg_acc  += adc_inputDmaBuf[s * ADC_CHARGING_CHANNEL_MAX + ADC_CHARGING_CHANNEL_CHARGEVOLTAGE];
+        }
+        raw_battery = (uint16_t)(batt_acc / ADC_DMA_OVERSAMPLE);
+        raw_charger = (uint16_t)(chg_acc  / ADC_DMA_OVERSAMPLE);
+    }
+#endif
 #else
     /* Snapshot volatile ADC values under interrupt lock to avoid torn reads */
     __disable_irq();
