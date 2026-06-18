@@ -56,6 +56,17 @@ volatile uint16_t adc_u16ChargerVoltage       = 0;
 volatile uint16_t adc_u16ChargerInputVoltage  = 0;
 volatile uint16_t adc_u16Input_NTC            = 0;
 
+#if BOARD_YARDFORCE500B_LFP
+/* CLOUDY: boxcar oversampling for the two noisy charge rails. The ISR sums
+ * every raw conversion as it lands; ADC_input() averages and clears the
+ * accumulator each 10ms window, giving ~sqrt(N) noise reduction before the
+ * IIR filter runs (the F401 has no hardware oversampler). */
+volatile uint32_t adc_u32BatteryAcc           = 0;
+volatile uint16_t adc_u16BatteryCnt           = 0;
+volatile uint32_t adc_u32ChargerAcc           = 0;
+volatile uint16_t adc_u16ChargerCnt           = 0;
+#endif
+
 float battery_voltage;
 float charge_voltage;
 float current;
@@ -270,7 +281,21 @@ void ADC_input(void)
     uint16_t raw_current       = adc_u16Current;
     uint16_t raw_chargerInput  = adc_u16ChargerInputVoltage;
     uint16_t raw_ntc           = adc_u16Input_NTC;
+#if BOARD_YARDFORCE500B_LFP
+    /* Snapshot and clear the boxcar accumulators atomically with the raw reads */
+    uint32_t batt_acc = adc_u32BatteryAcc; uint16_t batt_cnt = adc_u16BatteryCnt;
+    uint32_t chg_acc  = adc_u32ChargerAcc; uint16_t chg_cnt  = adc_u16ChargerCnt;
+    adc_u32BatteryAcc = 0; adc_u16BatteryCnt = 0;
+    adc_u32ChargerAcc = 0; adc_u16ChargerCnt = 0;
+#endif
     __enable_irq();
+
+#if BOARD_YARDFORCE500B_LFP
+    /* Use the mean of every conversion taken since the last call; fall back to
+     * the latest single sample on the (practically impossible) empty window. */
+    if (batt_cnt) raw_battery = (uint16_t)(batt_acc / batt_cnt);
+    if (chg_cnt)  raw_charger = (uint16_t)(chg_acc  / chg_cnt);
+#endif
 
     /* battery volatge calculation */
     l_fTmp = ((float)raw_battery / 4095.0f) * 3.3f * 10.09 + 0.6f;
@@ -334,10 +359,18 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         case ADC_CHARGING_CHANNEL_CHARGEVOLTAGE:
             adc_u16ChargerVoltage = l_u16Rawdata;
+#if BOARD_YARDFORCE500B_LFP
+            adc_u32ChargerAcc += l_u16Rawdata;
+            adc_u16ChargerCnt++;
+#endif
             break;
 
         case ADC_CHARGING_CHANNEL_BATTERYVOLTAGE:
             adc_u16BatteryVoltage = l_u16Rawdata;
+#if BOARD_YARDFORCE500B_LFP
+            adc_u32BatteryAcc += l_u16Rawdata;
+            adc_u16BatteryCnt++;
+#endif
             break;
 
         case ADC_CHARGING_CHANNEL_CHARGERINPUTVOLTAGE:
