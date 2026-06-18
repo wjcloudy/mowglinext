@@ -236,16 +236,25 @@ void ChargeController(void)
 
     case CHARGER_STATE_CHARGING_CC:
 #if BOARD_YARDFORCE500B_LFP
-        // CLOUDY single-step CC regulation toward MAX_CHARGE_CURRENT, with a +/-0.1A current
-        // deadband. The previous +/-2 "fast" step overshot on the LFP's low ESR (a small duty
-        // change makes the current jump), and that current spike sagged the charger input
-        // enough to trip the undock detection -> PWM 0. Single steps ramp gently with no
-        // overshoot. The decrement is floored at MIN_PWM_VALUE so CC never drives PWM to zero -
-        // it ramps down to the floor and hands off to CV / IDLE rather than slamming off.
-        if (((current > (MAX_CHARGE_CURRENT + 0.1f)) || (battery_voltage > charge_end_voltage))
-            && (chargecontrol_pwm_val > MIN_PWM_VALUE))
+        // CLOUDY asymmetric CC regulation: ramp UP gently (single step, +/-0.1A deadband) so a
+        // small duty change on the LFP's low ESR can't overshoot the current, but back OFF FAST
+        // (proportional to the overshoot) when current runs high. The earlier symmetric single
+        // step backed off only -1/cycle (10ms), so a current spike at high PWM lingered above
+        // this board's hardware overcurrent lockout long enough to LATCH it (charge then dies
+        // until a redock). The proportional backoff claws PWM down hard on a real spike, matching
+        // the reference build that runs 1395 trip-free. Floored at MIN_PWM_VALUE so CC never
+        // slams PWM to zero - it ramps down to the floor and hands off to CV / IDLE.
+        if ((current > (MAX_CHARGE_CURRENT + 0.1f)) || (battery_voltage > charge_end_voltage))
         {
-            chargecontrol_pwm_val--;
+            uint16_t step = 1;
+            float over = current - MAX_CHARGE_CURRENT;   // <=0 when backing off for the CV knee
+            if (over > 0.5f)       step = 16;            // hard overcurrent: dump PWM before the OCP latches
+            else if (over > 0.25f) step = 6;
+            else if (over > 0.1f)  step = 2;
+            if (chargecontrol_pwm_val > (uint16_t)(MIN_PWM_VALUE + step))
+                chargecontrol_pwm_val -= step;
+            else
+                chargecontrol_pwm_val = MIN_PWM_VALUE;
         }
         if ((battery_voltage < charge_end_voltage) && (current < (MAX_CHARGE_CURRENT - 0.1f))
             && (chargecontrol_pwm_val < MAX_PWM_VALUE))
