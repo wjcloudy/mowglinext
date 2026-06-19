@@ -97,7 +97,7 @@ extern "C"
 #define BOARD_HAS_MASTER_USART 0
 #endif
 
-//#define I_DONT_NEED_MY_FINGERS              1      // disables EmergencyController() (no wheel lift, or tilt sensing and stopping the blade anymore)
+#define I_DONT_NEED_MY_FINGERS              1      // disables EmergencyController() (no wheel lift, or tilt sensing and stopping the blade anymore)
 
 #if BOARD_YARDFORCE500B_LFP
 /* ===========================================================================
