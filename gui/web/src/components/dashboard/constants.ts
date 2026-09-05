@@ -12,51 +12,54 @@ export const MONO_FONT = "'Space Grotesk', 'JetBrains Mono', ui-monospace, monos
 //   warning  = non-fatal anomaly that still needs operator awareness
 //   success  = terminal success (completion, charging-done banners)
 //   danger   = emergency / blocking failure
+// `label`/`friendly` hold i18n key strings (under the `mowerStates` namespace),
+// resolved at render time via `t(...)` — see StatePill.tsx. `tone` stays inline
+// because it drives the palette, not copy.
 export const MOWER_STATES: Record<string, { label: string; tone: 'info' | 'primary' | 'warning' | 'success' | 'danger'; friendly: string }> = {
   // Idle / docked family
-  IDLE_DOCKED:                { label: 'À la base',          tone: 'info',    friendly: 'Au repos sur la base' },
-  IDLE:                       { label: 'Au repos',           tone: 'info',    friendly: 'Prêt quand vous voulez' },
-  CHARGING:                   { label: 'En charge',          tone: 'success', friendly: 'Recharge de la batterie' },
+  IDLE_DOCKED:                { label: 'mowerStates.IDLE_DOCKED.label',                 tone: 'info',    friendly: 'mowerStates.IDLE_DOCKED.friendly' },
+  IDLE:                       { label: 'mowerStates.IDLE.label',                        tone: 'info',    friendly: 'mowerStates.IDLE.friendly' },
+  CHARGING:                   { label: 'mowerStates.CHARGING.label',                    tone: 'success', friendly: 'mowerStates.CHARGING.friendly' },
 
   // Autonomous mowing cycle
-  PREFLIGHT_CHECK:            { label: 'Pré-vol',            tone: 'info',    friendly: 'Vérifications avant départ' },
-  UNDOCKING:                  { label: 'Départ base',        tone: 'primary', friendly: 'Quitte la base' },
-  CALIBRATING_HEADING:        { label: 'Calibration cap',    tone: 'info',    friendly: 'Calibration du cap' },
-  MOWING:                     { label: 'Tonte',              tone: 'primary', friendly: 'Tonte en cours' },
-  TRANSIT:                    { label: 'Transit',            tone: 'primary', friendly: 'Trajet vers la bande suivante' },
-  SKIP_STRIP:                 { label: 'Bande ignorée',      tone: 'info',    friendly: 'Bande inaccessible ignorée' },
-  RETURNING_HOME:             { label: 'Retour base',        tone: 'primary', friendly: 'Retour vers la base' },
-  MOWING_COMPLETE:            { label: 'Tonte terminée',     tone: 'success', friendly: 'Toutes les zones tondues' },
+  PREFLIGHT_CHECK:            { label: 'mowerStates.PREFLIGHT_CHECK.label',             tone: 'info',    friendly: 'mowerStates.PREFLIGHT_CHECK.friendly' },
+  UNDOCKING:                  { label: 'mowerStates.UNDOCKING.label',                   tone: 'primary', friendly: 'mowerStates.UNDOCKING.friendly' },
+  CALIBRATING_HEADING:        { label: 'mowerStates.CALIBRATING_HEADING.label',         tone: 'info',    friendly: 'mowerStates.CALIBRATING_HEADING.friendly' },
+  MOWING:                     { label: 'mowerStates.MOWING.label',                      tone: 'primary', friendly: 'mowerStates.MOWING.friendly' },
+  TRANSIT:                    { label: 'mowerStates.TRANSIT.label',                     tone: 'primary', friendly: 'mowerStates.TRANSIT.friendly' },
+  SKIP_STRIP:                 { label: 'mowerStates.SKIP_STRIP.label',                  tone: 'info',    friendly: 'mowerStates.SKIP_STRIP.friendly' },
+  RETURNING_HOME:             { label: 'mowerStates.RETURNING_HOME.label',              tone: 'primary', friendly: 'mowerStates.RETURNING_HOME.friendly' },
+  MOWING_COMPLETE:            { label: 'mowerStates.MOWING_COMPLETE.label',             tone: 'success', friendly: 'mowerStates.MOWING_COMPLETE.friendly' },
 
   // Recording
-  RECORDING:                  { label: 'Enregistrement',     tone: 'primary', friendly: 'Enregistrement de la limite' },
-  RECORDING_COMPLETE:         { label: 'Enregistré',         tone: 'success', friendly: 'Limite de zone enregistrée' },
+  RECORDING:                  { label: 'mowerStates.RECORDING.label',                   tone: 'primary', friendly: 'mowerStates.RECORDING.friendly' },
+  RECORDING_COMPLETE:         { label: 'mowerStates.RECORDING_COMPLETE.label',          tone: 'success', friendly: 'mowerStates.RECORDING_COMPLETE.friendly' },
 
   // Manual
-  MANUAL_MOWING:              { label: 'Tonte manuelle',     tone: 'primary', friendly: 'Mode tonte manuelle' },
+  MANUAL_MOWING:              { label: 'mowerStates.MANUAL_MOWING.label',               tone: 'primary', friendly: 'mowerStates.MANUAL_MOWING.friendly' },
 
   // Battery
-  LOW_BATTERY_DOCKING:        { label: 'Batterie faible',    tone: 'warning', friendly: 'Batterie faible — retour à la base' },
-  CRITICAL_BATTERY_DOCKING:   { label: 'Batterie critique',  tone: 'warning', friendly: 'Batterie critique — retour à la base' },
-  CRITICAL_BATTERY_NAV_FAILED:{ label: 'Échec retour',       tone: 'danger',  friendly: 'Batterie critique et retour impossible' },
+  LOW_BATTERY_DOCKING:        { label: 'mowerStates.LOW_BATTERY_DOCKING.label',         tone: 'warning', friendly: 'mowerStates.LOW_BATTERY_DOCKING.friendly' },
+  CRITICAL_BATTERY_DOCKING:   { label: 'mowerStates.CRITICAL_BATTERY_DOCKING.label',    tone: 'warning', friendly: 'mowerStates.CRITICAL_BATTERY_DOCKING.friendly' },
+  CRITICAL_BATTERY_NAV_FAILED:{ label: 'mowerStates.CRITICAL_BATTERY_NAV_FAILED.label', tone: 'danger',  friendly: 'mowerStates.CRITICAL_BATTERY_NAV_FAILED.friendly' },
 
   // Rain
-  RAIN_DETECTED_DOCKING:      { label: 'Pluie détectée',     tone: 'warning', friendly: 'Pluie détectée — retour à la base' },
-  RAIN_WAITING:               { label: 'Attente du sec',     tone: 'warning', friendly: "Attend la fin de la pluie" },
-  RAIN_TIMEOUT:               { label: 'Délai pluie',        tone: 'warning', friendly: "Abandon de l'attente du temps sec" },
-  RESUMING_AFTER_RAIN:        { label: 'Reprise',            tone: 'primary', friendly: 'Reprise après la pluie' },
+  RAIN_DETECTED_DOCKING:      { label: 'mowerStates.RAIN_DETECTED_DOCKING.label',       tone: 'warning', friendly: 'mowerStates.RAIN_DETECTED_DOCKING.friendly' },
+  RAIN_WAITING:               { label: 'mowerStates.RAIN_WAITING.label',                tone: 'warning', friendly: 'mowerStates.RAIN_WAITING.friendly' },
+  RAIN_TIMEOUT:               { label: 'mowerStates.RAIN_TIMEOUT.label',                tone: 'warning', friendly: 'mowerStates.RAIN_TIMEOUT.friendly' },
+  RESUMING_AFTER_RAIN:        { label: 'mowerStates.RESUMING_AFTER_RAIN.label',         tone: 'primary', friendly: 'mowerStates.RESUMING_AFTER_RAIN.friendly' },
 
   // Recovery / transitions
-  RESUMING_UNDOCKING:         { label: 'Reprise départ',     tone: 'primary', friendly: 'Quitte la base pour reprendre' },
-  BOUNDARY_RECOVERY:          { label: 'Récup. limite',      tone: 'warning', friendly: 'Récupération après un écart de limite' },
+  RESUMING_UNDOCKING:         { label: 'mowerStates.RESUMING_UNDOCKING.label',          tone: 'primary', friendly: 'mowerStates.RESUMING_UNDOCKING.friendly' },
+  BOUNDARY_RECOVERY:          { label: 'mowerStates.BOUNDARY_RECOVERY.label',           tone: 'warning', friendly: 'mowerStates.BOUNDARY_RECOVERY.friendly' },
 
   // Failures / emergencies
-  EMERGENCY:                  { label: "Arrêt d'urgence",    tone: 'danger',  friendly: "Arrêt d'urgence activé" },
-  BOUNDARY_EMERGENCY_STOP:    { label: 'Alerte limite',      tone: 'danger',  friendly: 'Arrêt — hors limites' },
-  UNDOCK_FAILED:              { label: 'Échec départ',       tone: 'warning', friendly: 'Échec du départ — vérifier la base' },
-  CHARGER_FAILED:             { label: 'Échec chargeur',     tone: 'warning', friendly: 'Chargeur non détecté' },
-  NAV_TO_DOCK_FAILED:         { label: 'Échec navigation',   tone: 'danger',  friendly: 'Navigation vers la base impossible' },
-  COVERAGE_FAILED_DOCKING:    { label: 'Échec couverture',   tone: 'warning', friendly: 'Échec couverture — retour à la base' },
+  EMERGENCY:                  { label: 'mowerStates.EMERGENCY.label',                   tone: 'danger',  friendly: 'mowerStates.EMERGENCY.friendly' },
+  BOUNDARY_EMERGENCY_STOP:    { label: 'mowerStates.BOUNDARY_EMERGENCY_STOP.label',     tone: 'danger',  friendly: 'mowerStates.BOUNDARY_EMERGENCY_STOP.friendly' },
+  UNDOCK_FAILED:              { label: 'mowerStates.UNDOCK_FAILED.label',               tone: 'warning', friendly: 'mowerStates.UNDOCK_FAILED.friendly' },
+  CHARGER_FAILED:             { label: 'mowerStates.CHARGER_FAILED.label',              tone: 'warning', friendly: 'mowerStates.CHARGER_FAILED.friendly' },
+  NAV_TO_DOCK_FAILED:         { label: 'mowerStates.NAV_TO_DOCK_FAILED.label',          tone: 'danger',  friendly: 'mowerStates.NAV_TO_DOCK_FAILED.friendly' },
+  COVERAGE_FAILED_DOCKING:    { label: 'mowerStates.COVERAGE_FAILED_DOCKING.label',     tone: 'warning', friendly: 'mowerStates.COVERAGE_FAILED_DOCKING.friendly' },
 };
 
 export const fmt = {
@@ -74,15 +77,15 @@ export const fmt = {
 };
 
 export const KEYFRAMES_CSS = `
-@keyframes mn-pulse {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.4; transform: scale(0.85); }
-}
-@keyframes mn-rise {
-  from { opacity: 0; transform: translateY(8px); }
-  to   { opacity: 1; transform: translateY(0); }
-}
 @media (prefers-reduced-motion: no-preference) {
+  @keyframes mn-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.85); }
+  }
+  @keyframes mn-rise {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
   @keyframes mn-bounds-glow {
     0%, 100% { box-shadow: 0 0 0 0 rgba(255,107,107,0.7), inset 0 0 0 1px rgba(255,107,107,0.6); }
     50% { box-shadow: 0 0 0 6px rgba(255,107,107,0), inset 0 0 0 1px rgba(255,107,107,0.9); }
@@ -90,6 +93,22 @@ export const KEYFRAMES_CSS = `
   @keyframes mn-pulse-red {
     0%, 100% { box-shadow: 0 0 0 0 rgba(255,107,107,0); }
     50% { box-shadow: 0 0 0 8px rgba(255,107,107,0.15); }
+  }
+  @keyframes mowerPulseRed {
+    0%, 100% { box-shadow: 0 0 0 0 var(--mower-status-danger); }
+    50% { box-shadow: 0 0 0 4px transparent; }
+  }
+  @keyframes mowerPulseGreen {
+    0%, 100% { box-shadow: 0 0 0 0 var(--mower-status-active); }
+    50% { box-shadow: 0 0 0 4px transparent; }
+  }
+  @keyframes liveStripPulse {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
+  }
+  @keyframes liveStripSheen {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
   }
 }
 .mn-card-hover:hover { transform: translateY(-1px); }
@@ -110,21 +129,26 @@ export const KEYFRAMES_CSS = `
   pointer-events: none;
 }
 
-/* ─── AntD Card → liquid glass ──────────────────────────────────────────
+/* ─── AntD Card → display-mode-aware tech-garden surface ────────────────
    Pull every stock AntD Card into the tech-garden glass language so pages
    built on AntD (Diagnostics, Settings, Onboarding) match the hand-built
    DashCard/GlassCard surfaces without per-page edits. Same recipe as
-   DashCard: translucent dark fill, backdrop blur, soft border, luminous
-   top-left edge. */
+   DashCard: soft border and luminous top-left edge in every mode. */
 .ant-card {
   position: relative;
-  background: rgba(11, 24, 20, 0.6) !important;
-  backdrop-filter: blur(24px) saturate(140%);
-  -webkit-backdrop-filter: blur(24px) saturate(140%);
+  background: rgba(11, 24, 20, 0.78) !important;
   border: 1px solid var(--border-soft) !important;
   border-radius: var(--radius-md) !important;
   box-shadow: 0 24px 60px -20px rgba(0,0,0,0.5), 0 4px 16px -4px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.04) !important;
   overflow: hidden;
+}
+:root[data-display-mode='visual'] .ant-card {
+  background: rgba(11, 24, 20, 0.60) !important;
+  backdrop-filter: blur(20px) saturate(135%);
+  -webkit-backdrop-filter: blur(20px) saturate(135%);
+}
+:root[data-display-mode='efficient'] .ant-card {
+  background: var(--bg-card-solid) !important;
 }
 .ant-card::before {
   content: '';
@@ -140,12 +164,11 @@ export const KEYFRAMES_CSS = `
 }
 .ant-card-head { border-bottom: 1px solid var(--border-soft) !important; background: transparent !important; }
 .ant-card-body, .ant-card-head { position: relative; z-index: 1; }
-/* Nested cards (a card inside a card) shouldn't double up the blur+edge —
-   flatten the inner one to a plain translucent tile. */
+/* Nested cards flatten to a plain tile so edges and shadows do not stack. */
 .ant-card .ant-card {
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
   background: var(--bg-elevated) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
   box-shadow: none !important;
 }
 .ant-card .ant-card::before { display: none; }
@@ -177,10 +200,11 @@ export const KEYFRAMES_CSS = `
   text-transform: uppercase;
   font-weight: 600 !important;
 }
+/* Data numerals use Space Grotesk: Instrument Serif's zero glyph reads as
+   "()" at statistic sizes, which looks like a broken value. */
 .ant-statistic-content-value,
-.ant-statistic-content-prefix,
-.ant-statistic-content-suffix {
-  font-family: 'Instrument Serif', 'Iowan Old Style', Georgia, serif !important;
+.ant-statistic-content-prefix {
+  font-family: 'Space Grotesk', 'Inter', sans-serif !important;
   font-variant-numeric: tabular-nums;
   letter-spacing: -0.015em;
 }
@@ -249,11 +273,18 @@ export const KEYFRAMES_CSS = `
 .ant-btn-primary:active { transform: translateY(0); }
 
 .ant-btn-default {
-  background: var(--bg-card) !important;
+  background: rgba(11, 24, 20, 0.78) !important;
   border: 1px solid var(--border-soft) !important;
   color: var(--ink) !important;
-  backdrop-filter: blur(12px);
   font-weight: 600 !important;
+}
+:root[data-display-mode='visual'] .ant-btn-default {
+  background: rgba(11, 24, 20, 0.60) !important;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+:root[data-display-mode='efficient'] .ant-btn-default {
+  background: var(--bg-card-solid) !important;
 }
 .ant-btn-default:hover,
 .ant-btn-default:focus {
@@ -342,9 +373,19 @@ export const KEYFRAMES_CSS = `
 
 /* Staggered page entrance: children with [data-stagger] animate in
    sequence on initial mount. Combine with --stagger-index from JS. */
-.mn-stagger > [data-stagger] {
-  opacity: 0;
-  animation: mn-rise 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) both;
-  animation-delay: calc(var(--stagger-index, 0) * 60ms + 80ms);
+@media (prefers-reduced-motion: no-preference) {
+  .mn-stagger > [data-stagger] {
+    opacity: 0;
+    animation: mn-rise 0.55s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+    animation-delay: calc(var(--stagger-index, 0) * 60ms + 80ms);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-concept], [data-concept] *, [data-concept] *::before, [data-concept] *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 `;

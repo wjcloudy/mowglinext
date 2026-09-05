@@ -15,6 +15,9 @@
 
 #include "mowgli_behavior/status_nodes.hpp"
 
+#include "mowgli_behavior/coverage_persistence.hpp"
+#include "mowgli_behavior/status_snapshot.hpp"
+
 namespace mowgli_behavior
 {
 
@@ -44,29 +47,65 @@ BT::NodeStatus PublishHighLevelStatus::tick()
     return BT::NodeStatus::FAILURE;
   }
 
-  if (!pub_)
+  // Shared publisher owned by the context so the behavior_tree_node's periodic
+  // timer can re-publish the last status while a long-running FollowStrip keeps
+  // this SyncActionNode from ticking (see BTContext::last_high_level_status).
   {
-    pub_ =
-        ctx->node->create_publisher<mowgli_interfaces::msg::HighLevelStatus>("~/high_level_status",
-                                                                             10);
+    std::lock_guard<std::mutex> lock(ctx->context_mutex);
+    if (!ctx->high_level_status_pub)
+    {
+      ctx->high_level_status_pub =
+          ctx->node->create_publisher<mowgli_interfaces::msg::HighLevelStatus>(
+              "~/high_level_status", 10);
+    }
   }
 
-  mowgli_interfaces::msg::HighLevelStatus msg;
-  msg.state = state_res.value();
-  msg.state_name = name_res.value();
-  msg.sub_state_name = "";
-  msg.current_area = static_cast<int16_t>(ctx->current_area);
-  msg.current_path = -1;
-  msg.current_path_index = static_cast<int16_t>(ctx->coverage_percent);
-  msg.total_swaths = static_cast<int16_t>(ctx->total_swaths);
-  msg.completed_swaths = static_cast<int16_t>(ctx->completed_swaths);
-  msg.skipped_swaths = static_cast<int16_t>(ctx->skipped_swaths);
-  msg.gps_quality_percent = ctx->gps_quality;
-  msg.battery_percent = ctx->battery_percent;
-  msg.is_charging = ctx->latest_power.charger_enabled;
-  msg.emergency = ctx->latest_emergency.active_emergency;
+  // Debounce transient IDLE. The requested state is recomputed from tree
+  // traversal each tick; a single-tick reactive deselection of MowingSequence
+  // (or a momentarily cleared current_command) makes the IdleSequence
+  // fall-through request IDLE for one tick mid-mission. Only publish IDLE after
+  // it has persisted for kIdleDebounceTicks ticks when coming FROM an active
+  // state (AUTONOMOUS/RECORDING/MANUAL_MOWING). All other transitions —
+  // including into motion states and into EMERGENCY/NULL — publish immediately.
+  const uint8_t requested_state = state_res.value();
+  uint8_t published_state = requested_state;
+  const bool was_active =
+      have_published_ && last_published_state_ != kStateIdle && last_published_state_ != kStateNull;
+  if (requested_state == kStateIdle && was_active)
+  {
+    if (++pending_idle_ticks_ < kIdleDebounceTicks)
+    {
+      // Hold the previous active state until IDLE proves persistent.
+      published_state = last_published_state_;
+    }
+    // else: IDLE has persisted long enough — accept it (published_state stays IDLE).
+  }
+  else
+  {
+    // Not a debounced IDLE transition — reset the counter and publish as-is.
+    pending_idle_ticks_ = 0;
+  }
 
-  pub_->publish(msg);
+  mowgli_interfaces::msg::HighLevelStatus identity;
+  identity.state = published_state;
+  identity.state_name = name_res.value();
+  identity.sub_state_name = "";
+  last_published_state_ = published_state;
+  have_published_ = true;
+
+  // Cache the message so the behavior_tree_node timer can re-publish it while
+  // the tree is parked in a long-running action with no further transitions.
+  // Only the state identity above is authored here; every live field is filled
+  // by the same projection the republish timer uses, so the two paths cannot
+  // drift apart (see status_snapshot.hpp).
+  mowgli_interfaces::msg::HighLevelStatus msg;
+  {
+    std::lock_guard<std::mutex> lock(ctx->context_mutex);
+    msg = withLiveStatusFields(identity, *ctx);
+    ctx->last_high_level_status = msg;
+    ctx->has_high_level_status = true;
+    ctx->high_level_status_pub->publish(msg);
+  }
 
   RCLCPP_DEBUG(ctx->node->get_logger(),
                "PublishHighLevelStatus: state=%u name='%s'",
@@ -144,6 +183,21 @@ BT::NodeStatus EndSession::tick()
   // (coverage reset / re-mow) is wrongly judged "no progress" and pushed
   // toward premature give-up at kMaxAreaAttempts.
   ctx->area_last_coverage.clear();
+  // Start-pose-blocked bookkeeping (issue #487) is per-session too: the next
+  // COMMAND_START must get a fresh exemption budget, and a stale
+  // start_blocked_area would make the first dispatch of the new session skip
+  // the no-progress counter for a pass that never happened.
+  ctx->coverage_start_blocked = false;
+  ctx->start_blocked_area.reset();
+  ctx->area_start_blocked_count.clear();
+  // SAFETY (issue #487 escape motion): disarm the escape and forget the
+  // last-motion direction at the session boundary. A token or a direction that
+  // survived into the next session would describe a pose the robot may no
+  // longer be standing in — the escape must re-derive both from the new
+  // session's own evidence or stand down.
+  ctx->start_blocked_escape_armed = false;
+  ctx->last_motion_valid = false;
+  ctx->last_motion_cmd_vx = 0.0;
   // Swath-completion model (replaces the cell coverage grid): clear the
   // per-area completed-swath sets, swath counts, and the completed-area set so
   // the next COMMAND_START re-plans and re-mows every area from swath 0.
@@ -152,7 +206,20 @@ BT::NodeStatus EndSession::tick()
   // the session boundary instead).
   ctx->area_completed_swaths.clear();
   ctx->area_swath_count.clear();
+  ctx->area_resume_pose_index.clear();
+  ctx->area_path_pose_count.clear();
+  ctx->area_plan_fingerprint.clear();
   ctx->completed_areas.clear();
+  // Drop any "mow only area N" constraint from a targeted run (~/start_in_area)
+  // at the same boundary as every other per-session set, so the next plain
+  // COMMAND_START mows the whole lawn again. The clip is session state (it must
+  // survive GetNextUnmowedArea re-entering after the targeted area finishes, or
+  // the run rolls over into the next area), so THIS is where it dies.
+  clearSingleAreaMode(*ctx);
+  // Remove the on-disk resume snapshot too: this is a real session boundary, so
+  // the next COMMAND_START must start fresh rather than resume a finished (or
+  // aborted-and-docked) session from the persisted cursor.
+  clearCoverageResumeState(*ctx);
   return BT::NodeStatus::SUCCESS;
 }
 

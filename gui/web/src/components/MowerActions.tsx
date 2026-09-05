@@ -1,13 +1,16 @@
 import {useApi} from "../hooks/useApi.ts";
 import {App, Card, Col, Divider, Row} from "antd";
-import {PlayCircleOutlined, HomeOutlined, WarningOutlined} from '@ant-design/icons';
+import {PlayCircleOutlined, HomeOutlined, WarningOutlined, RedoOutlined} from '@ant-design/icons';
 import AsyncButton from "./AsyncButton.tsx";
 import React from "react";
 import styled from "styled-components";
 import AsyncDropDownButton from "./AsyncDropDownButton.tsx";
 import {useHighLevelStatus} from "../hooks/useHighLevelStatus.ts";
+import {useCoverageResumeAvailable} from "../hooks/useCoverageResumeAvailable.ts";
 import {HighLevelStatusConstants} from "../types/ros.ts";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
+import {useTranslation} from "react-i18next";
+import {stringifyValue} from "../utils/stringifyValue.ts";
 
 const ActionsCard = styled(Card)`
   .ant-card-body > button {
@@ -31,10 +34,27 @@ export const useMowerAction = () => {
 };
 
 export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> = (props) => {
+    const {t} = useTranslation();
     const {highLevelStatus} = useHighLevelStatus();
     const mowerAction = useMowerAction()
+    const guiApi = useApi();
+    const resumeAvailable = useCoverageResumeAvailable();
     const {modal} = App.useApp();
     const {colors} = useThemeMode();
+
+    // "Start fresh": discard persisted mowing progress, then start — so the mow
+    // begins at the first line instead of resuming a prior interrupted session
+    // (the "starts at 2nd/3rd line" report). Plain Start still resumes.
+    const startFresh = async () => {
+        const clr = await guiApi.mowglinext.callCreate("coverage_clear_resume", {});
+        if (clr.error) {
+            throw new Error(clr.error.error);
+        }
+        const res = await guiApi.mowglinext.callCreate("high_level_control", {Command: 1});
+        if (res.error) {
+            throw new Error(res.error.error);
+        }
+    };
 
     // Home from IDLE means the robot is somewhere on the lawn (it's been
     // undocked) and the operator wants it to drive itself back to the dock.
@@ -48,27 +68,26 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
         if (highLevelStatus.state_name === "IDLE") {
             return new Promise<void>((resolve, reject) => {
                 modal.confirm({
-                    title: "Renvoyer le robot à la base ?",
+                    title: t('mowerActions.sendHomeTitle'),
                     content: (
                         <div>
                             <p>
-                                Le robot va calculer un itinéraire vers la base et s'y rendre seul.
+                                {t('mowerActions.sendHomeBody')}
                             </p>
                             <p style={{marginBottom: 0, color: colors.textSecondary}}>
-                                Assurez-vous que la zone entre le robot et la base est dégagée et que la
-                                position de la base est correctement définie.
+                                {t('mowerActions.sendHomeHint')}
                             </p>
                         </div>
                     ),
-                    okText: "Retour dock",
+                    okText: t('mowerActions.returnToDock'),
                     okType: "primary",
-                    cancelText: "Annuler",
+                    cancelText: t('mowerActions.cancel'),
                     onOk: async () => {
                         try {
                             await sendHome();
                             resolve();
                         } catch (e) {
-                            reject(e);
+                            reject(e instanceof Error ? e : new Error(stringifyValue(e)));
                         }
                     },
                     onCancel: () => resolve(),
@@ -85,7 +104,7 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
     }[] = [
         {
             key: "mower_s1",
-            label: "Enregistrer une zone",
+            label: t('mowerActions.recordZone'),
             actions: [{
                 command: "high_level_control",
                 args: {
@@ -95,7 +114,7 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
         },
         {
             key: "mower_s2",
-            label: "Tondre la zone suivante",
+            label: t('mowerActions.mowNextZone'),
             actions: [{
                 command: "high_level_control",
                 args: {
@@ -107,10 +126,10 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
             // Match MapToolbar: resting state is IDLE_DOCKED (BT never emits
             // plain IDLE except as the manual-mow fallthrough).
             key: (highLevelStatus.state_name == "IDLE_DOCKED" || highLevelStatus.state_name == "IDLE") ? "continue" : "pause",
-            label: (highLevelStatus.state_name == "IDLE_DOCKED" || highLevelStatus.state_name == "IDLE") ? "Continuer" : "Pause",
-            // No pause flag exists in the stack (the old mower_logic/
-            // manual_pause_mowing command returned HTTP 500). Continue = START
-            // (resumes via persisted mow_progress); Pause = HOME (dock).
+            label: (highLevelStatus.state_name == "IDLE_DOCKED" || highLevelStatus.state_name == "IDLE") ? t('mowerActions.continue') : t('mowerActions.pause'),
+            // Continue = START (resumes via persisted mow_progress); Pause =
+            // STOP (COMMAND_STOP=8 → StopHoldSequence: mower off, halt in place,
+            // Nav2 left up so the mission can resume, no dock drive).
             actions: (highLevelStatus.state_name == "IDLE_DOCKED" || highLevelStatus.state_name == "IDLE") ? [{
                 command: "high_level_control",
                 args: {
@@ -119,13 +138,13 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
             }] : [{
                 command: "high_level_control",
                 args: {
-                    Command: 2,
+                    Command: 8,
                 }
             }]
         },
         {
             key: "emergency_off",
-            "label": "Désactiver l'arrêt d'urgence",
+            "label": t('mowerActions.disableEmergency'),
             "danger": true,
             actions: [{
                 command: "emergency",
@@ -136,34 +155,34 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
         },
         {
             key: "mow_forward",
-            "label": "Lame avant",
+            "label": t('mowerActions.bladeForward'),
             actions: [{
                 command: "mow_enabled",
-                args: {MowEnabled: 1, MowDirection: 0}
+                args: {mow_enabled: 1, mow_direction: 0}
             }]
         },
         {
             key: "mow_backward",
-            "label": "Lame arrière",
+            "label": t('mowerActions.bladeBackward'),
             actions: [{
                 command: "mow_enabled",
-                args: {MowEnabled: 1, MowDirection: 1}
+                args: {mow_enabled: 1, mow_direction: 1}
             }]
         },
         {
             key: "mow_off",
-            "label": "Lame arrêtée",
+            "label": t('mowerActions.bladeOff'),
             "danger": true,
             actions: [{
                 command: "mow_enabled",
-                args: {MowEnabled: 0, MowDirection: 0}
+                args: {mow_enabled: 0, mow_direction: 0}
             }]
         },
     ];
     let children = props.children;
     if (children && Array.isArray(children)) {
-        children = children.map(c => {
-            return c ? <Col>{c}</Col> : null
+        children = children.map((c, index) => {
+            return c ? <Col key={`mower-action-${index}`}>{c}</Col> : null
         })
     } else if (children) {
         children = <Col>{children}</Col>
@@ -181,7 +200,17 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
                  (highLevelStatus.state_name === "IDLE" || highLevelStatus.state_name === "IDLE_DOCKED") ? (
                     <AsyncButton icon={<PlayCircleOutlined/>} type="primary" key="btnHLC1"
                                  onAsyncClick={mowerAction("high_level_control", {Command: 1})}
-                    >Démarrer</AsyncButton>
+                    >{resumeAvailable ? t('mowerActions.resume') : t('mowerActions.start')}</AsyncButton>
+                ) : null}
+                {/* When a prior mow was interrupted, "Start" resumes mid-path; this
+                    second button discards that progress and mows from the first
+                    line (issue: "starts at 2nd/3rd line"). */}
+                {highLevelStatus.state !== HighLevelStatusConstants.HIGH_LEVEL_STATE_AUTONOMOUS &&
+                 (highLevelStatus.state_name === "IDLE" || highLevelStatus.state_name === "IDLE_DOCKED") &&
+                 resumeAvailable ? (
+                    <AsyncButton icon={<RedoOutlined/>} key="btnHLCFresh"
+                                 onAsyncClick={startFresh}
+                    >{t('mowerActions.startFresh')}</AsyncButton>
                 ) : null}
                 {/* Home button is hidden only when the robot is already
                     docked (IDLE_DOCKED). From IDLE we show it so the operator
@@ -190,15 +219,15 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
                     because the autonomous transit is non-trivial. */}
                 {highLevelStatus.state_name !== "IDLE_DOCKED" ? <AsyncButton icon={<HomeOutlined/>} type="primary" key="btnHLC2"
                                                                            onAsyncClick={onHomeClick}
-                >Retour dock</AsyncButton> : null}
+                >{t('mowerActions.returnToDock')}</AsyncButton> : null}
             </Col>
             <Col>
                 {!highLevelStatus.emergency ?
                     <AsyncButton danger icon={<WarningOutlined/>} key="btnEmergencyOn" onAsyncClick={mowerAction("emergency", {Emergency: 1})}
-                    >Arrêt d'urgence</AsyncButton> : null}
+                    >{t('mowerActions.emergencyStop')}</AsyncButton> : null}
                 {highLevelStatus.emergency ?
                     <AsyncButton danger icon={<WarningOutlined/>} key="btnEmergencyOff" onAsyncClick={mowerAction("emergency", {Emergency: 0})}
-                    >Réarmer</AsyncButton> : null}
+                    >{t('mowerActions.rearm')}</AsyncButton> : null}
             </Col>
             <Col>
                 <AsyncDropDownButton style={{display: "inline"}}  key="drpActions"  menu={{
@@ -210,7 +239,7 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
                         }
                     }
                 }}>
-                    Plus
+                    {t('mowerActions.more')}
                 </AsyncDropDownButton>
             </Col>
         </Row>
@@ -220,7 +249,7 @@ export const MowerActions: React.FC<React.PropsWithChildren<{bare?: boolean}>> =
         return content;
     }
 
-    return <ActionsCard title={"Actions"} size={"small"}>
+    return <ActionsCard title={t('mowerActions.cardTitle')} size={"small"}>
         {content}
     </ActionsCard>;
 };

@@ -18,6 +18,7 @@
 
 #include "fusion_graph/fusion_graph_node.hpp"
 #include "fusion_graph/fusion_graph_node_util.hpp"
+#include "fusion_graph/rtk_wrongfix_gate.hpp"
 
 namespace fusion_graph
 {
@@ -38,6 +39,11 @@ void FusionGraphNode::SetupCommunications(double node_period_s)
   // sees GPS, never jumps. Nav2's odom_topic in nav2_params.yaml still
   // points here.
   pub_local_odom_ = create_publisher<nav_msgs::msg::Odometry>("/odometry/filtered", 10);
+  // LiDAR-only odometry (scan-match deltas integrated from the graph pose at
+  // the first accepted match). Diagnostic/visualisation only — the GUI overlays
+  // it to compare ICP heading & pose drift vs the fused/GPS estimate. Only
+  // emits when use_scan_matching is on (no matches → nothing to integrate).
+  pub_icp_odom_ = create_publisher<nav_msgs::msg::Odometry>("/fusion_graph/icp_odometry", 10);
 
   // High-rate extrapolated pose (item #15). Off by default — set
   // fast_pose_publish_rate_hz > 0 in yaml to enable. 100 Hz is the
@@ -202,13 +208,15 @@ void FusionGraphNode::SetupCommunications(double node_period_s)
       [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
              std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
       {
-        const bool ok = graph_->Save(graph_save_prefix_);
-        resp->success = ok;
-        resp->message = ok ? "saved to " + graph_save_prefix_ + ".*" : "save failed";
-        if (ok)
-          RCLCPP_INFO(get_logger(), "fusion_graph: %s", resp->message.c_str());
-        else
-          RCLCPP_WARN(get_logger(), "fusion_graph: %s", resp->message.c_str());
+        // Dispatch on the async save worker, never inline: a direct Save()
+        // blocks this executor for the full file write (~500 ms on the robot's
+        // eMMC — the exact stall DispatchAsyncSave was built to avoid,
+        // 2026-05-14 incident), starving the timers that feed the TF fallback
+        // path and risking Nav2 ExtrapolationExceptions on every manual save.
+        DispatchAsyncSave("manual-service");
+        resp->success = true;
+        resp->message = "save dispatched to " + graph_save_prefix_ + ".* (async)";
+        RCLCPP_INFO(get_logger(), "fusion_graph: %s", resp->message.c_str());
       });
 
   // ── Clear-graph service ─────────────────────────────────────────
@@ -236,6 +244,12 @@ void FusionGraphNode::SetupCommunications(double node_period_s)
         seed_xy_.reset();
         seed_yaw_.reset();
         seed_xy_rtk_fixed_ = false;
+        gnss_observation_tracker_.Reset();
+        last_rtk_fixed_stamp_.reset();
+        rtk_fixed_streak_ = 0;
+        last_gps_sigma_ = -1.0;
+        last_gps_map_xy_.reset();
+        ResetRtkWrongFixAccumulators(wheel_dist_since_last_gps_m_, abs_dtheta_since_last_gps_rad_);
         // Re-zero the dead-reckoning frame. Without this the odom→base
         // transform keeps whatever offset it had accumulated (observed
         // 74 m), so map→odom = graph_pose ∘ dr⁻¹ still has the huge
@@ -342,6 +356,21 @@ void FusionGraphNode::SetupCommunications(double node_period_s)
                           add("total_nodes", std::to_string(stats.total_nodes));
                           add("scans_attached", std::to_string(stats.scans_attached));
                           add("loop_closures", std::to_string(stats.loop_closures));
+                          // Nodes where the #513 rate/travel gate blocked the LC
+                          // search (cumulative). Diff against loop_closures to
+                          // see the gate working.
+                          add("lc_rate_gated", std::to_string(lc_rate_gated_));
+                          // Dock-prior vs RTK-Fixed GPS consistency (#512):
+                          // latest disagreement while charging (0 when
+                          // not) + nodes the dock prior yielded on.
+                          {
+                            const bool docked = last_is_charging_valid_ && last_is_charging_;
+                            const double d = docked ? dock_gps_disagreement_m_ : 0.0;
+                            char buf[32];
+                            std::snprintf(buf, sizeof(buf), "%.3f", d);
+                            add("dock_gps_disagreement_m", buf);
+                            add("dock_prior_yielded", std::to_string(dock_prior_yielded_));
+                          }
                           add("scans_received", std::to_string(scans_received_));
                           add("scan_matches_ok", std::to_string(scan_matches_ok_));
                           add("scan_matches_fail", std::to_string(scan_matches_fail_));
@@ -507,7 +536,7 @@ void FusionGraphNode::SetupCommunications(double node_period_s)
   }
 
   RCLCPP_INFO(get_logger(),
-              "fusion_graph_node up: datum=(%.6f, %.6f), node_period=%.3fs",
+              "fusion_graph_node up: datum=(%.9f, %.9f), node_period=%.3fs",
               datum_lat_,
               datum_lon_,
               node_period_s);

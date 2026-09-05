@@ -106,9 +106,11 @@ void GraphManager::ResetLocked()
 
   next_index_ = 0;
   last_node_time_s_ = 0.0;
+  node_time_index_.clear();
   initialized_ = false;
 
   accum_.Reset();
+  slip_window_.Clear();
   queue_ = UnaryQueue{};
 
   latest_.reset();
@@ -197,7 +199,7 @@ bool GraphManager::Save(const std::string& prefix) const
     // Datum (WGS84) tags the map to its garden so a keyframe map is rejected
     // at a different site on Load. 9 decimals ≈ 0.1 mm at lat/lon scale.
     meta_os << "datum_lat=" << std::fixed << std::setprecision(9) << params_.datum_lat << "\n";
-    meta_os << "datum_lon=" << params_.datum_lon << "\n";
+    meta_os << "datum_lon=" << std::fixed << std::setprecision(9) << params_.datum_lon << "\n";
     // Wall-clock seconds need ≥10 integer digits + a few fractional, so
     // default 6-digit iostream precision (1.7774e+09) silently corrupts
     // the timestamp. setprecision(15) is safe for double round-trip.
@@ -307,8 +309,8 @@ bool GraphManager::Load(const std::string& prefix)
        std::abs(loaded_datum_lon - params_.datum_lon) > 1.0e-6))
   {
     fprintf(stderr,
-            "fusion_graph::Load: datum mismatch (persisted map cfg=%.7f,%.7f vs "
-            "loaded=%.7f,%.7f) — rejecting cross-garden map\n",
+            "fusion_graph::Load: datum mismatch (persisted map cfg=%.9f,%.9f vs "
+            "loaded=%.9f,%.9f) — rejecting cross-garden map\n",
             params_.datum_lat,
             params_.datum_lon,
             loaded_datum_lat,
@@ -349,7 +351,15 @@ bool GraphManager::Load(const std::string& prefix)
   gtsam::Values kept_values;
   for (const auto& key_value : loaded_values)
   {
-    if (cutoff > 0 && gtsam::Symbol(key_value.key).index() < cutoff)
+    const gtsam::Symbol sym(key_value.key);
+    // Only pose keys ('x') are restored. A graph saved with use_imu_preint=true
+    // also serializes per-node gyro-bias variables (Symbol 'b', type double):
+    // casting those to Pose2 throws at boot, and re-inserting them with no
+    // factor referencing them leaves the update underconstrained. Bias is
+    // cheap to re-estimate live, so drop them on load.
+    if (sym.chr() != 'x')
+      continue;
+    if (cutoff > 0 && sym.index() < cutoff)
       continue;  // older than the window — drop (its info was already in priors)
     fg.add(gtsam::PriorFactor<gtsam::Pose2>(key_value.key,
                                             key_value.value.cast<gtsam::Pose2>(),
@@ -417,6 +427,11 @@ bool GraphManager::Load(const std::string& prefix)
     out.node_index = next_index_ - 1;
     out.timestamp = last_node_time_s_;
     latest_ = out;
+    // Persisted files store the latest timestamp but not a complete per-node
+    // timeline. Index only the pose whose epoch is known; subsequent live
+    // ticks extend the history without guessing timestamps for older poses.
+    node_time_index_.clear();
+    node_time_index_.emplace_back(last_node_time_s_, out.node_index);
   }
 
   return true;

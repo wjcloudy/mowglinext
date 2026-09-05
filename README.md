@@ -8,11 +8,8 @@
   <a href="https://www.behaviortree.dev/">
     <img src="https://img.shields.io/badge/BehaviorTree.CPP-v4-orange" alt="BehaviorTree">
   </a>
-  <a href="https://docs.ros.org/en/noetic/api/robot_localization/html/">
-    <img src="https://img.shields.io/badge/robot_localization-dual_EKF-success" alt="EKF">
-  </a>
   <a href="https://gtsam.org/">
-    <img src="https://img.shields.io/badge/GTSAM-iSAM2-purple" alt="GTSAM">
+    <img src="https://img.shields.io/badge/localizer-fusion__graph_(GTSAM_iSAM2)-purple" alt="GTSAM">
   </a>
   <a href="https://github.com/Fields2Cover/Fields2Cover">
     <img src="https://img.shields.io/badge/Coverage-Fields2Cover-yellow" alt="Coverage">
@@ -47,13 +44,13 @@
   <a href="https://mowgli.garden">
     <img src="https://img.shields.io/badge/Website-mowgli.garden-success">
   </a>
-  <a href="https://github.com/cedbossneo/mowglinext/wiki">
+  <a href="https://github.com/mowglinext/mowglinext/wiki">
     <img src="https://img.shields.io/badge/Wiki-Documentation-blue">
   </a>
-  <a href="https://github.com/cedbossneo/mowglinext/discussions">
+  <a href="https://github.com/mowglinext/mowglinext/discussions">
     <img src="https://img.shields.io/badge/Discussions-GitHub-purple">
   </a>
-  <a href="https://github.com/cedbossneo/mowglinext/issues">
+  <a href="https://github.com/mowglinext/mowglinext/issues">
     <img src="https://img.shields.io/badge/Issues-GitHub-red">
   </a>
   <a href="CONTRIBUTING.md">
@@ -63,9 +60,9 @@
 
 ---
 
-> **Beta — Work in Progress**
+> ## 🌱 First Public Beta — Open to Testers
 >
-> MowgliNext is under active development and **not ready for production use**. We're building in the open and welcome early adopters.
+> MowgliNext has reached its **first beta**: a complete autonomous mowing stack running on real hardware — undock, mow, avoid obstacles, dock, resume. We're now inviting testers to run it on their own mowers and help us harden it. Expect rough edges, and tell us what breaks: [open an issue](https://github.com/mowglinext/mowglinext/issues) or [join the discussion](https://github.com/mowglinext/mowglinext/discussions).
 
 ---
 
@@ -73,11 +70,11 @@
 
 A fully autonomous mowing stack running on real hardware: undock, navigate to zones, mow strip-by-strip with sub-centimeter accuracy, avoid obstacles, dock to charge, and resume.
 
-**Core:** robot_localization dual EKF (GPS + IMU + wheels, REP-105 map/odom) · opt-in GTSAM iSAM2 factor-graph localizer (`fusion_graph`) with LiDAR scan-matching + loop-closure · Nav2 navigation · BehaviorTree.CPP v4 · cell-based strip coverage planner
+**Core:** GTSAM iSAM2 factor-graph localizer (`fusion_graph`) — sole map+odom localizer (GPS + IMU + wheels + optional LiDAR scan-matching + loop-closure, REP-105 map/odom) · Nav2 navigation · BehaviorTree.CPP v4 · multi-area continuous-subpath coverage
 
-**Hardware:** YardForce chassis · ARM64 SBC (RK3566/RK3588, RPi 4/5) · u-blox F9P RTK-GPS · LDRobot LD19 LiDAR · STM32 firmware
+**Hardware:** YardForce chassis · ARM64 SBC (RK3566/RK3588, RPi 4/5) · RTK-GNSS via the Universal GNSS runtime (u-blox F9P, Unicore UM98x, or generic NMEA) · LiDAR (LDRobot LD19 / STL27L, RPLIDAR A1) · STM32 firmware
 
-See the **[Architecture wiki page](https://github.com/cedbossneo/mowglinext/wiki/Architecture)** for full system design and data flow.
+See the **[Architecture wiki page](https://github.com/mowglinext/mowglinext/wiki/Architecture)** for full system design and data flow.
 
 ## Dashboard
 
@@ -85,9 +82,9 @@ See the **[Architecture wiki page](https://github.com/cedbossneo/mowglinext/wiki
   <img src="docs/screenshots/dashboard-mowing.png" alt="Dashboard — mowing state" width="720">
 </p>
 
-State-adaptive hero card with live sparkline telemetry, health checks, and contextual actions. Weekly schedule grid, statistics with bar charts, and full Mapbox map editor. Dark & light themes, responsive mobile layout.
+State-adaptive hero card with a live mini-map, telemetry tiles, health checks, and contextual actions. Weekly schedule grid, statistics with bar charts, and full Mapbox map editor. Dark-only theme with Visual / Balanced / Efficient display modes, responsive mobile layout.
 
-See the **[GUI wiki page](https://github.com/cedbossneo/mowglinext/wiki/GUI)** for all pages and design details.
+See the **[GUI wiki page](https://github.com/mowglinext/mowglinext/wiki/GUI)** for all pages and design details.
 
 ## Quick Start
 
@@ -99,26 +96,34 @@ curl -sSL https://mowgli.garden/install.sh | bash
 
 The website composer and bootstrap installer now target the Universal GNSS runtime only for direct GNSS setups.
 
-GUI at `http://<mower-ip>:4006` · See **[Getting Started](https://github.com/cedbossneo/mowglinext/wiki/Getting-Started)** for full setup.
+GUI at `http://<mower-ip>:4006` · See **[Getting Started](https://github.com/mowglinext/mowglinext/wiki/Getting-Started)** for full setup.
+
+### Local Webots simulation
+
+The ROS 2 stack also has a Webots simulation for development and integration
+testing. See the [ROS 2 simulation instructions](ros2/README.md#running-webots-simulation)
+for a clean Docker checkout, browser access, and platform notes.
 
 ## Monorepo
 
 | Directory | Description |
 |-----------|-------------|
-| [`ros2/`](ros2/) | ROS2 stack: Nav2, robot_localization, opt-in fusion_graph (GTSAM iSAM2), BT, coverage, hardware bridge |
+| [`ros2/`](ros2/) | ROS2 stack: Nav2, fusion_graph (GTSAM iSAM2 sole localizer), BT, coverage, hardware bridge |
 | [`gui/`](gui/) | React + Go web interface |
 | [`firmware/`](firmware/) | STM32 motor control, IMU, blade safety |
-| [`install/`](install/) | Interactive installer, Docker Compose configs |
-| [`sensors/`](sensors/) | Dockerized GPS & LiDAR drivers |
-| [`docs/`](docs/) | GitHub Pages at [mowgli.garden](https://mowgli.garden) |
+| [`install/`](install/) | Interactive installer, hardware presets, modular Docker Compose configs |
+| [`docker/`](docker/) | Manual deployment configs, DDS settings, service orchestration |
+| [`sensors/`](sensors/) | Dockerized GNSS & LiDAR drivers |
+| [`docs/`](docs/) | GitHub Pages at [mowgli.garden](https://mowgli.garden) + the `docs/claude/` reference index |
 
 ## Documentation
 
 | Resource | Content |
 |----------|---------|
-| **[Wiki](https://github.com/cedbossneo/mowglinext/wiki)** | Architecture, configuration, deployment, sensors, firmware, BT, GUI, FAQ |
+| **[Wiki](https://github.com/mowglinext/mowglinext/wiki)** | Architecture, configuration, deployment, sensors, firmware, BT, GUI, FAQ |
 | **[Website](https://mowgli.garden)** | Landing page, install composer, features overview |
 | **[First Boot](docs/FIRST_BOOT.md)** | Post-install checklist |
+| **[ROS 2 simulation](ros2/README.md#running-webots-simulation)** | Local Webots simulation with Docker |
 
 ## A Word About OpenMower
 
@@ -126,7 +131,15 @@ MowgliNext exists because of [OpenMower](https://openmower.de/). They proved rob
 
 ## Contributing
 
-We welcome contributions! See the [Contributing Guide](CONTRIBUTING.md) and [AI-Assisted Contributing](https://github.com/cedbossneo/mowglinext/wiki/AI-Assisted-Contributing).
+We welcome contributions! See the [Contributing Guide](CONTRIBUTING.md) and [AI-Assisted Contributing](https://github.com/mowglinext/mowglinext/wiki/AI-Assisted-Contributing).
+
+### Working with Claude Code (or any coding agent)
+
+Start at [`CLAUDE.md`](CLAUDE.md) — safety rules, monorepo layout and the architecture invariants that override everything else. Then load only what you need:
+
+- [`docs/claude/doc-index.md`](docs/claude/doc-index.md) — which document is authoritative and which is a dated record
+- [`docs/claude/codemaps/`](docs/claude/codemaps/) — per-area "where to look" maps, plus the nested `CLAUDE.md` in `ros2/`, `gui/`, `firmware/`, `install/`, `docker/`, `sensors/`
+- [`docs/claude/ros-interfaces.md`](docs/claude/ros-interfaces.md) · [`parameters.md`](docs/claude/parameters.md) · [`testing-ci.md`](docs/claude/testing-ci.md) — every topic/service/action, every config key, every test and the CI job that gates it
 
 ## Acknowledgments
 

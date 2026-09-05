@@ -1,12 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useApi } from "./useApi.ts";
 import { App } from "antd";
 import { dirtyKeysRequireGpsRestart, restartGps } from "../utils/containers.ts";
 import { useContainerRestart } from "./useContainerRestart.ts";
 import { getQuaternionFromHeading } from "../utils/map.tsx";
 import { ContentType } from "../api/Api.ts";
+import { valuesMatch } from "../utils/settingsValues.ts";
+
+/** A section that saves outside mowgli_robot.yaml but wants the page's Save button. */
+export interface ExternalSaver {
+    /** Number of pending edits (0 = clean). Feeds the Save button count. */
+    dirtyCount: number;
+    /** Persist; resolve true on success, false after showing its own error. */
+    save: () => Promise<boolean>;
+    /** Drop pending edits (page-level Revert). */
+    revert?: () => void;
+}
 
 export type SettingsSection =
+    | "appearance"
     | "hardware"
     | "drive_motor"
     | "ntrip"
@@ -17,8 +30,11 @@ export type SettingsSection =
     | "docking"
     | "battery"
     | "safety"
+    | "obstacles"
     | "navigation"
     | "rain"
+    | "leds"
+    | "irrisense"
     | "advanced";
 
 export type SectionMeta = {
@@ -31,10 +47,17 @@ export type SectionMeta = {
 
 const SECTION_DEFINITIONS: SectionMeta[] = [
     {
+        id: "appearance",
+        label: "settingsSections.appearance.label",
+        icon: "bg-colors",
+        description: "settingsSections.appearance.description",
+        keys: [],
+    },
+    {
         id: "hardware",
-        label: "Hardware",
+        label: "settingsSections.hardware.label",
         icon: "tool",
-        description: "Robot model, wheels, chassis, and blade dimensions",
+        description: "settingsSections.hardware.description",
         keys: [
             "mower_model", "wheel_radius", "wheel_track", "wheel_width",
             "wheel_x_offset", "chassis_center_x", "chassis_length", "chassis_width",
@@ -44,9 +67,9 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
     },
     {
         id: "drive_motor",
-        label: "Drive Motor",
+        label: "settingsSections.drive_motor.label",
         icon: "dashboard",
-        description: "Firmware wheel-velocity PID gains and feedforward (applied live)",
+        description: "settingsSections.drive_motor.description",
         keys: [
             "wheel_pid_kp", "wheel_pid_ki", "wheel_pid_kd",
             "wheel_pid_integral_limit", "wheel_pid_pwm_per_mps",
@@ -54,9 +77,9 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
     },
     {
         id: "ntrip",
-        label: "NTRIP Corrections",
+        label: "settingsSections.ntrip.label",
         icon: "wifi",
-        description: "RTK correction network and base station — set this before GPS",
+        description: "settingsSections.ntrip.description",
         keys: [
             "ntrip_enabled", "ntrip_host", "ntrip_port",
             "ntrip_user", "ntrip_password", "ntrip_mountpoint",
@@ -64,73 +87,81 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
     },
     {
         id: "positioning",
-        label: "GPS & Positioning",
+        label: "settingsSections.positioning.label",
         icon: "global",
-        description: "Universal GNSS receiver and map datum",
+        description: "settingsSections.positioning.description",
         keys: [
             "datum_lat", "datum_lon", "datum_alt",
             "gnss_receiver_family", "gnss_serial_device", "gnss_serial_baud",
-            "gnss_config_baud", "gnss_profile", "gnss_signal_profile",
+            "gnss_config_baud", "gnss_execution_baud", "gnss_profile", "gnss_signal_profile",
             "gnss_profile_rate_hz", "gnss_signal_group",
             "gnss_unicore_pvt_algorithm", "gnss_unicore_rtk_reliability",
             "gnss_unicore_rtk_timeout_s", "gnss_unicore_dgps_timeout_s",
             "gps_wait_after_undock_sec", "gps_timeout_sec",
+            "gnss_receiver_model",
         ],
     },
     {
         id: "sensors",
-        label: "Sensors",
+        label: "settingsSections.sensors.label",
         icon: "aim",
-        description: "LiDAR, IMU, and GPS antenna placement on the robot",
+        description: "settingsSections.sensors.description",
         keys: [
             "lidar_enabled", "lidar_x", "lidar_y", "lidar_z", "lidar_yaw",
             "imu_x", "imu_y", "imu_z", "imu_yaw", "imu_pitch", "imu_roll",
             "gps_x", "gps_y", "gps_z",
             "dock_pose_yaw",
+            "imu_cal_samples", "imu_cal_auto_rest_sec", "imu_cal_periodic_recal_sec",
         ],
     },
     {
         id: "localization",
-        label: "Localization",
+        label: "settingsSections.localization.label",
         icon: "node-index",
-        description: "Map-frame fusion strategy and optional LiDAR factors",
+        description: "settingsSections.localization.description",
         keys: [
             "use_scan_matching", "use_loop_closure",
             "use_magnetometer",
+            "enable_mag_cal", "declination_deg", "min_horizontal_uT", "mag_yaw_variance",
         ],
     },
     {
         id: "mowing",
-        label: "Mowing",
+        label: "settingsSections.mowing.label",
         icon: "scissor",
-        description: "Speed, swath/headland, angle, and outline settings",
+        description: "settingsSections.mowing.description",
         keys: [
             // NOTE: path_spacing intentionally omitted — it is a dead knob. F2C
             // swath spacing = tool_width (coverage_server.operation_width); a
             // separate spacing value re-opens the swath-gap bug. The preview and
             // tool_width (Geometry section) are the real controls.
-            "mowing_enabled", "mowing_speed", "transit_speed", "outline_passes",
-            "outline_offset", "outline_overlap", "headland_width",
-            "num_headland_passes", "chassis_safety_inset",
-            "min_turning_radius", "mow_angle_offset_deg", "mow_angle_increment_deg",
+            // The outline_*/mow_angle_* knobs were removed: NO ros2 node reads
+            // them (navigation.launch.py forwards only the keys below to
+            // coverage_server, and the BT hardcodes mow_angle_deg=-1.0 "auto"),
+            // so they were dead controls. swath_overlap (a real coverage_server
+            // param) is surfaced here instead.
+            "mowing_enabled", "mowing_speed", "transit_speed",
+            "headland_width", "num_headland_passes", "swath_overlap",
+            "chassis_safety_inset", "min_turning_radius", "mow_direction",
         ],
     },
     {
         id: "docking",
-        label: "Docking",
+        label: "settingsSections.docking.label",
         icon: "home",
-        description: "Undock distance, approach, retry settings",
+        description: "settingsSections.docking.description",
         keys: [
             "undock_distance", "undock_speed", "dock_approach_distance",
             "dock_max_retries", "dock_use_charger_detection",
             "dock_charging_threshold",
+            "dock_approach_overshoot", "dock_pose_yaw_sigma_rad",
         ],
     },
     {
         id: "battery",
-        label: "Battery",
+        label: "settingsSections.battery.label",
         icon: "thunderbolt",
-        description: "Voltage and percentage thresholds for charging",
+        description: "settingsSections.battery.description",
         keys: [
             "battery_full_voltage", "battery_empty_voltage", "battery_critical_voltage",
             "battery_full_percent", "battery_low_percent", "battery_critical_percent",
@@ -139,20 +170,41 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
     },
     {
         id: "safety",
-        label: "Safety",
+        label: "settingsSections.safety.label",
         icon: "safety",
-        description: "Emergency stops, temperature limits, obstacle avoidance",
+        description: "settingsSections.safety.description",
         keys: [
-            "motor_temp_high_c", "motor_temp_low_c",
-            "max_obstacle_avoidance_distance",
+            // motor_temp_high_c / motor_temp_low_c REMOVED (issue #195): no
+            // layer of the stack implements a thermal blade cutoff — the
+            // firmware only measures and reports blade temperature. The real
+            // surface is mowgli_monitoring's motor_temp_warn_c /
+            // motor_temp_error_c diagnostics thresholds.
+            // The two lift keys below stay CLAIMED by this section but are
+            // deliberately NOT rendered (see SafetySection.tsx):
+            // lift_recovery_mode suppresses the ROS2 lift emergency and
+            // auto-releases the firmware latch, and the delay is inert unless
+            // that mode is on. Listing them here is what keeps them out of
+            // AdvancedSection's free-form editor, exactly as before.
             "lift_blade_resume_delay_sec", "lift_recovery_mode",
         ],
     },
     {
+        id: "obstacles",
+        label: "settingsSections.obstacles.label",
+        icon: "warning",
+        description: "settingsSections.obstacles.description",
+        keys: [
+            "obstacle_inflation_radius", "max_obstacle_avoidance_distance",
+            "obstacle_clearance_margin", "obstacle_detection_range_m",
+            "obstacle_wait_timeout_s",
+            "obstacle_margin", "obstacle_slowdown_ratio",
+        ],
+    },
+    {
         id: "navigation",
-        label: "Navigation",
+        label: "settingsSections.navigation.label",
         icon: "compass",
-        description: "Goal tolerances and progress timeout",
+        description: "settingsSections.navigation.description",
         keys: [
             "xy_goal_tolerance", "yaw_goal_tolerance", "coverage_xy_tolerance",
             "progress_timeout_sec",
@@ -160,33 +212,63 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
     },
     {
         id: "rain",
-        label: "Rain",
+        label: "settingsSections.rain.label",
         icon: "cloud",
-        description: "Rain detection behavior and delay",
+        description: "settingsSections.rain.description",
         keys: ["rain_mode", "rain_delay_minutes", "rain_debounce_sec"],
     },
     {
+        id: "leds",
+        label: "settingsSections.leds.label",
+        icon: "bulb",
+        description: "settingsSections.leds.description",
+        keys: [
+            // Every led_* key is claimed here so none of them leaks into
+            // AdvancedSection's free-form editor, where a raw SPI device path
+            // or clock would be edited with no context.
+            "led_enabled", "led_count", "led_spi_device", "led_spi_speed_hz",
+            "led_brightness", "led_idle_scale", "led_refresh_hz",
+            "led_low_battery_percent", "led_charge_full_percent",
+            "led_status_timeout_s", "led_keepalive_s", "led_device_retry_s",
+        ],
+    },
+    {
+        id: "irrisense",
+        label: "settingsSections.irrisense.label",
+        icon: "cloud-sync",
+        description: "settingsSections.irrisense.description",
+        // No yaml keys: the IrriSense settings (token included) live in the
+        // GUI's key-value DB and the section loads/saves them itself.
+        keys: [],
+    },
+    {
         id: "advanced",
-        label: "Advanced",
+        label: "settingsSections.advanced.label",
         icon: "code",
-        description: "Raw parameters and custom key-value pairs",
+        description: "settingsSections.advanced.description",
         keys: [],
     },
 ];
 
 export const useSettingsManager = () => {
+    const { t } = useTranslation();
     const guiApi = useApi();
     const { notification } = App.useApp();
     const [savedValues, setSavedValues] = useState<Record<string, any>>({});
     const [localValues, setLocalValues] = useState<Record<string, any>>({});
+    // Schema defaults = the GUI's source of "default value" for each key.
+    // (The backend derives these from the JSON schema, which stands in for the
+    // ROS2 package template it cannot read at runtime.) Used for the
+    // per-field "reset to default" affordance and the overridden indicator.
+    const [defaults, setDefaults] = useState<Record<string, any>>({});
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
     const [restartRequired, setRestartRequired] = useState(false);
     // GPS restart skips the rosbridge readiness probe (ROS2 is unaffected).
     const gpsRestart = useContainerRestart({
-        pendingLabel: "Redémarrage GPS…",
-        successMessage: "GPS redémarré — patientez ~10–30 s pour le RTK Fix",
-        errorMessage: "Échec du redémarrage GPS",
+        pendingLabel: t("settingsManager.gpsRestartPending"),
+        successMessage: t("settingsManager.gpsRestartSuccess"),
+        errorMessage: t("settingsManager.gpsRestartError"),
         skipReadinessProbe: true,
     });
     const [searchQuery, setSearchQuery] = useState("");
@@ -199,13 +281,27 @@ export const useSettingsManager = () => {
                 setLoading(true);
                 const res = await guiApi.settings.yamlList();
                 if (res.error) throw new Error((res.error as any).error);
-                const data = (res.data as Record<string, any>) || {};
+                const data = (res.data) || {};
                 setSavedValues(data);
                 setLocalValues(data);
+                // Best-effort: the reset-to-default UI degrades gracefully
+                // (no reset icons) if this fails, so it must not block load.
+                try {
+                    const defRes = await guiApi.request({
+                        path: "/settings/yaml/defaults",
+                        method: "GET",
+                        format: "json",
+                    });
+                    if (!defRes.error) {
+                        setDefaults((defRes.data as Record<string, any>) || {});
+                    }
+                } catch {
+                    /* defaults unavailable — reset affordance hidden */
+                }
                 initialLoadDone.current = true;
             } catch (e: any) {
                 notification.error({
-                    message: "Failed to load settings",
+                    message: t("settingsSections.toasts.loadFailed"),
                     description: e.message,
                 });
             } finally {
@@ -221,6 +317,41 @@ export const useSettingsManager = () => {
     const handleBulkChange = useCallback((changes: Record<string, any>) => {
         setLocalValues((prev) => ({ ...prev, ...changes }));
     }, []);
+
+    // hasDefault: the schema knows a default for this key (so a reset is
+    // meaningful). isDefault: the current local value already equals that
+    // default (tolerating int/float JSON churn, so 5 == 5.0). isOverridden:
+    // has a default AND the local value differs from it — the operator has
+    // pinned a non-default value that we should visually flag.
+    // valuesMatch is imported from ../utils/settingsValues.ts (null-safe;
+    // the old inline copy treated valuesMatch(null, 0) as true via Number(null)).
+    const hasDefault = useCallback(
+        (key: string): boolean => key in defaults,
+        [defaults]
+    );
+
+    const isDefault = useCallback(
+        (key: string): boolean =>
+            key in defaults && valuesMatch(localValues[key], defaults[key]),
+        [defaults, localValues]
+    );
+
+    const isOverridden = useCallback(
+        (key: string): boolean =>
+            key in defaults && !valuesMatch(localValues[key], defaults[key]),
+        [defaults, localValues]
+    );
+
+    // resetToDefault reverts a field to its schema default in the local (unsaved)
+    // state; the operator still presses Save to persist. On save the backend
+    // prunes default-valued keys, so the installed config stays sparse.
+    const resetToDefault = useCallback(
+        (key: string) => {
+            if (!(key in defaults)) return;
+            setLocalValues((prev) => ({ ...prev, [key]: defaults[key] }));
+        },
+        [defaults]
+    );
 
     // Dirty detection
     const dirtyKeys = useMemo(() => {
@@ -238,12 +369,39 @@ export const useSettingsManager = () => {
         return dirty;
     }, [localValues, savedValues]);
 
-    const isDirty = dirtyKeys.size > 0;
+    // External savers: sections whose settings do not live in mowgli_robot.yaml
+    // (IrriSense keeps its token in the GUI DB) register here so the page's
+    // ONE Save button covers them too. Refs hold the callbacks (no stale
+    // closure in persistSettings); the state mirror only drives rendering.
+    const externalSaversRef = useRef<Record<string, ExternalSaver>>({});
+    const [externalDirtyCounts, setExternalDirtyCounts] = useState<Record<string, number>>({});
+    const registerExternalSaver = useCallback((id: string, saver: ExternalSaver) => {
+        externalSaversRef.current[id] = saver;
+        setExternalDirtyCounts((prev) =>
+            prev[id] === saver.dirtyCount ? prev : { ...prev, [id]: saver.dirtyCount }
+        );
+    }, []);
+    const unregisterExternalSaver = useCallback((id: string) => {
+        delete externalSaversRef.current[id];
+        setExternalDirtyCounts((prev) => {
+            if (!(id in prev)) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+        });
+    }, []);
+    const externalDirtyCount = useMemo(
+        () => Object.values(externalDirtyCounts).reduce((a, b) => a + b, 0),
+        [externalDirtyCounts]
+    );
+    const dirtyCount = dirtyKeys.size + externalDirtyCount;
+    const isDirty = dirtyCount > 0;
 
     const isSectionDirty = useCallback(
         (sectionId: SettingsSection): boolean => {
             const section = SECTION_DEFINITIONS.find((s) => s.id === sectionId);
             if (!section) return false;
+            if ((externalDirtyCounts[section.id] ?? 0) > 0) return true;
             if (section.id === "advanced") {
                 // Advanced section: any key not in other sections
                 const knownKeys = new Set(
@@ -256,7 +414,7 @@ export const useSettingsManager = () => {
             }
             return section.keys.some((k) => dirtyKeys.has(k));
         },
-        [dirtyKeys]
+        [dirtyKeys, externalDirtyCounts]
     );
 
     const persistSettings = useCallback(async (options?: { forceGpsRestart?: boolean }) => {
@@ -279,9 +437,10 @@ export const useSettingsManager = () => {
             const liveHardwareKeys = ["ticks_per_meter", ...driveKeys];
             const liveHardwareDirty = liveHardwareKeys.some((k) => dirtyKeys.has(k));
             const hasDirtyChanges = dirtyKeys.size > 0;
-            if (!hasDirtyChanges && !shouldRestartGps) {
+            const externalSavers = Object.values(externalSaversRef.current).filter((x) => x.dirtyCount > 0);
+            if (!hasDirtyChanges && !shouldRestartGps && externalSavers.length === 0) {
                 notification.info({
-                    message: "No changes to save",
+                    message: t("settingsSections.toasts.noChanges"),
                 });
                 return;
             }
@@ -299,18 +458,33 @@ export const useSettingsManager = () => {
             if (hasDirtyChanges) {
                 const res = await guiApi.settings.yamlCreate(dirtyPayload);
                 if (res.error) throw new Error((res.error as any).error);
-                setSavedValues({ ...localValues });
+                // AdvancedSection deletes surface as null-valued keys. The
+                // backend drops null keys from the YAML on save, so prune them
+                // from local state too — otherwise the deleted rows reappear.
+                const pruned: Record<string, any> = {};
+                for (const [key, value] of Object.entries(localValues)) {
+                    if (value !== null) {
+                        pruned[key] = value;
+                    }
+                }
+                setSavedValues(pruned);
+                setLocalValues(pruned);
                 setRestartRequired(true);
                 notification.success({
-                    message: "Settings saved",
+                    message: t("settingsSections.toasts.saved"),
                     description: shouldRestartGps
-                        ? "Restarting GPS to apply GNSS changes. Restart ROS2 to apply other saved changes."
-                        : "Restart ROS2 to apply changes.",
+                        ? t("settingsSections.toasts.savedGpsRestartDescription")
+                        : t("settingsSections.toasts.savedDescription"),
                 });
             } else if (shouldRestartGps) {
                 notification.info({
-                    message: "Restarting GPS with current settings",
+                    message: t("settingsSections.toasts.restartingGps"),
                 });
+            }
+            // Sections that persist outside the yaml (IrriSense) save through
+            // their own endpoint; each reports its own toast on failure.
+            for (const saver of externalSavers) {
+                if (!(await saver.save())) return;
             }
             // Auto-restart the GPS container when GPS/NTRIP fields changed —
             // ROS2 keeps running, the user just sees RTCM stop briefly. This
@@ -342,12 +516,15 @@ export const useSettingsManager = () => {
                         // Manual settings edit: use the typed dock_pose_x/y as-is
                         // (operator entered the value explicitly — no GPS override).
                         use_gps_position: false,
+                        // Honour the typed heading (SetDockingPoint yaw_source REQUEST=1);
+                        // an operator-entered yaw is explicit, never circular.
+                        yaw_source: 1,
                     });
                 } catch (e: any) {
                     notification.warning({
-                        message: "Settings saved, but map_server runtime refresh failed",
+                        message: t("settingsSections.toasts.dockRefreshFailed"),
                         description: e?.message ??
-                            "Restart ROS2 (or call /map_server_node/set_docking_point manually) to pick up the new dock pose.",
+                            t("settingsSections.toasts.dockRefreshFailedDescription"),
                     });
                 }
             }
@@ -356,7 +533,7 @@ export const useSettingsManager = () => {
             // restart). yamlCreate above persisted them to mowgli_robot.yaml
             // for the next boot; this sets the live ROS params too. The
             // hardware_bridge callback applies ticks_per_meter in-process and
-            // re-sends drive PID/feedforward to the STM32 firmware.
+            // re-sends the full drive runtime tuning packet to the STM32 firmware.
             if (hasDirtyChanges && liveHardwareDirty) {
                 const parameters = liveHardwareKeys
                     .filter((k) => dirtyKeys.has(k) && k in localValues)
@@ -372,22 +549,22 @@ export const useSettingsManager = () => {
                         });
                     } catch (e: any) {
                         notification.warning({
-                            message: "Settings saved, but live wheel/drive update failed",
+                            message: t("settingsSections.toasts.drivePidUpdateFailed"),
                             description: e?.message ??
-                                "Restart ROS2 to apply the new wheel and drive-motor settings.",
+                                t("settingsSections.toasts.drivePidUpdateFailedDescription"),
                         });
                     }
                 }
             }
         } catch (e: any) {
             notification.error({
-                message: "Failed to save settings",
+                message: t("settingsSections.toasts.saveFailed"),
                 description: e.message,
             });
         } finally {
             setSaving(false);
         }
-    }, [localValues, dirtyKeys, guiApi, notification, gpsRestart]);
+    }, [localValues, dirtyKeys, guiApi, notification, gpsRestart, t]);
 
     const savePartialValues = useCallback(async (
         partialValues: Record<string, any>,
@@ -426,7 +603,7 @@ export const useSettingsManager = () => {
 
             if (!options?.silentSuccess) {
                 notification.success({
-                    message: options?.successMessage ?? "Settings saved",
+                    message: options?.successMessage ?? t("settingsSections.toasts.saved"),
                     description: options?.successDescription,
                 });
             }
@@ -434,14 +611,14 @@ export const useSettingsManager = () => {
             return true;
         } catch (e: any) {
             notification.error({
-                message: options?.errorMessage ?? "Failed to save settings",
+                message: options?.errorMessage ?? t("settingsSections.toasts.saveFailed"),
                 description: e.message,
             });
             return false;
         } finally {
             setSaving(false);
         }
-    }, [guiApi, notification, savedValues]);
+    }, [guiApi, notification, savedValues, t]);
 
     const acceptPersistedValues = useCallback((persistedValues: Record<string, any>) => {
         setSavedValues((prev) => ({ ...prev, ...persistedValues }));
@@ -458,6 +635,9 @@ export const useSettingsManager = () => {
 
     const revert = useCallback(() => {
         setLocalValues({ ...savedValues });
+        for (const saver of Object.values(externalSaversRef.current)) {
+            saver.revert?.();
+        }
     }, [savedValues]);
 
     // Get keys that don't belong to any defined section.
@@ -481,6 +661,20 @@ export const useSettingsManager = () => {
         "gps_antenna_y",
         "gps_antenna_z",
         "automatic_mode",
+        // Retired in issue #195: removed from the ROS2 template AND the GUI
+        // schema because no node ever read them. Belt-and-braces for a robot
+        // whose installed yaml still carries them between the schema removal
+        // and the retired-key scrub that runs on the next Settings save
+        // (gui/pkg/api/settings.go retiredParamKeys) — same rationale as
+        // slam_mode / map_save_on_dock above: dead config that would silently
+        // mislead anyone who edits it.
+        "outline_passes",
+        "outline_offset",
+        "outline_overlap",
+        "mow_angle_offset_deg",
+        "mow_angle_increment_deg",
+        "motor_temp_high_c",
+        "motor_temp_low_c",
     ]);
     const advancedKeys = useMemo(() => {
         const knownKeys = new Set(
@@ -508,17 +702,25 @@ export const useSettingsManager = () => {
         sections: SECTION_DEFINITIONS,
         values: localValues,
         savedValues,
+        defaults,
         loading,
         saving,
         gpsRestarting: gpsRestart.pending,
         isDirty,
         dirtyKeys,
+        dirtyCount,
+        registerExternalSaver,
+        unregisterExternalSaver,
         restartRequired,
         searchQuery,
         advancedKeys,
         setSearchQuery,
         handleChange,
         handleBulkChange,
+        hasDefault,
+        isDefault,
+        isOverridden,
+        resetToDefault,
         isSectionDirty,
         matchesSearch,
         save,

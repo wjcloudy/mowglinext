@@ -25,8 +25,11 @@ set(msg_files
   "msg/WheelTick.msg"
   "msg/ImuRaw.msg"
   "msg/MapArea.msg"
+  "msg/MapObstacleInfo.msg"
   "msg/ObstacleArray.msg"
   "msg/TrackedObstacle.msg"
+  "msg/DockCalibrationStatus.msg"
+  "msg/DigEvent.msg"
 )
 
 # Declare service files
@@ -51,6 +54,7 @@ set(srv_files
 set(action_files
   "action/CoverageTask.action"
   "action/PlanCoverage.action"
+  "action/CalibrateDock.action"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -64,6 +68,24 @@ rosidl_generate_interfaces(${PROJECT_NAME}
     nav_msgs
 )
 
+add_library(${PROJECT_NAME}_headers INTERFACE)
+target_include_directories(${PROJECT_NAME}_headers INTERFACE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+install(
+  DIRECTORY include/
+  DESTINATION include
+)
+
+install(
+  TARGETS ${PROJECT_NAME}_headers
+  EXPORT export_${PROJECT_NAME}_headers
+)
+
+ament_export_include_directories(include)
+ament_export_targets(export_${PROJECT_NAME}_headers)
 ament_export_dependencies(rosidl_default_runtime)
 
 ament_package()

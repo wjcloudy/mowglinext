@@ -22,9 +22,8 @@
 #include <cmath>
 #include <tuple>
 
-#include <gtest/gtest.h>
-
 #include "mowgli_localization/cog_yaw_math.hpp"
+#include <gtest/gtest.h>
 
 using mowgli_localization::compute_cog_body_yaw;
 using mowgli_localization::wrap_angle;
@@ -45,12 +44,8 @@ double ang_diff(double a, double b)
 // the anchor sample and the current sample.
 //
 // Antenna body-frame velocity = (vx - omega*ry, omega*rx) with SIGNED vx.
-std::tuple<double, double> simulate_baseline(double vx,
-                                             double omega,
-                                             double rx,
-                                             double ry,
-                                             double psi_end,
-                                             double dt)
+std::tuple<double, double> simulate_baseline(
+    double vx, double omega, double rx, double ry, double psi_end, double dt)
 {
   const double vant_bx = vx - omega * ry;
   const double vant_by = omega * rx;
@@ -71,8 +66,8 @@ std::tuple<double, double> simulate_baseline(double vx,
 
 // Run the full estimator over a simulated baseline and return the recovered
 // body yaw. lever arm rx/ry default to the YardForce 500 mount.
-double recover_yaw(double vx, double omega, double psi_end, double rx = 0.30, double ry = 0.0,
-                   double dt = 0.5)
+double recover_yaw(
+    double vx, double omega, double psi_end, double rx = 0.30, double ry = 0.0, double dt = 0.5)
 {
   const auto [dx, dy] = simulate_baseline(vx, omega, rx, ry, psi_end, dt);
   const int wheel_sign = (vx >= 0.0) ? 1 : -1;
@@ -198,6 +193,66 @@ TEST(CogSweepGate, BoundaryAtRatio)
   EXPECT_FALSE(mowgli_localization::cog_sweep_dominates(0.1, 0.30, 0.03, 1.0));
   // Nudge omega up → now dominant.
   EXPECT_TRUE(mowgli_localization::cog_sweep_dominates(0.11, 0.30, 0.03, 1.0));
+}
+
+// ── Stationary-latch staleness accumulator ──────────────────────────────
+// cog_latch_rotation_increment() deadbands the per-sample rotation so a long
+// stationary dwell's gyro noise never accumulates into a false latch
+// invalidation, while a real in-place pivot trips the threshold quickly.
+// Field 2026-06-20: a stale post-pivot latch republished a heading 180° wrong
+// and teleported the fused yaw.
+
+TEST(CogLatchStaleness, NoiseBelowDeadbandDoesNotAccumulate)
+{
+  // 0.03 rad/s gyro noise, under a 0.05 deadband, integrated at 100 Hz for a
+  // full 10 minutes of standing still — must accumulate exactly zero.
+  double acc = 0.0;
+  const double deadband = 0.05;
+  const double dt = 0.01;
+  for (int i = 0; i < 100 * 600; ++i)
+  {
+    acc += mowgli_localization::cog_latch_rotation_increment(0.03, dt, deadband);
+  }
+  EXPECT_DOUBLE_EQ(acc, 0.0);
+}
+
+TEST(CogLatchStaleness, InPlacePivotTripsThreshold)
+{
+  // A 180° in-place pivot at 0.5 rad/s (well over deadband). By a quarter turn
+  // the accumulator is past the 0.26 rad staleness threshold, and by the end
+  // it has integrated ~the full half-turn magnitude.
+  double acc = 0.0;
+  const double deadband = 0.05;
+  const double threshold = 0.26;
+  const double omega = 0.5;
+  const double dt = 0.01;
+  const int n = static_cast<int>((M_PI / omega) / dt);  // samples for a half turn
+  bool tripped_before_quarter_turn = false;
+  for (int i = 0; i < n; ++i)
+  {
+    acc += mowgli_localization::cog_latch_rotation_increment(omega, dt, deadband);
+    if (i == n / 4 && acc > threshold)
+    {
+      tripped_before_quarter_turn = true;
+    }
+  }
+  EXPECT_TRUE(tripped_before_quarter_turn);
+  EXPECT_NEAR(acc, M_PI, 0.05);
+}
+
+TEST(CogLatchStaleness, NonPositiveDtContributesNothing)
+{
+  // Guards the out-of-order / first-sample dt path.
+  EXPECT_DOUBLE_EQ(mowgli_localization::cog_latch_rotation_increment(1.0, 0.0, 0.05), 0.0);
+  EXPECT_DOUBLE_EQ(mowgli_localization::cog_latch_rotation_increment(1.0, -0.1, 0.05), 0.0);
+}
+
+TEST(CogLatchStaleness, AtDeadbandIsNotAccumulated)
+{
+  // Strict > : a sample exactly at the deadband is treated as noise.
+  EXPECT_DOUBLE_EQ(mowgli_localization::cog_latch_rotation_increment(0.05, 0.01, 0.05), 0.0);
+  // Just above accumulates.
+  EXPECT_GT(mowgli_localization::cog_latch_rotation_increment(0.051, 0.01, 0.05), 0.0);
 }
 
 int main(int argc, char** argv)

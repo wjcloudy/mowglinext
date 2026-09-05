@@ -159,6 +159,25 @@ TEST(ScanMatcher, ConvergesWithWarmStart)
   EXPECT_NEAR(res.delta.theta(), T_truth.theta(), 0.03);
 }
 
+TEST(ScanMatcher, MinInliersOverrideGatesAcceptance)
+{
+  // The per-call min_inliers override must replace params.min_inliers at BOTH
+  // the in-loop early-abort and the final ok gate — this is what lets the
+  // keyframe path (kf_min_inliers) accept partial-overlap matches the shared
+  // scan-to-scan default (30) rejects. Full-overlap scans give many inliers, so
+  // the default and a lower override both accept; an override higher than any
+  // achievable inlier count must reject the same match.
+  const gtsam::Pose2 T_truth(0.03, 0.02, 0.02);
+  auto src = SyntheticScan(200, gtsam::Pose2());
+  auto tgt = SyntheticScan(200, T_truth);
+
+  fusion_graph::ScanMatcher matcher;
+  EXPECT_TRUE(matcher.Match(src, tgt, gtsam::Pose2()).ok);  // default (30)
+  EXPECT_TRUE(matcher.Match(src, tgt, gtsam::Pose2(), 16).ok);  // looser override accepts
+  EXPECT_FALSE(
+      matcher.Match(src, tgt, gtsam::Pose2(), 100000).ok);  // impossibly-high override rejects
+}
+
 TEST(ScanMatcher, EmptyInputsFail)
 {
   fusion_graph::ScanMatcher matcher;
@@ -220,12 +239,8 @@ TEST(GyroPreintFactor, BiasCancelsCorrectly)
 
 TEST(GyroPreintFactor, JacobianMatchesNumeric)
 {
-  GyroPreintFactor f(gtsam::Symbol('x', 0),
-                     gtsam::Symbol('x', 1),
-                     gtsam::Symbol('b', 1),
-                     0.15,
-                     0.5,
-                     UnitDiag1());
+  GyroPreintFactor f(
+      gtsam::Symbol('x', 0), gtsam::Symbol('x', 1), gtsam::Symbol('b', 1), 0.15, 0.5, UnitDiag1());
   const gtsam::Pose2 X_prev(0.5, 0.2, 0.3);
   const gtsam::Pose2 X_curr(0.7, 0.1, 0.45);
   const double bias = 0.02;
@@ -250,10 +265,9 @@ TEST(GyroPreintFactor, JacobianMatchesNumeric)
     auto e_minus2 = f.evaluateError(X_prev, X_curr.retract(-d_curr), bias);
     H2_num(0, i) = (e_plus2[0] - e_minus2[0]) / (2.0 * eps);
   }
-  H3_num(0, 0) =
-      (f.evaluateError(X_prev, X_curr, bias + eps)[0] -
-       f.evaluateError(X_prev, X_curr, bias - eps)[0]) /
-      (2.0 * eps);
+  H3_num(0, 0) = (f.evaluateError(X_prev, X_curr, bias + eps)[0] -
+                  f.evaluateError(X_prev, X_curr, bias - eps)[0]) /
+                 (2.0 * eps);
 
   for (int j = 0; j < 3; ++j)
   {
@@ -268,12 +282,8 @@ TEST(GyroPreintFactor, WrapsAroundPi)
   // X_prev.theta = π−0.05, X_curr.theta = -π+0.05 → actual Δθ = 0.10
   // (crosses ±π). Preint = 0.10, bias = 0 → residual must be 0
   // (NOT 2π − 0.10).
-  GyroPreintFactor f(gtsam::Symbol('x', 0),
-                     gtsam::Symbol('x', 1),
-                     gtsam::Symbol('b', 1),
-                     0.10,
-                     0.1,
-                     UnitDiag1());
+  GyroPreintFactor f(
+      gtsam::Symbol('x', 0), gtsam::Symbol('x', 1), gtsam::Symbol('b', 1), 0.10, 0.1, UnitDiag1());
   const gtsam::Pose2 X_prev(0.0, 0.0, M_PI - 0.05);
   const gtsam::Pose2 X_curr(0.0, 0.0, -M_PI + 0.05);
   EXPECT_NEAR(f.evaluateError(X_prev, X_curr, 0.0)[0], 0.0, 1e-9);
@@ -283,11 +293,12 @@ TEST(GyroPreintFactor, WrapsAroundPi)
 // PoseTranslationPrior — availability + convention guard
 // ─────────────────────────────────────────────────────────────────────
 //
-// The keyframe layer uses GTSAM's built-in PoseTranslationPrior<Pose2>
-// as the scan-to-keyframe ABSOLUTE xy constraint (a prior on the current
-// node's translation), instead of a custom factor. This test (a) confirms
-// the header exists/links in this GTSAM 4.3a1 build, and (b) locks the
-// residual shape (2D xy) + analytic Jacobian against a wrong GTSAM bump.
+// GTSAM version/convention guard for PoseTranslationPrior<Pose2>. The
+// scan-to-keyframe constraint has since moved to a full PriorFactor<Pose2>
+// (xy + yaw — see graph_manager_node.cpp), so this is no longer the live
+// keyframe factor; the test is retained to (a) confirm the header exists/links
+// in this GTSAM 4.3a1 build, and (b) lock the residual shape (2D xy) + analytic
+// Jacobian against a wrong GTSAM bump, in case the xy-only prior is reused.
 TEST(PoseTranslationPrior, AvailableAndWellFormed)
 {
   gtsam::PoseTranslationPrior<gtsam::Pose2> f(gtsam::Symbol('x', 0),
@@ -386,4 +397,48 @@ TEST(ScanToKeyframeComposition, RecoversTruePose)
   // Negative control: the forward composition is the mirror — must be far off.
   EXPECT_GT(err_fwd, 0.05) << "forward composition unexpectedly close — convention ambiguous; "
                            << "err_inv=" << err_inv << " err_fwd=" << err_fwd;
+}
+
+TEST(ScanBetweenConvention, MatchesBetweenFactorDirection)
+{
+  // Same asymmetric landmark set as ScanToKeyframeComposition.
+  std::vector<gtsam::Point2> map_pts;
+  for (int i = 0; i < 40; ++i)
+  {
+    const double t = -2.0 + 4.0 * static_cast<double>(i) / 40.0;
+    map_pts.emplace_back(6.0 + t, 5.0);
+  }
+  for (int i = 0; i < 40; ++i)
+  {
+    const double t = -1.5 + 3.0 * static_cast<double>(i) / 40.0;
+    map_pts.emplace_back(8.0, 4.0 + t);
+  }
+
+  const gtsam::Pose2 prev_pose(5.0, 3.0, 0.4);
+  const gtsam::Pose2 curr_pose(5.05, 3.0, 0.4 + 0.025);
+
+  const auto prev_scan = ScanFromPose(map_pts, prev_pose);
+  const auto curr_scan = ScanFromPose(map_pts, curr_pose);
+
+  fusion_graph::ScanMatcher matcher;
+  // Runtime calls Match(source=curr, target=prev) for the scan-between AND
+  // loop-closure factors, so res.delta == prev.between(curr) — the FORWARD
+  // motion that BetweenFactor(k_prev, k_curr) expects (graph_manager_node.cpp:346,
+  // graph_manager_rebase.cpp:377), identical to the wheel between-factor.
+  auto res = matcher.Match(curr_scan, prev_scan, gtsam::Pose2());
+  ASSERT_TRUE(res.ok);
+
+  // BetweenFactor(k_prev, k_curr) composes as X_curr = X_prev.compose(delta),
+  // so the FORWARD composition must recover curr; the inverse (the old buggy
+  // direction, where delta was curr.between(prev)) must land far off. This
+  // mirrors ScanToKeyframeComposition's robust negative-control style and is
+  // insensitive to ICP's rotation precision from an identity init.
+  const gtsam::Pose2 via_fwd = prev_pose.compose(res.delta);
+  const gtsam::Pose2 via_inv = prev_pose.compose(res.delta.inverse());
+  const double err_fwd = (via_fwd.translation() - curr_pose.translation()).norm();
+  const double err_inv = (via_inv.translation() - curr_pose.translation()).norm();
+  EXPECT_LT(err_fwd, 0.03) << "prev.compose(delta) must recover curr; " << "err_fwd=" << err_fwd
+                           << " err_inv=" << err_inv;
+  EXPECT_GT(err_inv, 0.05) << "inverse composition unexpectedly close — inverted convention; "
+                           << "err_fwd=" << err_fwd << " err_inv=" << err_inv;
 }

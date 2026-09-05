@@ -173,7 +173,27 @@ void GraphManager::RebaseISAM2()
     fg.add(gtsam::PriorFactor<gtsam::Pose2>(kv.key, kv.value.cast<gtsam::Pose2>(), noise));
     kept_values.insert(kv.key, kv.value);
   }
-  fresh.update(fg, kept_values);
+  // SAFETY (SAFETY_REVIEW_2026-07-23 G-H4): this update runs on the detached
+  // maintenance thread — an unguarded GTSAM throw here propagates out of the
+  // thread lambda and std::terminate()s the whole node (dead localizer
+  // mid-mow). A failed rebuild is recoverable: abandon the rebase and leave
+  // the live isam_ untouched.
+  try
+  {
+    fresh.update(fg, kept_values);
+  }
+  catch (const std::exception& e)
+  {
+    std::fprintf(stderr,
+                 "[fusion_graph] iSAM2 rebase rebuild failed (%s) — abandoning "
+                 "rebase, live graph untouched.\n",
+                 e.what());
+    std::lock_guard<std::mutex> lock(mu_);
+    rebase_pending_factors_.resize(0);
+    rebase_pending_values_.clear();
+    rebase_in_progress_ = false;
+    return;
+  }
 
   // Phase 3: replay anything Tick / ForceAnchor / AddLoopClosure
   // added while we were rebuilding, then atomically swap isam_.
@@ -190,7 +210,23 @@ void GraphManager::RebaseISAM2()
     }
     if (rebase_pending_factors_.size() > 0 || rebase_pending_values_.size() > 0)
     {
-      fresh.update(rebase_pending_factors_, rebase_pending_values_);
+      // SAFETY (G-H4): same terminate risk as phase 2 — a throw during the
+      // replay abandons the rebase (fresh is discarded, live isam_ kept).
+      try
+      {
+        fresh.update(rebase_pending_factors_, rebase_pending_values_);
+      }
+      catch (const std::exception& e)
+      {
+        std::fprintf(stderr,
+                     "[fusion_graph] iSAM2 rebase replay failed (%s) — abandoning "
+                     "rebase, live graph untouched.\n",
+                     e.what());
+        rebase_pending_factors_.resize(0);
+        rebase_pending_values_.clear();
+        rebase_in_progress_ = false;
+        return;
+      }
     }
     isam_ = std::move(fresh);
     estimate_dirty_ = true;
@@ -288,6 +324,13 @@ void GraphManager::RigidTransformAll(const gtsam::Pose2& correction,
   auto tight_noise = MakeDiagonal({std::max(latest_node_sigma_xy, 1.0e-4),
                                    std::max(latest_node_sigma_xy, 1.0e-4),
                                    std::max(latest_node_sigma_theta, 1.0e-4)});
+  // Rebuild from POSE keys only. `transformed` may also carry per-node
+  // gyro-bias variables ('b', double) when use_imu_preint is on; the loop below
+  // adds no factor for them, and handing iSAM2 new variables that no new factor
+  // references makes the update underconstrained (IndeterminantLinearSystem →
+  // ResetLocked wipes the graph). Bias is re-estimated live, so drop it here —
+  // mirroring what Load() does.
+  gtsam::Values pose_values;
   for (const auto& kv : transformed)
   {
     gtsam::Symbol s(kv.key);
@@ -295,8 +338,27 @@ void GraphManager::RigidTransformAll(const gtsam::Pose2& correction,
       continue;
     const auto noise = (kv.key == latest_key) ? tight_noise : loose_noise;
     fg.add(gtsam::PriorFactor<gtsam::Pose2>(kv.key, kv.value.cast<gtsam::Pose2>(), noise));
+    pose_values.insert(kv.key, kv.value);
   }
-  fresh.update(fg, transformed);
+  // SAFETY (SAFETY_REVIEW_2026-07-23 G-H4): this runs in the executor thread
+  // via SeedFromDockPose — an unguarded GTSAM throw would propagate out of
+  // the callback and kill the node. A degenerate rebuild self-heals into a
+  // clean re-seed instead (same posture as ApplyIsamUpdateLocked).
+  try
+  {
+    fresh.update(fg, pose_values);
+  }
+  catch (const std::exception& e)
+  {
+    std::fprintf(stderr,
+                 "[fusion_graph] iSAM2 rigid-transform rebuild failed (%s) — "
+                 "resetting graph for a clean re-seed instead of aborting the "
+                 "node.\n",
+                 e.what());
+    ++stats_isam_resets_;
+    ResetLocked();
+    return;
+  }
   isam_ = std::move(fresh);
   estimate_dirty_ = true;
   // Loop-closure edges collapsed into priors during the rebuild.

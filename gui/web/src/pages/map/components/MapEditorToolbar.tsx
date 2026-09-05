@@ -1,4 +1,5 @@
 import {Tooltip} from "antd";
+import {useTranslation} from "react-i18next";
 import {
     SaveOutlined,
     CloseOutlined,
@@ -56,6 +57,7 @@ const ToolButton = ({icon, tooltip, onClick, disabled, danger, primary, glow}: T
         <button
             onClick={onClick}
             disabled={disabled}
+            aria-label={tooltip}
             style={{
                 width: 40,
                 height: 40,
@@ -90,7 +92,8 @@ export const MapEditorToolbar = ({
     onDrawPolygon, onDrawShape, onDrawEmoji, onTrash, onCombine, onSubtract, onSplit, onEditSelectedFeature,
     onPlaceDock, dockPlacementMode,
 }: MapEditorToolbarProps) => {
-    const {colors} = useThemeMode();
+    const {colors, displayMode} = useThemeMode();
+    const {t} = useTranslation();
 
     const btnStyle: React.CSSProperties = {
         width: 40,
@@ -117,20 +120,21 @@ export const MapEditorToolbar = ({
         flexDirection: 'column',
         gap: 2,
         background: colors.glassBackground,
-        backdropFilter: 'blur(16px) saturate(180%)',
-        WebkitBackdropFilter: 'blur(16px) saturate(180%)',
+        backdropFilter: displayMode === 'visual' ? 'blur(16px) saturate(180%)' : undefined,
+        WebkitBackdropFilter: displayMode === 'visual' ? 'blur(16px) saturate(180%)' : undefined,
         borderRadius: 12,
         border: colors.glassBorder,
         boxShadow: colors.glassShadow,
         padding: 6,
     }}>
         {/* Save / Cancel */}
-        <Tooltip title={hasUnsavedChanges ? "Save Map *" : "Save Map"} placement="right">
+        <Tooltip title={hasUnsavedChanges ? t('mapEditorToolbar.saveMapUnsaved') : t('mapEditorToolbar.saveMap')} placement="right">
             <div>
                 <AsyncButton
                     type="text"
                     icon={<SaveOutlined/>}
                     onAsyncClick={onSaveMap}
+                    aria-label={hasUnsavedChanges ? t('mapEditorToolbar.saveMapUnsaved') : t('mapEditorToolbar.saveMap')}
                     style={{
                         ...btnStyle,
                         color: hasUnsavedChanges ? colors.danger : colors.success,
@@ -139,21 +143,22 @@ export const MapEditorToolbar = ({
                 />
             </div>
         </Tooltip>
-        <ToolButton icon={<CloseOutlined/>} tooltip="Cancel editing" onClick={onCancel}/>
+        <ToolButton icon={<CloseOutlined/>} tooltip={t('mapEditorToolbar.cancelEditing')} onClick={onCancel}/>
 
         <div style={{height: 1, background: colors.borderSubtle, margin: '2px 4px'}}/>
 
         {/* Undo / Redo */}
-        <ToolButton icon={<UndoOutlined/>} tooltip="Undo" onClick={onUndo} disabled={historyIndex <= 0}/>
-        <ToolButton icon={<RedoOutlined/>} tooltip="Redo" onClick={onRedo} disabled={historyIndex >= editHistoryLength - 1}/>
+        <ToolButton icon={<UndoOutlined/>} tooltip={t('mapEditorToolbar.undo')} onClick={onUndo} disabled={historyIndex <= 0}/>
+        <ToolButton icon={<RedoOutlined/>} tooltip={t('mapEditorToolbar.redo')} onClick={onRedo} disabled={historyIndex >= editHistoryLength - 1}/>
 
         <div style={{height: 1, background: colors.borderSubtle, margin: '2px 4px'}}/>
 
         {/* Drawing tools */}
-        <ToolButton icon={<BorderOutlined/>} tooltip="Draw polygon" onClick={onDrawPolygon}/>
+        <ToolButton icon={<BorderOutlined/>} tooltip={t('mapEditorToolbar.drawPolygon')} onClick={onDrawPolygon}/>
         <ShapePickerDropdown onDrawShape={onDrawShape} onDrawEmoji={onDrawEmoji} placement="bottomLeft">
-            <Tooltip title="Add shape" placement="right">
+            <Tooltip title={t('mapEditorToolbar.addShape')} placement="right">
                 <button
+                    aria-label={t('mapEditorToolbar.addShape')}
                     style={btnStyle}
                     onMouseOver={(e) => {
                         e.currentTarget.style.background = colors.bgElevated;
@@ -166,26 +171,26 @@ export const MapEditorToolbar = ({
                 </button>
             </Tooltip>
         </ShapePickerDropdown>
-        <ToolButton icon={<DeleteOutlined/>} tooltip="Delete selected" onClick={onTrash} disabled={selectedFeatureCount === 0} danger/>
+        <ToolButton icon={<DeleteOutlined/>} tooltip={t('mapEditorToolbar.deleteSelected')} onClick={onTrash} disabled={selectedFeatureCount === 0} danger/>
 
         <div style={{height: 1, background: colors.borderSubtle, margin: '2px 4px'}}/>
 
         {/* Boolean operations */}
-        <ToolButton icon={<MergeCellsOutlined/>} tooltip="Combine (select 2+)" onClick={onCombine} disabled={selectedFeatureCount < 2}/>
-        <ToolButton icon={<MinusSquareOutlined/>} tooltip="Subtract (select 2)" onClick={onSubtract} disabled={selectedFeatureCount !== 2}/>
-        <ToolButton icon={<SplitCellsOutlined/>} tooltip="Split (select 1, draw line)" onClick={onSplit} disabled={selectedFeatureCount !== 1}/>
+        <ToolButton icon={<MergeCellsOutlined/>} tooltip={t('mapEditorToolbar.combine')} onClick={onCombine} disabled={selectedFeatureCount < 2}/>
+        <ToolButton icon={<MinusSquareOutlined/>} tooltip={t('mapEditorToolbar.subtract')} onClick={onSubtract} disabled={selectedFeatureCount !== 2}/>
+        <ToolButton icon={<SplitCellsOutlined/>} tooltip={t('mapEditorToolbar.split')} onClick={onSplit} disabled={selectedFeatureCount !== 1}/>
 
         <div style={{height: 1, background: colors.borderSubtle, margin: '2px 4px'}}/>
 
         {/* Edit properties */}
-        <ToolButton icon={<FormOutlined/>} tooltip="Edit properties" onClick={onEditSelectedFeature} disabled={selectedFeatureCount !== 1}/>
+        <ToolButton icon={<FormOutlined/>} tooltip={t('mapEditorToolbar.editProperties')} onClick={onEditSelectedFeature} disabled={selectedFeatureCount !== 1}/>
 
         <div style={{height: 1, background: colors.borderSubtle, margin: '2px 4px'}}/>
 
         {/* Dock placement */}
         <ToolButton
             icon={<AimOutlined/>}
-            tooltip={dockPlacementMode ? "Click on map to place dock" : "Place dock point"}
+            tooltip={dockPlacementMode ? t('mapEditorToolbar.clickToPlaceDock') : t('mapEditorToolbar.placeDockPoint')}
             onClick={onPlaceDock}
             primary={dockPlacementMode}
             glow={dockPlacementMode}

@@ -21,12 +21,21 @@
  * Bridges generic ROS2 GNSS fixes into the Mowgli AbsolutePose message.
  *
  * Performs WGS84 → local ENU projection using a configurable datum origin.
- * Universal GNSS is the single owner of the typed /gps/status contract, so
- * this node only consumes /gps/fix and publishes /gps/absolute_pose plus the
+ * Universal GNSS is the single owner of the typed /gps/status contract. This
+ * node consumes /gps/fix for coordinates/covariance and /gps/status for the
+ * authoritative RTK/fix state, then publishes /gps/absolute_pose plus the
  * robot_localization-friendly /gps/pose_cov twin.
  *
+ * /gps/pose_cov additionally requires a GENUINELY NEW receiver observation.
+ * The adapter republishes its last accepted fix on a timer with the receipt
+ * stamp unchanged, so callbacks keep arriving after the receiver freezes.
+ * /gps/absolute_pose still mirrors every delivery (it carries its own stamp
+ * and flags), but the pose_cov twin is consumed as an absolute anchor — see
+ * the freshness gate in on_navsat_fix.
+ *
  * Subscribed topics:
- *   /gps/fix   sensor_msgs/msg/NavSatFix
+ *   /gps/fix     sensor_msgs/msg/NavSatFix
+ *   /gps/status  mowgli_interfaces/msg/GnssStatus
  *
  * Published topics:
  *   /gps/absolute_pose    mowgli_interfaces/msg/AbsolutePose
@@ -36,11 +45,14 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <memory>
 
 #include "geometry_msgs/msg/pose_with_covariance.hpp"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
+#include "mowgli_interfaces/gnss_observation_freshness.hpp"
 #include "mowgli_interfaces/msg/absolute_pose.hpp"
+#include "mowgli_interfaces/msg/gnss_status.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
 #include "std_srvs/srv/trigger.hpp"
@@ -96,7 +108,23 @@ private:
   /// during pure rotation.
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_cov_pub_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr fix_sub_;
+  rclcpp::Subscription<mowgli_interfaces::msg::GnssStatus>::SharedPtr status_sub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr set_datum_srv_;
+
+  /// Latest typed GNSS status. /gps/status is the authoritative RTK/fix-state
+  /// source even when /gps/fix covariance is missing or rejected.
+  mowgli_interfaces::msg::GnssStatus last_status_;
+  bool has_status_{false};
+
+  /// Receiver-receipt identity of the /gps/fix stream. The Universal GNSS
+  /// adapter preserves the receipt stamp across its timer-driven cached
+  /// republications, so the stamp — never callback arrival time — is what
+  /// distinguishes a genuine new observation from a frozen receiver.
+  ///
+  /// sequence=0 selects the tracker's receipt-only compatibility mode:
+  /// NavSatFix has no sequence field, and pairing it against the separately
+  /// delivered /gps/status sequence is deliberately left to a follow-up.
+  mowgli_interfaces::gnss_observation_freshness::ObservationTracker fix_observation_tracker_;
 
   /// TF listener to resolve base_footprint↔gps_link (static from URDF,
   /// gives the lever arm) and map↔base_footprint (dynamic from ekf_map,

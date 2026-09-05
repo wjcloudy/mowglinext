@@ -2,6 +2,9 @@ import {describe, it, expect, vi, beforeEach} from 'vitest';
 import {render, screen} from '@testing-library/react';
 import {App} from 'antd';
 import {MowerStatus} from './MowerStatus.tsx';
+// Assert against the active locale (pinned to English in test/setup.ts) rather
+// than hardcoded copy, so reworded translations don't break these tests.
+import en from '../i18n/locales/en.json';
 
 // MowerStatus reads snake_case rosbridge fields and pulls GPS from
 // useGnssStatus / battery from usePower+useSettings — NOT from highLevelStatus.
@@ -20,9 +23,6 @@ const mockGnss = vi.fn();
 vi.mock('../hooks/useGnssStatus.ts', () => ({useGnssStatus: () => mockGnss()}));
 vi.mock('../hooks/useSettings.ts', () => ({useSettings: () => ({settings: {}})}));
 vi.mock('../hooks/useApi.ts', () => ({useApi: () => ({request: vi.fn()})}));
-vi.mock('../hooks/useContainerRestart.ts', () => ({
-    useContainerRestart: (o: any) => ({pending: false, pendingLabel: o?.pendingLabel ?? '', run: vi.fn()}),
-}));
 vi.mock('./MowerActions.tsx', () => ({useMowerAction: () => () => vi.fn()}));
 vi.mock('../theme/ThemeContext.tsx', () => ({
     useThemeMode: () => ({
@@ -43,7 +43,7 @@ describe('MowerStatus', () => {
             highLevelStatus: {state_name: 'IDLE', battery_percent: 75, is_charging: false},
         });
         renderStatus();
-        expect(screen.getByText('Au repos')).toBeInTheDocument();
+        expect(screen.getByText(en.utils.stateIdle)).toBeInTheDocument();
     });
 
     it('displays mowing state', () => {
@@ -51,12 +51,12 @@ describe('MowerStatus', () => {
             highLevelStatus: {state_name: 'MOWING', battery_percent: 50, is_charging: false},
         });
         renderStatus();
-        expect(screen.getByText('Tonte')).toBeInTheDocument();
+        expect(screen.getByText(en.utils.stateMowing)).toBeInTheDocument();
     });
 
     it('falls back to Offline when state_name is absent', () => {
         mockHighLevelStatus.mockReturnValue({highLevelStatus: {}});
         renderStatus();
-        expect(screen.getByText('Hors ligne')).toBeInTheDocument();
+        expect(screen.getByText(en.utils.stateOffline)).toBeInTheDocument();
     });
 });

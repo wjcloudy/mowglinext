@@ -2,7 +2,7 @@
 package mowgli
 
 import (
-	"github.com/cedbossneo/mowglinext/pkg/msgs/geometry"
+	"github.com/mowglinext/mowglinext/pkg/msgs/geometry"
 )
 
 // AddMowingAreaReq for mowgli_interfaces/srv/AddMowingArea request.
@@ -136,6 +136,8 @@ type PromoteObstacleReq struct {
 	AreaIndex                 uint32                         `json:"area_index"`
 	ObstacleId                uint32                         `json:"obstacle_id"`
 	Polygon                   geometry.Polygon               `json:"polygon"`
+	PendingId                 uint32                         `json:"pending_id"`
+	Name                      string                         `json:"name"`
 }
 
 // PromoteObstacleRes for mowgli_interfaces/srv/PromoteObstacle response.
@@ -148,6 +150,8 @@ type PromoteObstacleRes struct {
 type SetDockingPointReq struct {
 	DockingPose               geometry.Pose                  `json:"docking_pose"`
 	UseGpsPosition            bool                           `json:"use_gps_position"`
+	YawSource                 uint8                          `json:"yaw_source"`
+	YawRad                    float64                        `json:"yaw_rad"`
 }
 
 // SetDockingPointRes for mowgli_interfaces/srv/SetDockingPoint response.

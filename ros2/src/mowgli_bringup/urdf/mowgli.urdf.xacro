@@ -27,7 +27,7 @@
        at runtime from the operator's calibrated yaml. -->
   <xacro:arg name="lidar_x"   default="0.0"/>
   <xacro:arg name="lidar_y"   default="0.024"/>
-  <xacro:arg name="lidar_z"   default="0.22"/>
+  <xacro:arg name="lidar_z"   default="0.30"/>
   <xacro:arg name="lidar_yaw" default="3.1408"/>
 
   <xacro:arg name="imu_x"     default="0.18"/>
@@ -50,6 +50,7 @@
   <xacro:arg name="chassis_length"   default="0.60"/>
   <xacro:arg name="chassis_width"    default="0.40"/>
   <xacro:arg name="chassis_height"   default="0.19"/>
+  <xacro:arg name="chassis_mass_kg"  default="8.76"/>
   <xacro:arg name="chassis_center_x" default="0.20"/>
   <xacro:arg name="wheel_radius"     default="0.093"/>
   <xacro:arg name="wheel_width"      default="0.04"/>
@@ -80,7 +81,7 @@
   <xacro:property name="caster_x_offset"  value="${chassis_cx + base_length/2.0 - caster_radius}"/>
   <xacro:property name="caster_track"     value="$(arg caster_track)"/>
 
-  <xacro:property name="base_mass"        value="8.76"/>
+  <xacro:property name="base_mass"        value="$(arg chassis_mass_kg)"/>
 
   <xacro:property name="blade_radius"     value="$(arg blade_radius)"/>
   <xacro:property name="blade_height"     value="0.01"/>
@@ -289,12 +290,11 @@
                             h="${blade_height}"/>
   </link>
 
-  <joint name="blade_joint" type="continuous">
+  <joint name="blade_joint" type="fixed">
     <parent link="base_link"/>
     <child  link="blade_link"/>
     <!-- Blade disc centred under chassis -->
     <origin xyz="${chassis_cx} 0 ${-wheel_radius + 0.05}" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
   </joint>
 
   <!-- ================================================================

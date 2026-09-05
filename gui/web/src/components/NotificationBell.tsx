@@ -1,14 +1,16 @@
 import {useEffect, useRef, useState} from "react";
 import {AnimatePresence, motion} from "framer-motion";
+import {useTranslation} from "react-i18next";
+import type {TFunction} from "i18next";
 import {useNotificationCenter, type NotificationItem} from "../hooks/useNotificationCenter.tsx";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
 
-const formatRelative = (ms: number): string => {
+const formatRelative = (ms: number, t: TFunction): string => {
     const diff = Date.now() - ms;
-    if (diff < 60_000) return 'just now';
-    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
-    return `${Math.floor(diff / 86_400_000)}d ago`;
+    if (diff < 60_000) return t('notificationBell.justNow');
+    if (diff < 3_600_000) return t('notificationBell.minutesAgo', {n: Math.floor(diff / 60_000)});
+    if (diff < 86_400_000) return t('notificationBell.hoursAgo', {n: Math.floor(diff / 3_600_000)});
+    return t('notificationBell.daysAgo', {n: Math.floor(diff / 86_400_000)});
 };
 
 const dotKeyframes = `
@@ -32,7 +34,7 @@ function BellIcon({color, animate, size = 18}: BellIconProps) {
              stroke={color} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"
              style={{
                  transformOrigin: '50% 30%',
-                 animation: animate ? 'notifBellWiggle 1.6s ease-in-out infinite' : 'none',
+                 animation: animate ? 'notifBellWiggle 1.6s ease-in-out 2' : 'none',
              }}>
             <path d="M6 8a6 6 0 1 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/>
             <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>
@@ -49,8 +51,20 @@ const levelColor = (lvl: NotificationItem['level'], colors: ReturnType<typeof us
     }
 };
 
+// The severity dot is color-only — give it a text alternative (i18n key per
+// level) so the signal survives for screen readers / color-blind users.
+const levelLabelKey = (lvl: NotificationItem['level']): string => {
+    switch (lvl) {
+        case 'error': return 'notificationBell.levelError';
+        case 'warning': return 'notificationBell.levelWarning';
+        case 'success': return 'notificationBell.levelSuccess';
+        default: return 'notificationBell.levelInfo';
+    }
+};
+
 export function NotificationBell() {
     const {colors} = useThemeMode();
+    const {t} = useTranslation();
     const {items, unread, markRead, markAllRead, dismiss, clear} = useNotificationCenter();
     const [open, setOpen] = useState(false);
     const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -65,16 +79,22 @@ export function NotificationBell() {
         return () => document.removeEventListener('mousedown', handler);
     }, [open]);
 
+    // Mark everything read when the panel CLOSES (not on open), so the
+    // unread highlight/dot styling stays visible while the operator is
+    // actually reading the list. Covers every close path (bell toggle,
+    // click-outside) because it watches the open -> closed transition.
+    const wasOpenRef = useRef(false);
+    useEffect(() => {
+        if (wasOpenRef.current && !open) markAllRead();
+        wasOpenRef.current = open;
+    }, [open, markAllRead]);
+
     return (
         <div ref={wrapRef} style={{position: 'relative'}}>
             <style>{dotKeyframes}</style>
             <button
-                onClick={() => {
-                    const next = !open;
-                    setOpen(next);
-                    if (next) markAllRead();
-                }}
-                aria-label={`Notifications${unread > 0 ? ` (${unread} unread)` : ''}`}
+                onClick={() => setOpen(prev => !prev)}
+                aria-label={unread > 0 ? t('notificationBell.bellAriaUnread', {n: unread}) : t('notificationBell.bellAria')}
                 style={{
                     position: 'relative', background: 'transparent', border: 'none',
                     cursor: 'pointer', padding: 6, display: 'inline-flex',
@@ -118,7 +138,7 @@ export function NotificationBell() {
                             padding: '12px 14px', borderBottom: `1px solid ${colors.border}`,
                         }}>
                             <div style={{fontSize: 13, fontWeight: 700, color: colors.text}}>
-                                Notifications
+                                {t('notificationBell.notifications')}
                             </div>
                             {items.length > 0 && (
                                 <button
@@ -127,7 +147,7 @@ export function NotificationBell() {
                                         background: 'transparent', border: 'none', cursor: 'pointer',
                                         color: colors.textMuted, fontSize: 11, fontWeight: 600,
                                     }}
-                                >Clear all</button>
+                                >{t('notificationBell.clearAll')}</button>
                             )}
                         </div>
                         <div style={{flex: 1, overflowY: 'auto'}}>
@@ -136,9 +156,9 @@ export function NotificationBell() {
                                     padding: '40px 16px', textAlign: 'center',
                                     color: colors.textMuted, fontSize: 13,
                                 }}>
-                                    Nothing right now.
+                                    {t('notificationBell.nothingRightNow')}
                                     <div style={{fontSize: 11, marginTop: 6}}>
-                                        Critical events (emergency, rain, completion) will land here.
+                                        {t('notificationBell.criticalEventsHint')}
                                     </div>
                                 </div>
                             )}
@@ -157,11 +177,14 @@ export function NotificationBell() {
                                             transition: 'background 0.15s',
                                         }}
                                     >
-                                        <span style={{
-                                            width: 6, height: 6, borderRadius: 3, marginTop: 6,
-                                            background: accent, flexShrink: 0,
-                                            boxShadow: item.read ? 'none' : `0 0 6px ${accent}`,
-                                        }}/>
+                                        <span
+                                            role="img"
+                                            aria-label={t(levelLabelKey(item.level))}
+                                            style={{
+                                                width: 6, height: 6, borderRadius: 3, marginTop: 6,
+                                                background: accent, flexShrink: 0,
+                                                boxShadow: item.read ? 'none' : `0 0 6px ${accent}`,
+                                            }}/>
                                         <div style={{flex: 1, minWidth: 0}}>
                                             <div style={{
                                                 fontSize: 13, fontWeight: item.read ? 500 : 700,
@@ -173,12 +196,12 @@ export function NotificationBell() {
                                                 </div>
                                             )}
                                             <div style={{fontSize: 10, color: colors.textMuted, marginTop: 4}}>
-                                                {formatRelative(item.timestamp)}
+                                                {formatRelative(item.timestamp, t)}
                                             </div>
                                         </div>
                                         <button
                                             onClick={(e) => { e.stopPropagation(); dismiss(item.id); }}
-                                            aria-label="Dismiss"
+                                            aria-label={t('notificationBell.dismiss')}
                                             style={{
                                                 background: 'transparent', border: 'none', cursor: 'pointer',
                                                 color: colors.textMuted, padding: 4, lineHeight: 1,

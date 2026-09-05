@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -28,22 +29,31 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "geometry_msgs/msg/twist_stamped.hpp"
+#include "mowgli_interfaces/action/calibrate_dock.hpp"
+#include "mowgli_interfaces/motion_yaw_fit.hpp"
 #include "mowgli_interfaces/msg/absolute_pose.hpp"
+#include "mowgli_interfaces/msg/dock_calibration_status.hpp"
 #include "mowgli_interfaces/msg/emergency.hpp"
 #include "mowgli_interfaces/msg/high_level_status.hpp"
 #include "mowgli_interfaces/msg/status.hpp"
+#include "mowgli_interfaces/robot_yaml_scalar.hpp"
 #include "mowgli_interfaces/srv/calibrate_imu_yaw.hpp"
 #include "mowgli_interfaces/srv/high_level_control.hpp"
+#include "mowgli_interfaces/srv/set_docking_point.hpp"
+#include "mowgli_localization/dock_cog_gate.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/callback_group.hpp"
 #include "rclcpp/executors/multi_threaded_executor.hpp"
 #include "rclcpp/qos.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/magnetic_field.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include <yaml-cpp/yaml.h>
 
 namespace mowgli_localization
@@ -58,8 +68,10 @@ constexpr int HL_STATE_AUTONOMOUS = 2;
 constexpr int HL_STATE_RECORDING = 3;
 
 // HighLevelControl command codes.
+constexpr int HL_CMD_HOME = 2;
 constexpr int HL_CMD_RECORD_AREA = 3;
 constexpr int HL_CMD_RECORD_CANCEL = 6;
+constexpr int HL_CMD_STOP = 8;
 
 double stamp_to_float(const builtin_interfaces::msg::Time& s)
 {
@@ -77,85 +89,10 @@ void sleep_for(double sec)
       std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(sec)));
 }
 
-// Splice a new numeric value into a "<indent><key>:<spaces><number><rest>"
-// line, anchored on the indent so a key whose name happens to contain
-// ours (e.g. dock_pose_x_offset) is not matched.
-void splice_yaml_scalar(std::string& content, const std::string& key, const std::string& new_value)
-{
-  size_t scan = 0;
-  while (scan < content.size())
-  {
-    const size_t line_start = scan;
-    size_t cursor = line_start;
-    while (cursor < content.size() && (content[cursor] == ' ' || content[cursor] == '\t'))
-      ++cursor;
-    const size_t indent_end = cursor;
-    if (indent_end > line_start && cursor + key.size() < content.size() &&
-        content.compare(cursor, key.size(), key) == 0 && content[cursor + key.size()] == ':')
-    {
-      cursor += key.size() + 1;
-      while (cursor < content.size() && (content[cursor] == ' ' || content[cursor] == '\t'))
-        ++cursor;
-      const size_t val_start = cursor;
-      while (cursor < content.size())
-      {
-        const char c = content[cursor];
-        const bool is_num =
-            (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E';
-        if (!is_num)
-          break;
-        ++cursor;
-      }
-      if (cursor > val_start)
-      {
-        content.replace(val_start, cursor - val_start, new_value);
-        return;
-      }
-    }
-    const size_t nl = content.find('\n', line_start);
-    if (nl == std::string::npos)
-      break;
-    scan = nl + 1;
-  }
-}
-
-// Update dock_pose_x/y/yaw values in mowgli_robot.yaml in place via
-// per-line substring splicing — preserves comments and surrounding
-// structure (yaml-cpp would round-trip and strip them). Atomic via
-// tmp+rename. Returns false if the file can't be read or written.
-bool update_dock_pose_in_robot_yaml(const std::string& path, double x, double y, double yaw_rad)
-{
-  std::ifstream in(path);
-  if (!in.good())
-    return false;
-  std::stringstream buf;
-  buf << in.rdbuf();
-  std::string content = buf.str();
-  in.close();
-
-  auto fmt = [](double v)
-  {
-    std::ostringstream s;
-    s << std::fixed << std::setprecision(6) << v;
-    return s.str();
-  };
-  splice_yaml_scalar(content, "dock_pose_x", fmt(x));
-  splice_yaml_scalar(content, "dock_pose_y", fmt(y));
-  splice_yaml_scalar(content, "dock_pose_yaw", fmt(yaw_rad));
-
-  const std::string tmp_path = path + ".tmp";
-  {
-    std::ofstream out(tmp_path, std::ios::trunc);
-    if (!out.good())
-      return false;
-    out << content;
-    if (!out.good())
-      return false;
-  }
-  std::error_code ec;
-  std::filesystem::rename(tmp_path, path, ec);
-  return !ec;
-}
+// dock_pose_x/y/yaw writeback moved to mowgli_interfaces::robot_yaml_scalar
+// (task #42) — was a byte-for-byte-identical copy of the same splice logic
+// duplicated across this file, mowgli_map/area_manager.cpp, and
+// mowgli_behavior/calibration_nodes.cpp.
 
 std::string utc_iso8601_now()
 {
@@ -209,6 +146,44 @@ public:
   static constexpr double DOCK_UNDOCK_SPEED_DEFAULT = 0.15;
   static constexpr double DOCK_UNDOCK_DISTANCE_DEFAULT_M = 2.0;
   static constexpr double DOCK_UNDOCK_TIMEOUT_SEC = 25.0;
+  // Re-dock leg: the return drive is DELEGATED to the production docking
+  // pipeline (HL_CMD_HOME → Nav2 staging → SimpleChargingDock with charger
+  // detection and its own retries). Three custom forward controllers were
+  // field-tested 2026-08-01 (blind dead-reckoning, point-bearing P, Stanley
+  // on the fused yaw) and each found a new failure mode, while the docking
+  // server re-docked reliably all day — so the calibration only SUPERVISES:
+  // an angle guard on the raw RTK track course aborts an askew final
+  // approach, then a steered backoff re-lines the robot for a fresh attempt.
+  static constexpr int REDOCK_MAX_ATTEMPTS = 3;
+  static constexpr double REDOCK_NAV_TIMEOUT_SEC = 180.0;  // per HOME attempt (nav + dock)
+  // Raw-track course estimate: bearing over the last ≥ this much travel. No
+  // fused-yaw dependence — a startup-transient fusion bias steered run 5
+  // consistently off target while keeping its own angle guard blind.
+  static constexpr double REDOCK_COURSE_BASELINE_M = 0.20;
+  static constexpr int REDOCK_APPROACH_TICKS_MIN = 6;  // guard arms only while closing in
+  // Dock-protect angle guard: arriving askew must not shove the dock
+  // sideways — abort the attempt (STOP → steered backoff → fresh HOME)
+  // instead of shoving in at an angle. Not applied inside the cutoff radius,
+  // where the wheel guides funnel the chassis and the heading swings by
+  // design.
+  static constexpr double REDOCK_ANGLE_GUARD_DIST_M = 0.6;
+  static constexpr double REDOCK_ANGLE_GUARD_RAD = 0.20;  // ~11.5°
+  static constexpr double REDOCK_STEER_CUTOFF_M = 0.35;
+  // Steered backoff between attempts: reverse ~2 m while converging on the
+  // ideal line (Stanley terms on the raw-track course; the cross-track term
+  // flips sign in reverse — the TAIL must move toward the line).
+  static constexpr double REDOCK_BACKOFF_M = 2.0;
+  static constexpr double REDOCK_BACKOFF_TIMEOUT_SEC = 30.0;
+  static constexpr double REDOCK_HDG_KP = 1.0;  // rad/s per rad of line-heading error
+  static constexpr double REDOCK_XT_KP = 1.0;  // weight of the cross-track term
+  static constexpr double REDOCK_XT_SHARPNESS = 4.0;  // atan(k·e): ~0.38 rad at e = 10 cm
+  static constexpr double REDOCK_WZ_MAX = 0.10;  // rad/s clamp on the steer output
+  // Give the firmware's charge-detection debounce a chance after an attempt.
+  static constexpr double REDOCK_CHARGE_SETTLE_SEC = 8.0;
+  // Persist retries: map_server's yaw-convergence gate (0.5° window-std over
+  // 5 s by default) needs the fused yaw to settle after the drive.
+  static constexpr int PERSIST_MAX_ATTEMPTS = 8;
+  static constexpr double PERSIST_RETRY_DELAY_SEC = 5.0;
   // Runtime mowgli_robot.yaml — bind-mounted, persists across redeploys.
   // Calibration writes the dock pose back here so the same file the launch
   // system reads at startup also carries the latest measured values.
@@ -269,7 +244,10 @@ public:
     hlc_client_ = create_client<mowgli_interfaces::srv::HighLevelControl>(
         "/behavior_tree_node/high_level_control", rclcpp::ServicesQoS(), cb_group_);
 
-    cmd_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel_teleop", state_qos);
+    // All calibration motion goes on /cmd_vel_docking (twist_mux priority 15)
+    // so collision_monitor stays in the loop — NOT /cmd_vel_teleop (priority
+    // 20), which bypasses it. Blade is never commanded here regardless.
+    cmd_pub_ = create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel_docking", state_qos);
 
     srv_ = create_service<mowgli_interfaces::srv::CalibrateImuYaw>(
         "~/calibrate",
@@ -286,10 +264,91 @@ public:
         declare_parameter<double>("undock_distance", DOCK_UNDOCK_DISTANCE_DEFAULT_M);
     dock_undock_speed_ = declare_parameter<double>("undock_speed", DOCK_UNDOCK_SPEED_DEFAULT);
 
+    // ── One-click dock calibration (CalibrateDock action) parameters ──
+    // Defaults single-sourced from the mowgli_bringup template (Invariant 15);
+    // the constants here are only the fallback when a param is absent.
+    dc_reverse_distance_m_ = declare_parameter<double>("dock_calib_reverse_distance_m", 2.0);
+    dc_reverse_speed_ms_ = declare_parameter<double>("dock_calib_reverse_speed_ms", 0.15);
+    dc_redock_overshoot_m_ = declare_parameter<double>("dock_calib_redock_overshoot_m", 0.30);
+    dc_rtk_wait_timeout_s_ = declare_parameter<double>("dock_calib_rtk_wait_timeout_s", 10.0);
+    dc_redock_charge_timeout_s_ =
+        declare_parameter<double>("dock_calib_redock_charge_timeout_s", 30.0);
+    dc_cog_min_samples_ = declare_parameter<int>("dock_calib_cog_min_samples", 8);
+    // Per-sample COG yaw scatter is dominated by the publisher's 0.10 m
+    // baseline: even under RTK-Fixed (σ_pos 2-3 cm) individual samples spread
+    // ~10-19° in theory and 10-27° std as field-measured across straight 2 m
+    // reverses, so a few-degree std gate can NEVER pass and even ~17° trips
+    // on ordinary condition-to-condition variation. This gate only screens
+    // gross incoherence (RTK-Float wander); heading QUALITY is enforced by
+    // the bearing-match gate below, which checks the circular MEAN against
+    // the GPS displacement bearing.
+    dc_cog_std_max_rad_ = declare_parameter<double>("dock_calib_cog_std_max_rad", 0.70);
+    // Sanity cross-check only (the persisted yaw IS the reversed RTK travel
+    // bearing, see dock_cog_gate.hpp): with ~16 COG samples of 10-19°
+    // per-sample scatter the mean carries a 3-4° standard error, so a
+    // few-degree match gate trips on pure noise. 0.35 rad (~20°) still
+    // catches a dead/stale COG feed or an RTK-Float excursion.
+    dc_cog_bearing_match_max_rad_ =
+        declare_parameter<double>("dock_calib_cog_bearing_match_max_rad", 0.35);
+    dc_min_baseline_disp_m_ =
+        declare_parameter<double>("dock_calib_min_baseline_displacement_m", 0.5);
+
+    // COG body-heading feed (already lever-arm-corrected + reverse-aware —
+    // Resolution A: consume as-is, NO +pi). Sampled only while the reverse
+    // leg is active (collecting_cog_).
+    cog_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+        "/imu/cog_heading",
+        imu_qos_,
+        [this](sensor_msgs::msg::Imu::ConstSharedPtr msg)
+        {
+          cog_cb(std::move(msg));
+        },
+        sub_opts);
+
+    // The ONE canonical dock_pose writer (Invariant 6): persist via map_server.
+    set_dock_client_ =
+        create_client<mowgli_interfaces::srv::SetDockingPoint>("/map_server_node/set_docking_point",
+                                                               rclcpp::ServicesQoS(),
+                                                               cb_group_);
+
+    dock_action_ = rclcpp_action::create_server<CalibrateDock>(
+        this,
+        "~/calibrate_dock",
+        [this](const rclcpp_action::GoalUUID& uuid, std::shared_ptr<const CalibrateDock::Goal> goal)
+        {
+          return dock_handle_goal(uuid, goal);
+        },
+        [this](const std::shared_ptr<DockGoalHandle> gh)
+        {
+          return dock_handle_cancel(gh);
+        },
+        [this](const std::shared_ptr<DockGoalHandle> gh)
+        {
+          dock_handle_accepted(gh);
+        },
+        rcl_action_server_get_default_options(),
+        cb_group_);
+
+    // Foxglove-friendly façade (the GUI transport has no ROS-action support):
+    // a non-blocking start service + a live status topic mirroring the action.
+    status_pub_ =
+        create_publisher<mowgli_interfaces::msg::DockCalibrationStatus>("~/dock_calibration/status",
+                                                                        state_qos);
+    dock_start_srv_ = create_service<std_srvs::srv::Trigger>(
+        "~/dock_calibration/start",
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+        {
+          dock_start_cb(req, res);
+        },
+        rclcpp::ServicesQoS(),
+        cb_group_);
+
     RCLCPP_INFO(get_logger(),
-                "IMU yaw calibration node ready. Dock undock: %.2f m @ %.2f m/s. "
-                "Ensure robot is undocked with ~1 m of clear space in front and "
-                "behind, then call ~/calibrate.",
+                "Dock calibration node ready. Dock undock: %.2f m @ %.2f m/s. "
+                "One-click: ~/calibrate_dock (action) or ~/dock_calibration/start "
+                "(service, GUI) → ~/dock_calibration/status. Legacy IMU/mag: "
+                "~/calibrate (CalibrateImuYaw service).",
                 dock_undock_distance_,
                 dock_undock_speed_);
   }
@@ -544,6 +603,15 @@ private:
                 x0,
                 y0);
 
+    // Buffer GPS samples across the whole reverse (task #47) so the heading
+    // can be fit through the entire trajectory instead of just its two
+    // endpoints — see the line-fit block after the reverse below. Drop
+    // samples that haven't moved at least 5 cm since the last kept one so a
+    // near-stationary tail doesn't bloat the buffer with noise (mirrors
+    // CalibrateHeadingFromUndock's buffering in behavior_tree_node.cpp).
+    std::vector<std::pair<double, double>> samples;
+    samples.emplace_back(x0, y0);
+
     const double period = 1.0 / CMD_RATE_HZ;
     const double t_deadline = monotonic() + DOCK_UNDOCK_TIMEOUT_SEC;
     double displacement = 0.0;
@@ -561,6 +629,12 @@ private:
         const double dx = latest_gps_x_ - x0;
         const double dy = latest_gps_y_ - y0;
         displacement = std::hypot(dx, dy);
+        const double sdx = latest_gps_x_ - samples.back().first;
+        const double sdy = latest_gps_y_ - samples.back().second;
+        if ((sdx * sdx + sdy * sdy) >= (0.05 * 0.05))
+        {
+          samples.emplace_back(latest_gps_x_, latest_gps_y_);
+        }
         if (displacement >= dock_undock_distance_)
           break;
       }
@@ -595,9 +669,46 @@ private:
       return std::nullopt;
     }
 
-    const double dock_yaw = std::atan2(-dy, -dx);
-    const double sigma_pos = std::max(static_cast<double>(gps_position_accuracy_.load()), 0.003);
-    const double sigma_yaw_rad = std::atan2(2.0 * sigma_pos, displacement);
+    // Task #47: prefer a total-least-squares line fit through the WHOLE
+    // buffered reverse trajectory over the endpoint-only atan2(-dy,-dx)
+    // below. An endpoint-only bearing assumes the reverse was perfectly
+    // straight; any curvature (e.g. yaw-loop wiggle before #37/#39) biases
+    // that single atan2 by a few degrees with no way to detect it, and
+    // fusion_graph's own dock unary factor (σ floor 0.035 rad, ~2°) then
+    // holds the whole session to that bias — enough to miss the ~0.4 m
+    // docking corridor over a ~1.5 m approach. The line fit is robust to
+    // curvature and gives a tighter σ_yaw from the SAME baseline (σ shrinks
+    // ~1/√n instead of being limited to the two endpoints). Same gate as
+    // CalibrateHeadingFromUndock (calibration_nodes.cpp): >=4 samples
+    // spanning >=0.5 m; below that, fall back to the endpoint bearing (the
+    // sample buffer's own span may be short even if the tracked
+    // start/end displacement above cleared min_displacement, e.g. sparse
+    // GPS arrivals near dock_undock_speed_'s low end).
+    const bool have_line_fit_samples =
+        samples.size() >= 4u && std::hypot(samples.back().first - samples.front().first,
+                                           samples.back().second - samples.front().second) >= 0.5;
+    double dock_yaw;
+    double sigma_yaw_rad;
+    const char* yaw_method = "endpoint";
+    if (have_line_fit_samples)
+    {
+      const auto [motion_yaw, motion_sigma] =
+          mowgli_interfaces::motion_yaw_fit::FitMotionYaw(samples);
+      // Robot heading points opposite the motion (the maneuver reverses).
+      dock_yaw = motion_yaw + M_PI;
+      while (dock_yaw > M_PI)
+        dock_yaw -= 2.0 * M_PI;
+      while (dock_yaw < -M_PI)
+        dock_yaw += 2.0 * M_PI;
+      sigma_yaw_rad = std::max(motion_sigma, 0.001);  // floor at ~0.06°
+      yaw_method = "line_fit";
+    }
+    else
+    {
+      dock_yaw = std::atan2(-dy, -dx);
+      const double sigma_pos = std::max(static_cast<double>(gps_position_accuracy_.load()), 0.003);
+      sigma_yaw_rad = std::atan2(2.0 * sigma_pos, displacement);
+    }
 
     DockYawResult result;
     result.dock_pose_x = x0;
@@ -609,10 +720,10 @@ private:
     result.yaw_sigma_deg = sigma_yaw_rad * 180.0 / M_PI;
     result.speed_ms = dock_undock_speed_;
 
-    if (!update_dock_pose_in_robot_yaml(MOWGLI_ROBOT_YAML_PATH,
-                                        result.dock_pose_x,
-                                        result.dock_pose_y,
-                                        result.dock_pose_yaw_rad))
+    if (!mowgli_interfaces::robot_yaml_scalar::UpdateDockPose(MOWGLI_ROBOT_YAML_PATH,
+                                                              result.dock_pose_x,
+                                                              result.dock_pose_y,
+                                                              result.dock_pose_yaw_rad))
     {
       RCLCPP_ERROR(get_logger(),
                    "Failed to persist dock pose to %s — file missing or "
@@ -623,13 +734,15 @@ private:
 
     RCLCPP_INFO(get_logger(),
                 "Dock yaw calibration: start=(%+.3f, %+.3f) end=(%+.3f, "
-                "%+.3f) displacement=%.3f m dock_yaw=%+.2f° (σ=%.2f°). "
-                "Saved to %s.",
+                "%+.3f) displacement=%.3f m method=%s (n=%zu) dock_yaw=%+.2f° "
+                "(σ=%.2f°). Saved to %s.",
                 x0,
                 y0,
                 x1,
                 y1,
                 displacement,
+                yaw_method,
+                samples.size(),
                 result.dock_pose_yaw_deg,
                 result.yaw_sigma_deg,
                 MOWGLI_ROBOT_YAML_PATH);
@@ -833,6 +946,733 @@ private:
       sleep_for(0.1);
     }
     return bt_state_ == target;
+  }
+
+  // ═══ One-click dock calibration (CalibrateDock action, Resolution A) ═══
+  // The dock yaw is circular_mean(/imu/cog_heading over the reverse leg) with
+  // NO +pi (the topic is already the reverse-aware BODY heading). The sequence
+  // reverses on /cmd_vel_docking, gates COG coherence, re-docks forward until
+  // charging, then persists via map_server's set_docking_point (yaw_source=
+  // MOTION) — the single canonical writer. Blade is never commanded; every
+  // drive loop zero-vels on emergency/cancel; the dock pose is persisted ONLY
+  // after a verified re-dock+charge.
+  using CalibrateDock = mowgli_interfaces::action::CalibrateDock;
+  using DockGoalHandle = rclcpp_action::ServerGoalHandle<CalibrateDock>;
+  using DockStatus = mowgli_interfaces::msg::DockCalibrationStatus;
+
+  // Result of the IMU-yaw numerical solve. Declared here (before DockOutcome,
+  // which embeds a ComputeResult) so the type is visible at that point.
+  struct ComputeResult
+  {
+    bool success{false};
+    std::string message;
+    double imu_yaw_rad{0.0};
+    double imu_yaw_deg{0.0};
+    int samples_used{0};
+    double std_dev_deg{0.0};
+    double imu_pitch_rad{0.0};
+    double imu_pitch_deg{0.0};
+    double imu_roll_rad{0.0};
+    double imu_roll_deg{0.0};
+    int stationary_samples_used{0};
+    double gravity_mag_mps2{0.0};
+  };
+
+  // Outcome of one calibration run, returned by run_dock_calibration_core so
+  // the action wrapper can build a CalibrateDock::Result and the service façade
+  // can ignore it (it reports via the status topic instead).
+  struct DockOutcome
+  {
+    bool success{false};
+    bool canceled{false};
+    uint8_t retry_reason{0};
+    std::string message;
+    bool gate_valid{false};
+    DockCogGateResult gate{};
+    bool imu_valid{false};
+    ComputeResult imu{};
+  };
+
+  void cog_cb(sensor_msgs::msg::Imu::ConstSharedPtr msg)
+  {
+    if (!collecting_cog_.load())
+      return;
+    const auto& q = msg->orientation;
+    const double yaw =
+        std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    std::lock_guard<std::mutex> lk(cog_lock_);
+    cog_samples_.push_back(yaw);
+  }
+
+  // Publish the foxglove-friendly status topic (the GUI has no action support).
+  void publish_status(uint8_t phase,
+                      float progress,
+                      float displacement,
+                      bool running,
+                      bool success,
+                      uint8_t retry_reason,
+                      const std::string& message)
+  {
+    DockStatus s;
+    s.phase = phase;
+    s.progress = progress;
+    s.displacement_m = displacement;
+    s.charging = is_charging_.load();
+    s.running = running;
+    {
+      std::lock_guard<std::mutex> lk(cog_lock_);
+      s.cog_std_deg = static_cast<float>(circular_std(cog_samples_) * 180.0 / M_PI);
+    }
+    s.success = success;
+    s.retry_reason = retry_reason;
+    s.message = message;
+    status_pub_->publish(s);
+  }
+
+  // ── Action wrapper: run the core on a thread, map DockOutcome → Result ──
+  rclcpp_action::GoalResponse dock_handle_goal(const rclcpp_action::GoalUUID&,
+                                               std::shared_ptr<const CalibrateDock::Goal>)
+  {
+    if (dock_action_busy_.exchange(true))
+    {
+      RCLCPP_WARN(get_logger(), "CalibrateDock: already running — rejecting new goal.");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+  }
+
+  rclcpp_action::CancelResponse dock_handle_cancel(const std::shared_ptr<DockGoalHandle>)
+  {
+    RCLCPP_WARN(get_logger(), "CalibrateDock: cancel requested — will stop and hold.");
+    return rclcpp_action::CancelResponse::ACCEPT;
+  }
+
+  void dock_handle_accepted(const std::shared_ptr<DockGoalHandle> gh)
+  {
+    std::thread(
+        [this, gh]()
+        {
+          const auto goal = gh->get_goal();
+          if (goal->include_mag)
+          {
+            // Mag calibration needs an in-place figure-8 rotation, which would
+            // scramble the straight-line re-dock geometry — so it is NOT folded
+            // into the dock sequence. No-op it here with a clear pointer to the
+            // legacy path (~/calibrate with mag_only=true).
+            RCLCPP_WARN(get_logger(),
+                        "CalibrateDock: include_mag ignored — mag calibration needs rotation "
+                        "that would break the straight re-dock. Use ~/calibrate (mag_only=true).");
+          }
+          const DockOutcome out = run_dock_calibration_core(goal->include_imu_yaw,
+                                                            [gh]()
+                                                            {
+                                                              return gh->is_canceling();
+                                                            });
+          auto res = std::make_shared<CalibrateDock::Result>();
+          res->success = out.success;
+          res->retry_reason = out.retry_reason;
+          res->message = out.message;
+          if (out.gate_valid)
+          {
+            res->dock_pose_yaw_rad = out.gate.dock_yaw_rad;
+            res->dock_pose_yaw_deg = out.gate.dock_yaw_rad * 180.0 / M_PI;
+            res->cog_std_deg = out.gate.cog_std_rad * 180.0 / M_PI;
+            res->reverse_displacement_m = out.gate.displacement_m;
+            res->dock_pose_x = latest_gps_x_.load();
+            res->dock_pose_y = latest_gps_y_.load();
+          }
+          if (out.imu_valid)
+          {
+            res->imu_yaw_valid = true;
+            res->imu_yaw_rad = out.imu.imu_yaw_rad;
+            res->imu_yaw_deg = out.imu.imu_yaw_deg;
+            res->imu_pitch_rad = out.imu.imu_pitch_rad;
+            res->imu_roll_rad = out.imu.imu_roll_rad;
+          }
+          if (out.canceled)
+            gh->canceled(res);
+          else if (out.success)
+            gh->succeed(res);
+          else
+            gh->abort(res);
+        })
+        .detach();
+  }
+
+  // ── Service façade: NON-BLOCKING start for the GUI (foxglove transport). ──
+  // Returns immediately (accepted / rejected); the run proceeds on a thread and
+  // reports live phase/progress + the terminal outcome on ~/dock_calibration/
+  // status. include_imu_yaw is off here (the GUI screen calibrates the dock; the
+  // imu-yaw fold is an action/CLI opt-in whose result the status topic omits).
+  void dock_start_cb(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                     std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+  {
+    if (emergency_active_)
+    {
+      res->success = false;
+      res->message = "Emergency active/latched — clear it, then retry.";
+      return;
+    }
+    if (bt_state_ == HL_STATE_AUTONOMOUS)
+    {
+      res->success = false;
+      res->message = "Robot is mowing (AUTONOMOUS). Send HOME first, then retry.";
+      return;
+    }
+    if (!is_charging_)
+    {
+      res->success = false;
+      res->message = "Robot is not on the dock (not charging). Dock it, then retry.";
+      return;
+    }
+    if (dock_action_busy_.exchange(true))
+    {
+      res->success = false;
+      res->message = "A dock calibration is already running.";
+      return;
+    }
+    std::thread(
+        [this]()
+        {
+          run_dock_calibration_core(/*include_imu_yaw=*/false,
+                                    []()
+                                    {
+                                      return false;
+                                    });
+        })
+        .detach();
+    res->success = true;
+    res->message = "Dock calibration started — watch ~/dock_calibration/status.";
+  }
+
+  bool persist_dock_via_map_server(double yaw_rad, std::string& err)
+  {
+    if (!set_dock_client_->wait_for_service(std::chrono::seconds(3)))
+    {
+      err = "map_server set_docking_point service unavailable";
+      return false;
+    }
+    auto req = std::make_shared<mowgli_interfaces::srv::SetDockingPoint::Request>();
+    req->use_gps_position = true;  // average on-dock GPS for x/y (independent of fusion)
+    req->yaw_source = mowgli_interfaces::srv::SetDockingPoint::Request::MOTION;
+    req->yaw_rad = yaw_rad;  // COG-derived chassis heading (Resolution A)
+    auto fut = set_dock_client_->async_send_request(req);
+    const double deadline = monotonic() + 8.0;
+    while (rclcpp::ok() && monotonic() < deadline)
+    {
+      if (fut.wait_for(std::chrono::milliseconds(50)) == std::future_status::ready)
+        break;
+    }
+    if (fut.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+    {
+      err = "set_docking_point timed out";
+      return false;
+    }
+    auto resp = fut.get();
+    if (!resp || !resp->success)
+    {
+      err = "set_docking_point rejected (RTK / charging / yaw-convergence gate)";
+      return false;
+    }
+    return true;
+  }
+
+  static uint8_t cog_reason_to_retry(DockCogReason r)
+  {
+    switch (r)
+    {
+      case DockCogReason::INSUFFICIENT_DISPLACEMENT:
+        return CalibrateDock::Result::RETRY_INSUFFICIENT_DISPLACEMENT;
+      case DockCogReason::INSUFFICIENT_SAMPLES:
+      case DockCogReason::HIGH_STD:
+      case DockCogReason::BEARING_MISMATCH:
+      default:
+        return CalibrateDock::Result::RETRY_COG_INCOHERENT;
+    }
+  }
+
+  // Core sequence shared by the action wrapper and the service façade. Publishes
+  // DockCalibrationStatus at every phase and returns the outcome. is_canceled()
+  // lets the action honour cancel requests (the service passes a constant false).
+  DockOutcome run_dock_calibration_core(bool include_imu_yaw,
+                                        const std::function<bool()>& is_canceled)
+  {
+    bool need_exit_recording = false;
+
+    // Terminal-state + cleanup helper. Runs on EVERY exit path: stops the robot,
+    // exits RECORDING, deactivates subs, publishes the terminal status, clears
+    // the busy flag, and returns the outcome. dock pose is persisted separately
+    // (before finish(success=true)) — this never writes it.
+    auto finish = [&](bool success,
+                      uint8_t reason,
+                      const std::string& msg,
+                      bool canceled,
+                      const DockCogGateResult* gate,
+                      const ComputeResult* imu) -> DockOutcome
+    {
+      publish_vx(0.0);
+      collecting_cog_ = false;
+      {
+        std::lock_guard<std::mutex> lk(lock_);
+        collecting_ = false;
+      }
+      if (need_exit_recording)
+      {
+        call_hlc(HL_CMD_RECORD_CANCEL, "exit recording");
+        wait_for_bt_state(HL_STATE_IDLE, 3.0);
+      }
+      deactivate_sensor_subs();
+      DockOutcome out;
+      out.success = success;
+      out.canceled = canceled;
+      out.retry_reason = reason;
+      out.message = msg;
+      if (gate)
+      {
+        out.gate_valid = true;
+        out.gate = *gate;
+      }
+      if (imu && imu->success)
+      {
+        out.imu_valid = true;
+        out.imu = *imu;
+      }
+      publish_status(DockStatus::PHASE_DONE,
+                     success ? 1.0f : 0.0f,
+                     0.0f,
+                     /*running=*/false,
+                     success,
+                     reason,
+                     msg);
+      dock_action_busy_ = false;
+      return out;
+    };
+
+    // ── Guards ──
+    if (emergency_active_)
+    {
+      return finish(false,
+                    CalibrateDock::Result::RETRY_EMERGENCY,
+                    "Emergency active/latched — clear it, then retry.",
+                    false,
+                    nullptr,
+                    nullptr);
+    }
+    if (bt_state_ == HL_STATE_AUTONOMOUS)
+    {
+      return finish(false,
+                    CalibrateDock::Result::RETRY_WRONG_STATE,
+                    "Robot is mowing (AUTONOMOUS). Send HOME first, then retry.",
+                    false,
+                    nullptr,
+                    nullptr);
+    }
+    if (!is_charging_)
+    {
+      return finish(false,
+                    CalibrateDock::Result::RETRY_WRONG_STATE,
+                    "Robot is not on the dock (not charging). Dock it, then retry.",
+                    false,
+                    nullptr,
+                    nullptr);
+    }
+
+    // ── (1) Wait for RTK-Fixed ──
+    // Subscribe BEFORE the wait: gps_rtk_fixed_ is only fed by the
+    // /gps/absolute_pose callback that activate_sensor_subs() creates (and
+    // finish() tears down after every run) — without a live subscription the
+    // wait polls a flag nothing updates and always times out.
+    activate_sensor_subs();
+    gps_rtk_fixed_ = false;  // require a fresh fix, not a stale one from a prior run
+    publish_status(
+        DockStatus::PHASE_WAIT_RTK, 0.05f, 0.0f, true, false, 0, "waiting for RTK-Fixed");
+    if (!wait_for_rtk_fixed(dc_rtk_wait_timeout_s_))
+    {
+      return finish(false,
+                    CalibrateDock::Result::RETRY_NO_RTK,
+                    "No RTK-Fixed within timeout — wait for a fix, then retry.",
+                    false,
+                    nullptr,
+                    nullptr);
+    }
+
+    // Enter RECORDING so the BT stands down (BoundaryGuard etc. exempt).
+    if (bt_state_ != HL_STATE_RECORDING)
+    {
+      if (!call_hlc(HL_CMD_RECORD_AREA, "enter recording") ||
+          !wait_for_bt_state(HL_STATE_RECORDING, 15.0))
+      {
+        return finish(false,
+                      CalibrateDock::Result::RETRY_WRONG_STATE,
+                      "Could not enter RECORDING via BT.",
+                      false,
+                      nullptr,
+                      nullptr);
+      }
+      need_exit_recording = true;
+    }
+
+    // ── (3) Straight reverse, collecting COG (+ IMU/odom accel if folding) ──
+    const double x0 = latest_gps_x_.load();
+    const double y0 = latest_gps_y_.load();
+    {
+      std::lock_guard<std::mutex> lk(cog_lock_);
+      cog_samples_.clear();
+    }
+    if (include_imu_yaw)
+    {
+      std::lock_guard<std::mutex> lk(lock_);
+      imu_samples_.clear();
+      odom_samples_.clear();
+      collecting_ = true;
+    }
+    collecting_cog_ = true;
+
+    const double period = 1.0 / CMD_RATE_HZ;
+    double disp = 0.0;
+    {
+      const double t_deadline = monotonic() + DOCK_UNDOCK_TIMEOUT_SEC;
+      while (rclcpp::ok())
+      {
+        if (is_canceled())
+        {
+          return finish(false,
+                        CalibrateDock::Result::RETRY_WRONG_STATE,
+                        "Canceled during reverse.",
+                        true,
+                        nullptr,
+                        nullptr);
+        }
+        if (emergency_active_)
+        {
+          return finish(false,
+                        CalibrateDock::Result::RETRY_EMERGENCY,
+                        "Emergency during reverse.",
+                        false,
+                        nullptr,
+                        nullptr);
+        }
+        publish_vx(-dc_reverse_speed_ms_);
+        sleep_for(period);
+        disp = std::hypot(latest_gps_x_.load() - x0, latest_gps_y_.load() - y0);
+        publish_status(DockStatus::PHASE_REVERSING,
+                       0.10f + 0.30f * static_cast<float>(
+                                           std::min(1.0,
+                                                    disp / std::max(dc_reverse_distance_m_, 1e-3))),
+                       static_cast<float>(disp),
+                       true,
+                       false,
+                       0,
+                       "reversing (blade off)");
+        if (disp >= dc_reverse_distance_m_ || monotonic() > t_deadline)
+          break;
+      }
+    }
+    publish_vx(0.0);
+    collecting_cog_ = false;
+    {
+      std::lock_guard<std::mutex> lk(lock_);
+      collecting_ = false;  // stop accel collection at the end of the reverse leg
+    }
+    const double x1 = latest_gps_x_.load();
+    const double y1 = latest_gps_y_.load();
+
+    // ── (7) COG-coherence gate + dock yaw (Resolution A: circular_mean, NO +pi) ──
+    publish_status(DockStatus::PHASE_CHECK_COG,
+                   0.45f,
+                   static_cast<float>(disp),
+                   true,
+                   false,
+                   0,
+                   "checking COG coherence");
+    std::vector<double> cog_snap;
+    {
+      std::lock_guard<std::mutex> lk(cog_lock_);
+      cog_snap = cog_samples_;
+    }
+    const DockCogGateResult gate =
+        evaluate_dock_cog_gate(cog_snap,
+                               x1 - x0,
+                               y1 - y0,
+                               static_cast<std::size_t>(std::max(0, dc_cog_min_samples_)),
+                               dc_cog_std_max_rad_,
+                               dc_cog_bearing_match_max_rad_,
+                               dc_min_baseline_disp_m_);
+    if (!gate.coherent)
+    {
+      return finish(false,
+                    cog_reason_to_retry(gate.reason),
+                    "COG incoherent (RTK not truly fixed / GPS noisy) — retry.",
+                    false,
+                    &gate,
+                    nullptr);
+    }
+
+    // Optional IMU-yaw fold from the same straight leg. Pitch/roll need a
+    // stationary baseline the dock reverse does not provide, so compute_imu_yaw
+    // may report them as skipped (imu_yaw itself comes from the accel segments).
+    ComputeResult imu_result;
+    bool have_imu = false;
+    if (include_imu_yaw)
+    {
+      std::vector<std::tuple<double, double, double, double>> imu_snap;
+      std::vector<std::tuple<double, double, double>> odom_snap;
+      {
+        std::lock_guard<std::mutex> lk(lock_);
+        imu_snap = imu_samples_;
+        odom_snap = odom_samples_;
+      }
+      imu_result = compute_imu_yaw(imu_snap, odom_snap, 0);
+      have_imu = imu_result.success;
+    }
+
+    // ── (4) Re-dock via the production docking pipeline, supervised ──
+    publish_status(DockStatus::PHASE_REDOCKING, 0.60f, 0.0f, true, false, 0, "re-docking");
+    {
+      // Line geometry shared by the guard and the steered backoff.
+      const double ux = std::cos(gate.dock_yaw_rad);
+      const double uy = std::sin(gate.dock_yaw_rad);
+
+      // HOME needs the BT idle (the reverse leg ran under RECORDING).
+      if (need_exit_recording)
+      {
+        call_hlc(HL_CMD_RECORD_CANCEL, "exit recording before HOME");
+        wait_for_bt_state(HL_STATE_IDLE, 5.0);
+        need_exit_recording = false;
+      }
+
+      for (int attempt = 0; attempt < REDOCK_MAX_ATTEMPTS && rclcpp::ok(); ++attempt)
+      {
+        if (!call_hlc(HL_CMD_HOME, "dock via Nav2"))
+        {
+          return finish(false,
+                        CalibrateDock::Result::RETRY_WRONG_STATE,
+                        "Could not start the Nav2 docking (HOME rejected).",
+                        false,
+                        &gate,
+                        nullptr);
+        }
+
+        // Supervise the approach: success = charging; abort = askew near the
+        // dock (angle guard on the RAW RTK track course — no fused-yaw
+        // dependence); failure = BT back to IDLE without charge, or timeout.
+        const double deadline = monotonic() + REDOCK_NAV_TIMEOUT_SEC;
+        double seg_x = latest_gps_x_.load();
+        double seg_y = latest_gps_y_.load();
+        double course = std::numeric_limits<double>::quiet_NaN();
+        double prev_to_dock = std::hypot(x0 - seg_x, y0 - seg_y);
+        int approaching_ticks = 0;
+        bool saw_autonomous = false;
+        while (rclcpp::ok() && monotonic() < deadline)
+        {
+          if (is_canceled())
+          {
+            call_hlc(HL_CMD_STOP, "stop HOME on cancel");
+            return finish(false,
+                          CalibrateDock::Result::RETRY_WRONG_STATE,
+                          "Canceled during re-dock.",
+                          true,
+                          &gate,
+                          nullptr);
+          }
+          if (emergency_active_)
+          {
+            return finish(false,
+                          CalibrateDock::Result::RETRY_EMERGENCY,
+                          "Emergency during re-dock.",
+                          false,
+                          &gate,
+                          nullptr);
+          }
+          if (is_charging_)
+            break;
+
+          const double cx = latest_gps_x_.load();
+          const double cy = latest_gps_y_.load();
+          if (std::hypot(cx - seg_x, cy - seg_y) >= REDOCK_COURSE_BASELINE_M)
+          {
+            course = std::atan2(cy - seg_y, cx - seg_x);
+            seg_x = cx;
+            seg_y = cy;
+          }
+          const double to_dock = std::hypot(x0 - cx, y0 - cy);
+          approaching_ticks = (to_dock < prev_to_dock - 1e-4) ? approaching_ticks + 1 : 0;
+          prev_to_dock = to_dock;
+          if (bt_state_ == HL_STATE_AUTONOMOUS)
+            saw_autonomous = true;
+
+          // Angle guard: only while genuinely closing in on the dock (the
+          // staging maneuver may pass nearby on an arbitrary heading).
+          if (to_dock < REDOCK_ANGLE_GUARD_DIST_M && to_dock > REDOCK_STEER_CUTOFF_M &&
+              approaching_ticks >= REDOCK_APPROACH_TICKS_MIN && std::isfinite(course) &&
+              std::abs(wrap_angle(gate.dock_yaw_rad - course)) > REDOCK_ANGLE_GUARD_RAD)
+          {
+            RCLCPP_WARN(get_logger(),
+                        "Re-dock: track course %.1f° off the dock line at %.2f m — "
+                        "stopping for a steered backoff instead of shoving in askew.",
+                        std::abs(wrap_angle(gate.dock_yaw_rad - course)) * 180.0 / M_PI,
+                        to_dock);
+            call_hlc(HL_CMD_STOP, "abort askew approach");
+            wait_for_bt_state(HL_STATE_IDLE, 5.0);
+            break;
+          }
+
+          // BT finished (back to IDLE) without a charge signal → this attempt
+          // failed on the docking server's side.
+          if (saw_autonomous && bt_state_ == HL_STATE_IDLE)
+            break;
+
+          publish_status(DockStatus::PHASE_REDOCKING,
+                         0.60f + 0.25f * static_cast<float>(std::max(
+                                             0.0, 1.0 - to_dock / DOCK_UNDOCK_DISTANCE_DEFAULT_M)),
+                         static_cast<float>(to_dock),
+                         true,
+                         false,
+                         0,
+                         "re-docking (Nav2)");
+          sleep_for(period);
+        }
+        if (monotonic() >= deadline)
+          call_hlc(HL_CMD_STOP, "stop HOME on timeout");
+
+        // Give the firmware's charge-detection debounce (~2-3 s ADC) a chance
+        // before deciding this attempt failed.
+        {
+          const double t_settle = monotonic() + REDOCK_CHARGE_SETTLE_SEC;
+          while (rclcpp::ok() && !is_charging_ && monotonic() < t_settle)
+            sleep_for(period);
+        }
+        if (is_charging_ || attempt + 1 >= REDOCK_MAX_ATTEMPTS)
+          break;
+
+        // ── Steered backoff: reverse ~2 m converging on the ideal line so
+        //    the next HOME starts from a clean, lined-up spot. Runs under
+        //    RECORDING so the BT stands down while we publish cmd_vel. ──
+        publish_status(DockStatus::PHASE_REDOCKING,
+                       0.60f,
+                       0.0f,
+                       true,
+                       false,
+                       0,
+                       "re-docking (steered backoff)");
+        if (!call_hlc(HL_CMD_RECORD_AREA, "enter recording for backoff") ||
+            !wait_for_bt_state(HL_STATE_RECORDING, 15.0))
+        {
+          return finish(false,
+                        CalibrateDock::Result::RETRY_WRONG_STATE,
+                        "Could not enter RECORDING for the backoff.",
+                        false,
+                        &gate,
+                        nullptr);
+        }
+        const double bx = latest_gps_x_.load();
+        const double by = latest_gps_y_.load();
+        double bseg_x = bx;
+        double bseg_y = by;
+        double bcourse = std::numeric_limits<double>::quiet_NaN();
+        const double back_deadline = monotonic() + REDOCK_BACKOFF_TIMEOUT_SEC;
+        while (rclcpp::ok() && !emergency_active_ && !is_canceled() && monotonic() < back_deadline)
+        {
+          const double cx = latest_gps_x_.load();
+          const double cy = latest_gps_y_.load();
+          if (std::hypot(cx - bx, cy - by) >= REDOCK_BACKOFF_M)
+            break;
+          if (std::hypot(cx - bseg_x, cy - bseg_y) >= REDOCK_COURSE_BASELINE_M)
+          {
+            bcourse = std::atan2(cy - bseg_y, cx - bseg_x);
+            bseg_x = cx;
+            bseg_y = cy;
+          }
+          double wz = 0.0;
+          if (std::isfinite(bcourse))
+          {
+            // Reversing: the track course points backwards, so the chassis
+            // heading is course + pi. The cross-track term flips sign vs the
+            // forward case — the TAIL must move toward the line.
+            const double heading = wrap_angle(bcourse + M_PI);
+            const double hdg_err = wrap_angle(gate.dock_yaw_rad - heading);
+            const double e_xt = ux * (cy - y0) - uy * (cx - x0);
+            const double xt_term = +std::atan(REDOCK_XT_SHARPNESS * e_xt);
+            wz =
+                std::max(-REDOCK_WZ_MAX,
+                         std::min(REDOCK_WZ_MAX, REDOCK_HDG_KP * hdg_err + REDOCK_XT_KP * xt_term));
+          }
+          publish_arc(-dc_reverse_speed_ms_, wz);
+          sleep_for(period);
+        }
+        publish_vx(0.0);
+        call_hlc(HL_CMD_RECORD_CANCEL, "exit recording after backoff");
+        wait_for_bt_state(HL_STATE_IDLE, 5.0);
+      }
+    }
+    publish_vx(0.0);
+
+    // ── (5) Verify charging (give the charger handshake a few seconds) ──
+    publish_status(
+        DockStatus::PHASE_VERIFY_CHARGE, 0.85f, 0.0f, true, false, 0, "verifying charge");
+    {
+      const double t_verify = monotonic() + REDOCK_CHARGE_SETTLE_SEC;
+      while (rclcpp::ok() && !is_charging_ && monotonic() < t_verify)
+        sleep_for(period);
+    }
+    if (!is_charging_)
+    {
+      return finish(false,
+                    CalibrateDock::Result::RETRY_NO_CHARGE_ON_REDOCK,
+                    "Re-dock did not re-engage the charger — retry.",
+                    false,
+                    &gate,
+                    have_imu ? &imu_result : nullptr);
+    }
+
+    // ── Persist via the ONE canonical writer (map_server, yaw_source=MOTION),
+    //    ONLY now that re-dock + charging are verified. ──
+    // map_server's yaw-convergence gate wants the fused yaw quiet over a full
+    // rolling window, and right after the drive it is still settling (observed
+    // ~6° window-std immediately after re-dock) — so retry while the robot
+    // sits still on the charger instead of failing on the first attempt.
+    publish_status(DockStatus::PHASE_PERSIST, 0.95f, 0.0f, true, false, 0, "saving dock pose");
+    std::string perr;
+    bool persisted = false;
+    for (int attempt = 0; attempt < PERSIST_MAX_ATTEMPTS && rclcpp::ok(); ++attempt)
+    {
+      if (attempt > 0)
+      {
+        publish_status(DockStatus::PHASE_PERSIST,
+                       0.95f,
+                       0.0f,
+                       true,
+                       false,
+                       0,
+                       "saving dock pose (waiting for yaw to settle)");
+        const double t_retry = monotonic() + PERSIST_RETRY_DELAY_SEC;
+        while (rclcpp::ok() && monotonic() < t_retry)
+          sleep_for(period);
+      }
+      if (is_canceled() || emergency_active_)
+        break;
+      if (persist_dock_via_map_server(gate.dock_yaw_rad, perr))
+      {
+        persisted = true;
+        break;
+      }
+    }
+    if (!persisted)
+    {
+      return finish(false,
+                    CalibrateDock::Result::RETRY_PERSIST_FAILED,
+                    perr,
+                    false,
+                    &gate,
+                    have_imu ? &imu_result : nullptr);
+    }
+
+    return finish(true,
+                  CalibrateDock::Result::RETRY_NONE,
+                  "Dock calibrated: position from averaged GPS, yaw from COG, re-dock verified.",
+                  false,
+                  &gate,
+                  have_imu ? &imu_result : nullptr);
   }
 
   // ── Service handler ─────────────────────────────────────────────────
@@ -1175,22 +2015,6 @@ private:
   }
 
   // ── Numerical core ──────────────────────────────────────────────────
-  struct ComputeResult
-  {
-    bool success{false};
-    std::string message;
-    double imu_yaw_rad{0.0};
-    double imu_yaw_deg{0.0};
-    int samples_used{0};
-    double std_dev_deg{0.0};
-    double imu_pitch_rad{0.0};
-    double imu_pitch_deg{0.0};
-    double imu_roll_rad{0.0};
-    double imu_roll_deg{0.0};
-    int stationary_samples_used{0};
-    double gravity_mag_mps2{0.0};
-  };
-
   ComputeResult compute_imu_yaw(std::vector<std::tuple<double, double, double, double>> imu_samples,
                                 std::vector<std::tuple<double, double, double>> odom_samples,
                                 int baseline_count)
@@ -1467,6 +2291,28 @@ private:
   rclcpp::Client<mowgli_interfaces::srv::HighLevelControl>::SharedPtr hlc_client_;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_pub_;
   rclcpp::Service<mowgli_interfaces::srv::CalibrateImuYaw>::SharedPtr srv_;
+
+  // ── One-click dock calibration (CalibrateDock action) params + state ──
+  double dc_reverse_distance_m_{2.0};
+  double dc_reverse_speed_ms_{0.15};
+  double dc_redock_overshoot_m_{0.30};
+  double dc_rtk_wait_timeout_s_{10.0};
+  double dc_redock_charge_timeout_s_{30.0};
+  int dc_cog_min_samples_{8};
+  double dc_cog_std_max_rad_{0.0524};
+  double dc_cog_bearing_match_max_rad_{0.1047};
+  double dc_min_baseline_disp_m_{0.5};
+
+  std::mutex cog_lock_;
+  std::vector<double> cog_samples_;
+  std::atomic<bool> collecting_cog_{false};
+  std::atomic<bool> dock_action_busy_{false};
+
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr cog_sub_;
+  rclcpp::Client<mowgli_interfaces::srv::SetDockingPoint>::SharedPtr set_dock_client_;
+  rclcpp_action::Server<mowgli_interfaces::action::CalibrateDock>::SharedPtr dock_action_;
+  rclcpp::Publisher<mowgli_interfaces::msg::DockCalibrationStatus>::SharedPtr status_pub_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr dock_start_srv_;
 };
 
 }  // namespace mowgli_localization

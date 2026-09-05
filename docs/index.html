@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MowgliNext — Open-Source ROS2 Robot Mower</title>
-  <meta name="description" content="Autonomous robot mower built on ROS2 Kilted with RTK-GPS + IMU + wheel fusion (robot_localization EKF or opt-in GTSAM iSAM2 factor graph), behavior trees, and coverage planning. Open source, community driven.">
+  <meta name="description" content="Autonomous robot mower built on ROS2 Kilted with RTK-GPS + IMU + wheel fusion through a GTSAM iSAM2 factor-graph localizer, behavior trees, and coverage planning. Open source, community driven.">
   <link rel="icon" type="image/svg+xml" href="icon.svg">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -13,8 +13,8 @@
 <!-- ─── Beta Banner ─────────────────────────────────── -->
 <div class="beta-banner">
   <span class="beta-tag">BETA</span>
-  MowgliNext is under active development — not yet ready for production use.
-  <a href="https://github.com/cedbossneo/mowglinext">Follow progress on GitHub</a>
+  First public beta — running on real hardware and open to testers.
+  <a href="https://github.com/mowglinext/mowglinext">Join the testers on GitHub</a>
 </div>
 
 <!-- ─── Navigation ──────────────────────────────────── -->
@@ -25,8 +25,8 @@
       <li><a href="#how-it-works">How It Works</a></li>
       <li><a href="#features">Features</a></li>
       <li><a href="#getting-started">Get Started</a></li>
-      <li><a href="https://github.com/cedbossneo/mowglinext/wiki">Wiki</a></li>
-      <li><a href="https://github.com/cedbossneo/mowglinext">GitHub</a></li>
+      <li><a href="https://github.com/mowglinext/mowglinext/wiki">Wiki</a></li>
+      <li><a href="https://github.com/mowglinext/mowglinext">GitHub</a></li>
     </ul>
   </div>
 </nav>
@@ -129,8 +129,8 @@
     </p>
     <div class="buttons">
       <a href="#getting-started" class="btn btn-primary">Get Started</a>
-      <a href="https://github.com/cedbossneo/mowglinext" class="btn btn-secondary">View on GitHub</a>
-      <a href="https://github.com/cedbossneo/mowglinext/wiki" class="btn btn-secondary">Read the Docs</a>
+      <a href="https://github.com/mowglinext/mowglinext" class="btn btn-secondary">View on GitHub</a>
+      <a href="https://github.com/mowglinext/mowglinext/wiki" class="btn btn-secondary">Read the Docs</a>
     </div>
   </div>
 </section>
@@ -143,7 +143,7 @@
       <div class="flow-step">
         <div class="flow-icon">📡</div>
         <h3>See</h3>
-        <p>LiDAR scans the surroundings 10x/second. Required for obstacle avoidance and optional Kinematic-ICP drift correction. RTK-GPS pinpoints position to centimeter accuracy.</p>
+        <p>LiDAR scans the surroundings 10x/second. Required for obstacle avoidance and optional scan-matching + loop-closure factors in the localizer. RTK-GPS pinpoints position to centimeter accuracy.</p>
       </div>
       <div class="flow-arrow">→</div>
       <div class="flow-step">
@@ -155,7 +155,7 @@
       <div class="flow-step">
         <div class="flow-icon">🔄</div>
         <h3>Mow</h3>
-        <p>Cell-based strip coverage generates efficient mowing patterns. The robot follows them with sub-centimeter accuracy, tracking progress and replanning around obstacles in real time.</p>
+        <p>Fields2Cover plans headland rings and parallel swaths for every area, joined into one continuous path. The robot follows it with sub-centimeter accuracy, tracking progress and replanning around obstacles in real time.</p>
       </div>
     </div>
   </div>
@@ -169,14 +169,14 @@
 
       <div class="feature-card">
         <div class="icon">🗺️</div>
-        <h3>RTK Localization, Two Backends</h3>
-        <p>No SLAM needed. By default robot_localization's dual EKF fuses RTK-GPS + IMU + wheel odometry under REP-105. For RTK-Float windows or GPS-denied corners, switch on the opt-in GTSAM iSAM2 factor-graph localizer (<code>fusion_graph</code>) — same inputs, plus LiDAR scan-matching and loop-closure factors. Optional Kinematic-ICP gives an extra LiDAR drift-correction layer to the local EKF in either mode.</p>
+        <h3>RTK Localization, No SLAM</h3>
+        <p>No SLAM needed. A single GTSAM iSAM2 factor-graph localizer (<code>fusion_graph</code>) fuses RTK-GPS + IMU + wheel odometry under REP-105, holding a centimetre-accurate map pose. In RTK-Float windows or GPS-denied corners it folds LiDAR scan-matching and loop-closure factors into the same graph to keep the estimate stable.</p>
       </div>
 
       <div class="feature-card">
         <div class="icon">📡</div>
-        <h3>Dual-EKF Sensor Fusion</h3>
-        <p>Standard robot_localization stack: local EKF for continuous odometry, global EKF for GPS-anchored map pose. Battle-tested, under <code>two_d_mode</code>, with a tight non-holonomic constraint on the wheel input.</p>
+        <h3>Factor-Graph Sensor Fusion</h3>
+        <p>One iSAM2 factor graph owns both the odometry and map frames. RTK-GPS, IMU heading, wheel odometry, and optional LiDAR all enter as factors — with a tight non-holonomic constraint on the wheel input for smooth, drift-resistant tracking.</p>
       </div>
 
       <div class="feature-card">
@@ -257,15 +257,15 @@
 │  <span class="highlight">ROS2 Kilted Stack</span>                                     │
 │                                                      │
 │  ┌─────────────┐  ┌──────────┐  ┌─────────────────┐ │
-│  │  <span class="highlight">Nav2</span>        │  │<span class="highlight">Kinematic</span> │  │  <span class="highlight">Behavior Tree</span>  │ │
-│  │  navigate    │  │  <span class="highlight">ICP</span>     │  │  main_tree.xml  │ │
+│  │  <span class="highlight">Nav2</span>        │  │<span class="highlight">ScanMatch</span> │  │  <span class="highlight">Behavior Tree</span>  │ │
+│  │  navigate    │  │  <span class="highlight">loop</span>    │  │  main_tree.xml  │ │
 │  │  dock/undock │  │ (LiDAR)  │  │  10 Hz tick     │ │
 │  │  coverage    │  │          │  │                 │ │
 │  └─────────────┘  └──────────┘  └─────────────────┘ │
 │  ┌─────────────┐  ┌──────────┐  ┌─────────────────┐ │
-│  │  <span class="highlight">Coverage</span>    │  │<span class="highlight">robot_loc</span>│  │  <span class="highlight">Hardware</span>       │ │
-│  │  Planner     │  │ Dual EKF │  │  Bridge         │ │
-│  │  (cell-based)│  │GPS+IMU+Odometry│  │  COBS serial    │ │
+│  │  <span class="highlight">Coverage</span>    │  │<span class="highlight">fusion_gr</span>│  │  <span class="highlight">Hardware</span>       │ │
+│  │  Planner     │  │ iSAM2 FG │  │  Bridge         │ │
+│  │  (F2C v3)    │  │GPS+IMU+LiDAR│  │  COBS serial    │ │
 │  └─────────────┘  └──────────┘  └────────┬────────┘ │
 └───────────────────────────────────────────┼──────────┘
           │                │                │
@@ -309,7 +309,29 @@
       <!-- Universal GNSS -->
       <div class="composer-group" id="gnss-group">
         <h3>Universal GNSS</h3>
-        <p class="composer-hint" id="gnss-group-hint">Universal GNSS is the only supported direct GNSS stack. Pick the serial connection type here; the installer will still ask for the exact device path and detect the receiver baud.</p>
+        <p class="composer-hint" id="gnss-group-hint">Universal GNSS is the only supported direct GNSS stack. Pick first-boot defaults for the receiver family and serial connection here; the active runtime GNSS config later lives in the GUI/YAML, and the installer will still ask for the exact device path and detect the receiver baud.</p>
+        <div class="composer-options" data-group="gnssReceiverFamily">
+          <button class="composer-option active" data-value="auto">
+            <span class="option-icon">🛰️</span>
+            <span class="option-label">Auto</span>
+            <span class="option-desc">Let Universal GNSS auto-detect the receiver family at runtime</span>
+          </button>
+          <button class="composer-option" data-value="ublox">
+            <span class="option-icon">📍</span>
+            <span class="option-label">u-blox</span>
+            <span class="option-desc">Explicit u-blox receiver family selection</span>
+          </button>
+          <button class="composer-option" data-value="unicore">
+            <span class="option-icon">🧭</span>
+            <span class="option-label">Unicore / UM982</span>
+            <span class="option-desc">Explicit Unicore family selection for UM980/UM981/UM982-class receivers</span>
+          </button>
+          <button class="composer-option" data-value="nmea">
+            <span class="option-icon">📜</span>
+            <span class="option-label">Generic NMEA</span>
+            <span class="option-desc">Use the generic NMEA receiver-family mode</span>
+          </button>
+        </div>
         <div class="composer-options" data-group="gnssConnection">
           <button class="composer-option active" data-value="uart">
             <span class="option-icon">📡</span>
@@ -327,7 +349,7 @@
       <!-- LiDAR -->
       <div class="composer-group">
         <h3>LiDAR Sensor</h3>
-        <p class="composer-hint">Required for obstacle avoidance and optional Kinematic-ICP drift correction</p>
+        <p class="composer-hint">Required for obstacle avoidance and optional scan-matching + loop-closure localization</p>
         <div class="composer-options" data-group="lidar">
           <button class="composer-option active" data-value="ldlidar-uart">
             <span class="option-icon">🔴</span>
@@ -365,37 +387,6 @@
             <span class="option-icon">❌</span>
             <span class="option-label">None</span>
             <span class="option-desc">No LiDAR</span>
-          </button>
-        </div>
-      </div>
-
-      <!-- Rangefinders -->
-      <div class="composer-group disabled" id="tfluna-group" aria-disabled="true">
-        <h3>TF-Luna Rangefinders <span class="option-badge coming-soon">Unavailable</span></h3>
-        <p class="composer-hint">Temporarily disabled on this branch. The installer keeps TF-Luna support off until the runtime services are production-ready again.</p>
-        <div class="composer-options" data-group="tfluna">
-          <button class="composer-option active" data-value="none">
-            <span class="option-icon">❌</span>
-            <span class="option-label">None</span>
-            <span class="option-desc">No rangefinders</span>
-          </button>
-          <button class="composer-option" data-value="front">
-            <span class="option-icon">📏</span>
-            <span class="option-badge">Experimental</span>
-            <span class="option-label">Front only</span>
-            <span class="option-desc">Front obstacle sensor — data publishes, not yet fused</span>
-          </button>
-          <button class="composer-option" data-value="edge">
-            <span class="option-icon">📏</span>
-            <span class="option-badge">Experimental</span>
-            <span class="option-label">Edge only</span>
-            <span class="option-desc">Ground edge detector — data publishes, not yet fused</span>
-          </button>
-          <button class="composer-option" data-value="both">
-            <span class="option-icon">📏</span>
-            <span class="option-badge">Experimental</span>
-            <span class="option-label">Front + Edge</span>
-            <span class="option-desc">Both sensors — data publishes, not yet fused</span>
           </button>
         </div>
       </div>
@@ -461,9 +452,9 @@
 <!-- ─── Composer JS ─────────────────────────────────── -->
 <script>
 (function() {
-  var state = { backend: 'mowgli', gnssConnection: 'uart', lidar: 'ldlidar-uart', tfluna: 'none', channel: 'main' };
+  var state = { backend: 'mowgli', gnssReceiverFamily: 'auto', gnssConnection: 'uart', lidar: 'ldlidar-uart', channel: 'main' };
   var baseUrl = 'https://mowgli.garden/install.sh';
-  var defaultGnssHint = 'Universal GNSS is the only supported direct GNSS path. The installer will ask for the exact serial device and detect baud before first boot.';
+  var defaultGnssHint = 'Universal GNSS is the only supported direct GNSS path. Pick first-boot GNSS defaults here; the installer will ask for the exact serial device and detect baud, while the active runtime configuration later lives in the GUI/YAML.';
   var mavrosGnssHint = 'MAVROS uses the flight controller telemetry link. Direct Universal GNSS selection is disabled for this backend.';
 
   function setGroupDisabled(groupId, disabled) {
@@ -500,11 +491,11 @@
     parts.push('--backend=' + state.backend);
 
     if (state.backend !== 'mavros') {
+      parts.push('--gnss-receiver-family=' + state.gnssReceiverFamily);
       parts.push('--gnss-connection=' + state.gnssConnection);
     }
 
     parts.push('--lidar=' + state.lidar);
-    parts.push('--tfluna=' + state.tfluna);
 
     // Channel: only emit when non-default. --branch is used by both the
     // bootstrap (git clone) and the installer (image tag), keeping them
@@ -587,6 +578,21 @@
         <p>For the countless late nights spent together getting things to actually work. Debugging hardware at 2am is better with a friend.</p>
       </div>
       <div class="thanks-card">
+        <div class="thanks-icon">🛠️</div>
+        <h3><a href="https://github.com/cedbossneo">cedbossneo</a></h3>
+        <p>For leading the MowgliNext stack — the factor-graph localizer, Nav2 navigation, coverage, behavior trees, and the web GUI. The engine room of the project.</p>
+      </div>
+      <div class="thanks-card">
+        <div class="thanks-icon">🛰️</div>
+        <h3><a href="https://github.com/Pepeuch">Pepeuch</a></h3>
+        <p>For the Universal GNSS &amp; Unicore integration and relentless field testing — chasing down GPS and coverage bugs on real hardware, in real gardens.</p>
+      </div>
+      <div class="thanks-card">
+        <div class="thanks-icon">🧪</div>
+        <h3><a href="https://github.com/tetiti20">tetiti20</a></h3>
+        <p>For steady testing, feedback, and bug reports that keep the rough edges honest and push the project forward release after release.</p>
+      </div>
+      <div class="thanks-card">
         <div class="thanks-icon">🌍</div>
         <h3><a href="https://openmower.de/">OpenMower</a></h3>
         <p>For proving that robot mowers can be truly intelligent. You showed us what's possible and inspired an entire community of builders.</p>
@@ -602,6 +608,10 @@
         <p>Every person who installed our firmware, filed a bug, asked a question, or just said "it works!" — you give us the courage to keep spending nights on this project.</p>
       </div>
     </div>
+    <p class="thanks-all">
+      …and everyone else who has contributed code, issues, and ideas —
+      <a href="https://github.com/mowglinext/mowglinext/graphs/contributors">see all contributors on GitHub</a>.
+    </p>
   </div>
 </section>
 
@@ -614,9 +624,9 @@
       or contribute code. Every contribution makes autonomous mowing better for everyone.
     </p>
     <div class="buttons">
-      <a href="https://github.com/cedbossneo/mowglinext/discussions" class="btn btn-primary">Join Discussions</a>
-      <a href="https://github.com/cedbossneo/mowglinext/blob/main/CONTRIBUTING.md" class="btn btn-secondary">Contributing Guide</a>
-      <a href="https://github.com/cedbossneo/mowglinext/issues/new/choose" class="btn btn-secondary">Report a Bug</a>
+      <a href="https://github.com/mowglinext/mowglinext/discussions" class="btn btn-primary">Join Discussions</a>
+      <a href="https://github.com/mowglinext/mowglinext/blob/main/CONTRIBUTING.md" class="btn btn-secondary">Contributing Guide</a>
+      <a href="https://github.com/mowglinext/mowglinext/issues/new/choose" class="btn btn-secondary">Report a Bug</a>
     </div>
   </div>
 </section>
@@ -625,7 +635,7 @@
 <footer>
   <div class="container">
     <p>
-      MowgliNext is <a href="https://github.com/cedbossneo/mowglinext/blob/main/LICENSE">GPLv3 licensed</a> — same as OpenMower, because open source is how we all win.
+      MowgliNext is <a href="https://github.com/mowglinext/mowglinext/blob/main/LICENSE">GPLv3 licensed</a> — same as OpenMower, because open source is how we all win.
       <br>
       Built on <a href="https://docs.ros.org/en/kilted/">ROS2 Kilted</a>,
       <a href="https://docs.nav2.org/">Nav2</a>, and

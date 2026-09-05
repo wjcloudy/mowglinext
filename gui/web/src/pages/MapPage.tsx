@@ -3,6 +3,7 @@ import {useApi} from "../hooks/useApi.ts";
 import {App} from "antd";
 import turfArea from "@turf/area";
 import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
+import {useTranslation} from "react-i18next";
 import {MapArea, Map as MapType} from "../types/ros.ts";
 import DrawControl from "../components/DrawControl.tsx";
 import Map, {Layer, Source} from 'react-map-gl/mapbox';
@@ -24,6 +25,7 @@ import {useManualMode} from "./map/hooks/useManualMode.ts";
 import {useMapEditing} from "./map/hooks/useMapEditing.ts";
 import {useMapStreams} from "./map/hooks/useMapStreams.ts";
 import {useMapFiles, type ImportOpenMowerSummary} from "./map/hooks/useMapFiles.ts";
+import {useResetMowingProgress} from "./map/hooks/useResetMowingProgress.tsx";
 import {ImportOpenMowerModal} from "./map/components/ImportOpenMowerModal.tsx";
 import {NewAreaModal} from "./map/components/NewAreaModal.tsx";
 import {EditAreaModal} from "./map/components/EditAreaModal.tsx";
@@ -38,11 +40,24 @@ import {useIsMobile} from "../hooks/useIsMobile.ts";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
 
 
+// Mapbox access token comes from the build env only — no hardcoded fallback.
+// When it is missing the page renders a clear error panel instead of a broken
+// (blank) map, so the misconfiguration is obvious rather than silent.
+const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN as string | undefined || "pk.eyJ1IjoiY2VkYm9zc25lbyIsImEiOiJjbGxldjB4aDEwOW5vM3BxamkxeWRwb2VoIn0.WOccbQZZyO1qfAgNxnHAnA";
+
+// Layers the full map queries on hover to drive the two-way obstacle
+// highlight (map polygon → panel row). Module-level so the array identity is
+// stable across renders and react-map-gl does not re-bind the query on every
+// render.
+const DYN_OBSTACLE_INTERACTIVE_LAYERS = ['dyn-obstacle-fill'];
+
 export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
     const {notification} = App.useApp();
-    const {colors} = useThemeMode();
+    const {t} = useTranslation();
+    const {colors, displayMode} = useThemeMode();
     const isMobile = useIsMobile();
     const mowerAction = useMowerAction()
+    const resetMowingProgress = useResetMowingProgress()
 
     // Brand tokens for the Mapbox display-only layers (dock, mower, lidar).
     // Shared between the compact and full render branches so the two stay in
@@ -70,6 +85,12 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
     const guiApi = useApi()
     const [tileUri, setTileUri] = useState<string | undefined>()
     const [editMap, setEditMap] = useState<boolean>(false)
+    // Shared hover/selection link between the tracked-obstacles panel and the
+    // map. Hovering a panel row (or a map polygon) sets this id; both the
+    // Mapbox highlight layer (via its filter) and the panel read it, so the
+    // operator sees exactly which obstacle they're about to promote. null =
+    // nothing highlighted.
+    const [selectedObstacleId, setSelectedObstacleId] = useState<number | null>(null);
     const [features, setFeatures] = useState<Record<string, MowingFeature>>({});
     const [dockPlacementMode, setDockPlacementMode] = useState<boolean>(false);
     // OpenMower import preview — populated by handleImportOpenMower after
@@ -100,6 +121,9 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
     const robotPoseRef = useRef<{ x: number; y: number; heading: number } | null>(null)
     const mapInstanceRef = useRef<MapboxMap | null>(null)
     const drawRef = useRef<import('@mapbox/mapbox-gl-draw').default | null>(null);
+    // Stable ref to the 'rotateend' listener so it can be removed on unmount
+    // (StrictMode mounts twice, otherwise the handler stacks).
+    const rotateEndHandlerRef = useRef<(() => void) | null>(null);
 
     // Only include editable polygon features for DrawControl — exclude mower,
     // paths, and other display-only features so that frequent pose updates don't
@@ -174,6 +198,45 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
         return {type: "FeatureCollection", features: feats};
     }, [features, offsetX, offsetY, datum, LAYER_COLORS]);
 
+    // Layers for the persistent tracked-obstacle polygons (feature_type
+    // 'dyn-obstacle', carried in the same display-features source). Rendered as
+    // a translucent fill + rose outline + an id label, so the map and the
+    // TrackedObstaclesPanel share one visible identifier. `withHighlight` adds
+    // an amber outline on the currently selected/hovered obstacle — its filter
+    // reads selectedObstacleId, so a hover only re-binds this one layer's
+    // filter (no feature rebuild). Only the full map passes withHighlight; the
+    // compact overview just shows the fill/outline/label.
+    const renderDynObstacleLayers = (withHighlight: boolean) => (
+        [
+            <Layer key={"dyn-obstacle-fill"} type={"fill"} id={"dyn-obstacle-fill"}
+                filter={['==', ['get', 'feature_type'], 'dyn-obstacle']}
+                paint={{'fill-color': ['get', 'color']}}/>,
+            <Layer key={"dyn-obstacle-outline"} type={"line"} id={"dyn-obstacle-outline"}
+                filter={['==', ['get', 'feature_type'], 'dyn-obstacle']}
+                paint={{'line-color': LAYER_COLORS.lidarHit, 'line-width': 2}}/>,
+            ...(withHighlight ? [
+                <Layer key={"dyn-obstacle-highlight"} type={"line"} id={"dyn-obstacle-highlight"}
+                    filter={['all',
+                        ['==', ['get', 'feature_type'], 'dyn-obstacle'],
+                        ['==', ['get', 'obs_id'], selectedObstacleId ?? -1]]}
+                    paint={{'line-color': LAYER_COLORS.lidarMiss, 'line-width': 4}}/>,
+            ] : []),
+            <Layer key={"dyn-obstacle-label"} type={"symbol"} id={"dyn-obstacle-label"}
+                filter={['==', ['get', 'feature_type'], 'dyn-obstacle']}
+                layout={{
+                    'text-field': ['concat', '#', ['get', 'obs_label']],
+                    'text-size': 13,
+                    'text-font': ['Open Sans Bold'],
+                    'text-allow-overlap': true,
+                }}
+                paint={{
+                    'text-color': LAYER_COLORS.labelText,
+                    'text-halo-color': LAYER_COLORS.labelHalo,
+                    'text-halo-width': 1.5,
+                }}/>,
+        ]
+    );
+
     const [mowingAreas, setMowingAreas] = useState<{ key: string, label: string, feat: Feature }[]>([])
 
     const {map, setMap, path, plan, lidarCollection, mowProgressImage, highLevelStatus, joyStream, dynamicObstacles} = useMapStreams({
@@ -246,30 +309,78 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
             const navigationAreas = buildFeatures(map.navigation_areas??[], "navigation")
             newFeatures = {...workingAreas, ...navigationAreas}
 
-            const dock_lonlat = transpose(offsetX, offsetY, datum, map?.dock_y!!, map?.dock_x!!)
-            newFeatures["dock"] = new DockFeatureBase(dock_lonlat, map?.dock_heading ?? 0);
+            // dock_x/dock_y are optional on the wire. `map?.dock_y!` claimed
+            // otherwise and pushed `undefined` into transpose(), painting the
+            // dock at NaN; skip the marker instead when the pose is absent.
+            if (map.dock_x !== undefined && map.dock_y !== undefined) {
+                const dock_lonlat = transpose(offsetX, offsetY, datum, map.dock_y, map.dock_x)
+                newFeatures["dock"] = new DockFeatureBase(dock_lonlat, map.dock_heading ?? 0);
+            }
         }
         if (path?.poses) {
             // Coverage plan: the full F2C route (headland rings + every swath)
             // for the current area (/coverage/full_plan, a nav_msgs/Path).
             // Execution is swath-by-swath, but this shows the whole plan.
             // Rendered green so it reads distinctly from the transit plan below.
-            const coordinates: Position[] = path.poses.map((pose) => {
-                return transpose(offsetX, offsetY, datum, pose.pose?.position?.y!, pose.pose?.position?.x!)
-            });
-            if (coordinates.length > 1) {
-                const feature = new PathFeature("coverage-path", coordinates, LAYER_COLORS.coveragePath, 2);
-                newFeatures[feature.id] = feature
+            //
+            // full_path is the CONCATENATION of the drivable sub-paths; the
+            // jump between two sub-paths is never driven directly (the BT
+            // bridges it with an obstacle-avoiding Nav2 transit), so break the
+            // polyline at large gaps — drawing them as one line paints fake
+            // straight "routes" through the very obstacles the sub-path split
+            // exists to avoid.
+            const SUBPATH_GAP_M = 0.75;
+            let segment: Position[] = [];
+            let segmentIdx = 0;
+            let prev: { x: number; y: number } | null = null;
+            const flushSegment = () => {
+                if (segment.length > 1) {
+                    const feature = new PathFeature(
+                        `coverage-path-${segmentIdx}`, segment, LAYER_COLORS.coveragePath, 2);
+                    newFeatures[feature.id] = feature
+                    segmentIdx += 1;
+                }
+                segment = [];
+            };
+            for (const pose of path.poses) {
+                const x = pose.pose?.position?.x;
+                const y = pose.pose?.position?.y;
+                // A pose without coordinates cannot be drawn — break the
+                // polyline there rather than feeding NaN into transpose().
+                if (x === undefined || y === undefined) {
+                    flushSegment();
+                    prev = null;
+                    continue;
+                }
+                if (prev && Math.hypot(x - prev.x, y - prev.y) > SUBPATH_GAP_M) {
+                    flushSegment();
+                }
+                segment.push(transpose(offsetX, offsetY, datum, y, x));
+                prev = { x, y };
             }
+            flushSegment();
         }
         if (plan?.poses) {
-            const coordinates = plan.poses.map((pose) => {
-                return transpose(offsetX, offsetY, datum, pose.pose?.position?.y!, pose.pose?.position?.x!)
+            const coordinates = plan.poses.flatMap((pose) => {
+                const x = pose.pose?.position?.x;
+                const y = pose.pose?.position?.y;
+                if (x === undefined || y === undefined) return [];
+                return [transpose(offsetX, offsetY, datum, y, x)];
             });
             const feature = new ActivePathFeature("plan", coordinates);
             newFeatures[feature.id] = feature
         }
-        setFeatures(newFeatures)
+        // Preserve the live robot features — they are owned by the pose stream
+        // (useMapStreams merges mower/mower-* in) and must survive this
+        // map/path/plan-driven rebuild. Replacing the record wholesale wiped
+        // the mower on every path update, so the robot only stayed visible
+        // while the path overlays were NOT being streamed.
+        setFeatures((old) => ({
+            ...newFeatures,
+            ...Object.fromEntries(
+                Object.entries(old).filter(([k]) => k === "mower" || k.startsWith("mower-"))
+            ),
+        }))
     }, [map, path, plan, offsetX, offsetY, datum, editMap, LAYER_COLORS]);
 
     useEffect(() => {
@@ -356,10 +467,12 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
             .filter((f): f is MowingAreaFeature => f instanceof MowingAreaFeature)
             .sort((a, b) => (a.getMowingOrder() ?? 9999) - (b.getMowingOrder() ?? 9999));
         for (let i = 0; i < workareas.length; ++i) {
-            names[i] = workareas[i].getLabel();
+            names[i] = workareas[i].getLabel(
+                t('mapAreasList.unnamedArea', {order: workareas[i].getMowingOrder()})
+            );
         }
         return names;
-    }, [features]);
+    }, [features, t]);
 
     // Build the areas list for the sidebar panel
     const areasList = useMemo(() => {
@@ -375,7 +488,7 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                 if (ta !== tb) return ta - tb;
                 return (a.properties.mowing_order ?? 0) - (b.properties.mowing_order ?? 0);
             })
-            .map((f) => {
+            .map((f, i, arr) => {
                 const areaSqm = turfArea(f);
                 const areaLabel = areaSqm >= 10000
                     ? `${(areaSqm / 10000).toFixed(2)} ha`
@@ -383,16 +496,19 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                 const ftype = f.properties.feature_type;
                 let name = '';
                 if (f instanceof MowingAreaFeature) {
-                    name = f.getLabel();
+                    name = f.getLabel(t('mapAreasList.unnamedArea', {order: f.getMowingOrder()}));
                 } else if (f instanceof NavigationFeature) {
-                    name = `Navigation ${f.id}`;
+                    // Short 1-based ordinal within its own type, not the raw id.
+                    const navIdx = arr.slice(0, i).filter(x => x instanceof NavigationFeature).length + 1;
+                    name = t('mapAreasList.navigationArea', {index: navIdx});
                 } else if (f instanceof ObstacleFeature) {
-                    name = `Obstacle ${f.id}`;
+                    const obsIdx = arr.slice(0, i).filter(x => x instanceof ObstacleFeature).length + 1;
+                    name = t('mapAreasList.obstacleArea', {index: obsIdx});
                 }
                 const mowingOrder = f instanceof MowingAreaFeature ? f.getMowingOrder() : undefined;
                 return { id: f.id, name, ftype, areaLabel, mowingOrder };
             });
-    }, [features]);
+    }, [features, t]);
 
     const handleReorder = useCallback((id: string, direction: 'up' | 'down') => {
         setFeatures((curr) => {
@@ -470,6 +586,7 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
         handleDownloadGeoJSON,
         handleUploadGeoJSON,
         handleImportOpenMower,
+        handleReprojectOpenMowerPreview,
         handleApplyOpenMowerImport,
     } = useMapFiles({
         features,
@@ -492,8 +609,31 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
 
     const {manualMode, handleManualMode, handleStopManualMode, handleJoyMove, handleJoyStop} = useManualMode({mowerAction, joyStream, stateName: highLevelStatus.highLevelStatus.state_name});
 
+    // Toggle dock placement mode: re-pressing the button (or pressing Escape)
+    // cancels it, so the crosshair cursor is not a one-way trap.
     const handleDockPlacement = useCallback(() => {
-        setDockPlacementMode(true);
+        setDockPlacementMode(prev => !prev);
+    }, []);
+
+    // Escape cancels an armed dock placement.
+    useEffect(() => {
+        if (!dockPlacementMode) return;
+        const onKeyDown = (e: KeyboardEvent) => {
+            if (e.key === "Escape") setDockPlacementMode(false);
+        };
+        window.addEventListener("keydown", onKeyDown);
+        return () => window.removeEventListener("keydown", onKeyDown);
+    }, [dockPlacementMode]);
+
+    // Remove the map's 'rotateend' listener on unmount (added in onLoad).
+    useEffect(() => {
+        return () => {
+            const m = mapInstanceRef.current;
+            if (m && rotateEndHandlerRef.current) {
+                m.off('rotateend', rotateEndHandlerRef.current);
+                rotateEndHandlerRef.current = null;
+            }
+        };
     }, []);
 
     const handleMapClick = useCallback((e: {lngLat: {lng: number; lat: number}}) => {
@@ -508,6 +648,19 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
         setHasUnsavedChanges(true);
         setDockDirty(true);
     }, [dockPlacementMode, setHasUnsavedChanges]);
+
+    // Map → panel side of the two-way obstacle highlight: while the cursor is
+    // over a tracked-obstacle polygon, mirror its id into selectedObstacleId so
+    // the matching panel row lights up. e.features only carries the interactive
+    // layers (DYN_OBSTACLE_INTERACTIVE_LAYERS); when the cursor leaves every
+    // obstacle it is empty → clears the highlight. Hovering the overlay panel
+    // does not reach the map canvas, so panel-driven highlights are never
+    // clobbered here.
+    const handleMapMouseMove = useCallback((e: {features?: Array<{properties?: Record<string, unknown> | null}>}) => {
+        const hit = e.features?.find(f => f.properties?.feature_type === 'dyn-obstacle');
+        const id = hit ? (hit.properties?.obs_id as number) : null;
+        setSelectedObstacleId(prev => (prev === id ? prev : id));
+    }, []);
 
     // Belt-and-suspenders: any time dockDirty flips to true, ensure
     // hasUnsavedChanges is also true so the Save Map button glows. The
@@ -535,21 +688,55 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
         // here and returned HTTP 500, which also broke Continue-from-idle by
         // rejecting before the START fired). Use real HighLevelControl commands:
         // Continue = START (mow_progress persists, so it resumes where it left
-        // off); Pause = HOME (stop and return to dock).
+        // off); Pause = STOP (COMMAND_STOP=8 → StopHoldSequence: mower off, halt
+        // in place, Nav2 left up so the mission can resume, no dock drive).
         onContinueOrPause:
             highLevelStatus.highLevelStatus.state_name === "IDLE_DOCKED" ||
             highLevelStatus.highLevelStatus.state_name === "IDLE"
                 ? mowerAction("high_level_control", {Command: 1})
-                : mowerAction("high_level_control", {Command: 2}),
-        onBladeForward: mowerAction("mow_enabled", {MowEnabled: 1, MowDirection: 0}),
-        onBladeBackward: mowerAction("mow_enabled", {MowEnabled: 1, MowDirection: 1}),
-        onBladeOff: mowerAction("mow_enabled", {MowEnabled: 0, MowDirection: 0}),
+                : mowerAction("high_level_control", {Command: 8}),
+        onBladeForward: mowerAction("mow_enabled", {mow_enabled: 1, mow_direction: 0}),
+        onBladeBackward: mowerAction("mow_enabled", {mow_enabled: 1, mow_direction: 1}),
+        onBladeOff: mowerAction("mow_enabled", {mow_enabled: 0, mow_direction: 0}),
         onRecordFinish: mowerAction("high_level_control", {Command: 5}),
         onRecordCancel: mowerAction("high_level_control", {Command: 6}),
     }), [mowerAction, highLevelStatus.highLevelStatus.state_name]);
 
+    // Centered message panel used for the missing-token and missing-datum
+    // states — a plain, translated explanation instead of an eternal spinner
+    // or a broken map.
+    const CenteredMessage: React.FC<{title: string; detail?: string}> = ({title, detail}) => (
+        <div style={{
+            width: '100%',
+            height: '100%',
+            minHeight: compact ? undefined : 240,
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 8,
+            textAlign: 'center',
+            padding: 24,
+            color: colors.textSecondary,
+            background: colors.bgCard,
+            borderRadius: 12,
+        }}>
+            <div style={{fontSize: compact ? 14 : 16, fontWeight: 600, color: colors.text}}>{title}</div>
+            {detail && <div style={{fontSize: compact ? 12 : 14}}>{detail}</div>}
+        </div>
+    );
+
+    if (!MAPBOX_TOKEN) {
+        return <CenteredMessage
+            title={t('mapPage.mapboxTokenMissingTitle')}
+            detail={t('mapPage.mapboxTokenMissingDetail')}
+        />;
+    }
     if (_datumLon == 0 || _datumLat == 0) {
-        return <Spinner/>
+        return <CenteredMessage
+            title={t('mapPage.noDatumTitle')}
+            detail={t('mapPage.noDatumDetail')}
+        />;
     }
     if (compact) {
         return (
@@ -560,7 +747,7 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                                                          projection={{
                                                              name: "globe"
                                                          }}
-                                                         mapboxAccessToken={import.meta.env.VITE_MAPBOX_TOKEN || "pk.eyJ1IjoiY2VkYm9zc25lbyIsImEiOiJjbGxldjB4aDEwOW5vM3BxamkxeWRwb2VoIn0.WOccbQZZyO1qfAgNxnHAnA"}
+                                                         mapboxAccessToken={MAPBOX_TOKEN}
                                                          initialViewState={{
                                                              bounds: [{lng: map_sw[0], lat: map_sw[1]}, {lng: map_ne[0], lat: map_ne[1]}],
                                                              bearing,
@@ -673,6 +860,8 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                                 'circle-radius': 5,
                                 'circle-color': ['get', 'color'],
                             }}/>
+                        {/* Persistent tracked-obstacle polygons + id labels (compact overview: no highlight) */}
+                        {renderDynObstacleLayers(false)}
                     </Source>
                 </Map> : <Spinner/>}
             </div>
@@ -713,7 +902,7 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                                                          projection={{
                                                              name: "globe"
                                                          }}
-                                                         mapboxAccessToken={import.meta.env.VITE_MAPBOX_TOKEN || "pk.eyJ1IjoiY2VkYm9zc25lbyIsImEiOiJjbGxldjB4aDEwOW5vM3BxamkxeWRwb2VoIn0.WOccbQZZyO1qfAgNxnHAnA"}
+                                                         mapboxAccessToken={MAPBOX_TOKEN}
                                                          initialViewState={{
                                                              bounds: [{lng: map_sw[0], lat: map_sw[1]}, {lng: map_ne[0], lat: map_ne[1]}],
                                                              bearing,
@@ -726,10 +915,16 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                                                              // Capture user-driven rotation (right-click drag on
                                                              // desktop, two-finger rotate on touch — both enabled
                                                              // by default in mapbox-gl) and persist via the same
-                                                             // debounced handler the slider uses.
-                                                             m.on('rotateend', () => handleBearing(m.getBearing()));
+                                                             // debounced handler the slider uses. Keep a stable ref
+                                                             // so the unmount effect can remove it (StrictMode
+                                                             // mounts twice, otherwise the handler stacks).
+                                                             const onRotateEnd = () => handleBearing(m.getBearing());
+                                                             rotateEndHandlerRef.current = onRotateEnd;
+                                                             m.on('rotateend', onRotateEnd);
                                                          }}
                                                          onClick={handleMapClick}
+                                                         interactiveLayerIds={DYN_OBSTACLE_INTERACTIVE_LAYERS}
+                                                         onMouseMove={handleMapMouseMove}
                                                          cursor={dockPlacementMode ? 'crosshair' : undefined}
                 >
                     {tileUri ? <Source type={"raster"} id={"custom-raster"} tiles={[tileUri]} tileSize={256}/> : null}
@@ -836,6 +1031,8 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                                 'circle-radius': 5,
                                 'circle-color': ['get', 'color'],
                             }}/>
+                        {/* Persistent tracked-obstacle polygons + id labels + hover/select highlight */}
+                        {renderDynObstacleLayers(true)}
                     </Source>
                     {mowProgressImage && (
                         <Source type={"image"} id={"mow-progress"} url={mowProgressImage.url} coordinates={mowProgressImage.coordinates}>
@@ -907,7 +1104,9 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                             })()
                         }}
                         stateName={highLevelStatus.highLevelStatus.state_name}
+                        highLevelState={highLevelStatus.highLevelStatus.state}
                         emergency={highLevelStatus.highLevelStatus.emergency}
+                        onResetMowingProgress={resetMowingProgress}
                         {...mowerActions}
                     />
                 )}
@@ -936,13 +1135,15 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                 )}
                 {/* Desktop: View mode — bottom glass toolbar */}
                 {!isMobile && !editMap && (
-                    <div style={{position: 'absolute', bottom: 12, left: 16, right: 16, zIndex: 10, background: colors.glassBackground, backdropFilter: 'blur(22px) saturate(140%)', WebkitBackdropFilter: 'blur(22px) saturate(140%)', borderRadius: 18, border: colors.glassBorder, boxShadow: colors.glassShadow, padding: '10px 14px'}}>
+                    <div style={{position: 'absolute', bottom: 12, left: 16, right: 16, zIndex: 10, background: colors.glassBackground, backdropFilter: displayMode === 'visual' ? 'blur(22px) saturate(140%)' : undefined, WebkitBackdropFilter: displayMode === 'visual' ? 'blur(22px) saturate(140%)' : undefined, borderRadius: 18, border: colors.glassBorder, boxShadow: colors.glassShadow, padding: '10px 14px'}}>
                         <MapToolbar
                             manualMode={manualMode}
                             useSatellite={useSatellite}
                             mowingAreas={mowingAreas}
                             stateName={highLevelStatus.highLevelStatus.state_name}
+                            highLevelState={highLevelStatus.highLevelStatus.state}
                             emergency={highLevelStatus.highLevelStatus.emergency}
+                            onResetMowingProgress={resetMowingProgress}
                             pitched={pitched}
                             onTogglePitch={togglePitch}
                             onEditMap={handleEditMap}
@@ -965,7 +1166,7 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                 )}
                 {/* Desktop: Right panel — areas list + offset */}
                 {!isMobile && (
-                    <div style={{position: 'absolute', top: 12, right: 16, zIndex: 10, display: 'flex', flexDirection: 'column', gap: 0, width: 240, maxHeight: 'calc(100% - 32px)', background: colors.glassBackground, backdropFilter: 'blur(22px) saturate(140%)', WebkitBackdropFilter: 'blur(22px) saturate(140%)', borderRadius: 18, border: colors.glassBorder, boxShadow: colors.glassShadow, overflow: 'hidden'}}>
+                    <div style={{position: 'absolute', top: 12, right: 16, zIndex: 10, display: 'flex', flexDirection: 'column', gap: 0, width: 240, maxHeight: 'calc(100% - 32px)', background: colors.glassBackground, backdropFilter: displayMode === 'visual' ? 'blur(22px) saturate(140%)' : undefined, WebkitBackdropFilter: displayMode === 'visual' ? 'blur(22px) saturate(140%)' : undefined, borderRadius: 18, border: colors.glassBorder, boxShadow: colors.glassShadow, overflow: 'hidden'}}>
                         <AreasListPanel
                             areas={areasList}
                             onAreaClick={editMap ? handleAreaSelect : undefined}
@@ -978,6 +1179,8 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                                     obstacles={dynamicObstacles}
                                     obstacleAreaIndex={obstacleAreaIndex}
                                     areaNames={obstacleAreaNames}
+                                    selectedObstacleId={selectedObstacleId}
+                                    onHoverObstacle={setSelectedObstacleId}
                                 />
                             </div>
                         )}
@@ -996,11 +1199,19 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
             </div>
             <ImportOpenMowerModal
                 preview={importPreview}
-                onApply={async () => {
+                onApply={async (omDatumLat, omDatumLon, importDatum) => {
                     if (!importFileText) {
                         throw new Error("No imported map text in memory — re-select the file.");
                     }
-                    await handleApplyOpenMowerImport(importFileText);
+                    await handleApplyOpenMowerImport(importFileText, omDatumLat, omDatumLon, importDatum);
+                }}
+                onReproject={async (omDatumLat, omDatumLon) => {
+                    if (!importFileText) {
+                        throw new Error("No imported map text in memory — re-select the file.");
+                    }
+                    const summary = await handleReprojectOpenMowerPreview(importFileText, omDatumLat, omDatumLon);
+                    setImportPreview(summary);
+                    return summary;
                 }}
                 onClose={() => {
                     setImportPreview(null);

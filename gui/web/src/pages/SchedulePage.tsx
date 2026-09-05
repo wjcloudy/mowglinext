@@ -1,11 +1,14 @@
-import {App, Select, Switch, TimePicker} from "antd";
+import {App, Switch, Tag, TimePicker, Tooltip} from "antd";
 import {useCallback, useEffect, useRef, useState} from "react";
+import {useTranslation} from "react-i18next";
+import type {TFunction} from "i18next";
 import {useApi} from "../hooks/useApi.ts";
 import {useWS} from "../hooks/useWS.ts";
 import {Map as MapType} from "../types/ros.ts";
 import {useIsMobile} from "../hooks/useIsMobile";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
 import {DashCard, ActionButton, IconPlus, FONT} from "../components/dashboard";
+import {IrriSenseStatusChip} from "../components/schedule/IrriSenseStatusChip.tsx";
 import dayjs from "dayjs";
 
 interface Schedule {
@@ -16,16 +19,29 @@ interface Schedule {
   enabled: boolean;
   createdAt: string;
   lastRun?: string;
+  lastSkipReason?: string;
+  lastSkippedAt?: string;
 }
 
-const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const DAY_LETTERS = ["S", "M", "T", "W", "T", "F", "S"];
+const DAY_KEYS = ["dayMon", "dayTue", "dayWed", "dayThu", "dayFri", "daySat", "daySun"] as const;
+const DAY_LETTER_KEYS = ["letterSun", "letterMon", "letterTue", "letterWed", "letterThu", "letterFri", "letterSat"] as const;
 
-function areaLabel(index: number, name: string | undefined): string {
-  return name ? `${index + 1}. ${name}` : `Area ${index + 1}`;
+function areaLabel(t: TFunction, index: number, name: string | undefined): string {
+  return name ? `${index + 1}. ${name}` : t('schedulePage.areaLabel', {index: index + 1});
+}
+
+/** Pull a human-readable message out of an unknown thrown API error. */
+function errorMessage(e: unknown): string | undefined {
+  if (e instanceof Error && e.message) return e.message;
+  if (typeof e === "object" && e !== null) {
+    const err = (e as {error?: {error?: string}; message?: string});
+    return err.error?.error ?? err.message;
+  }
+  return undefined;
 }
 
 export const SchedulePage = () => {
+  const {t} = useTranslation();
   const {colors} = useThemeMode();
   const guiApi = useApi();
   const {notification, modal} = App.useApp();
@@ -39,7 +55,7 @@ export const SchedulePage = () => {
     () => {},
     () => {},
     (data) => {
-      const parsed = JSON.parse(data) as MapType;
+      const parsed = data as unknown as MapType;
       const names = (parsed.working_area ?? []).map((a) => a.name);
       setWorkingAreas(names);
     },
@@ -50,12 +66,6 @@ export const SchedulePage = () => {
     return () => { mapStream.stop(); };
   }, []);
 
-  const areaOptions = workingAreas.length > 0
-    ? workingAreas.map((name, index) => ({label: areaLabel(index, name), value: index}))
-    : Array.from({length: Math.max(1, schedules.reduce((max, s) => Math.max(max, s.area + 1), 1))}, (_, i) => ({
-        label: areaLabel(i, undefined), value: i,
-      }));
-
   const fetchSchedules = useCallback(async () => {
     try {
       const response = await guiApi.request<{ schedules: Schedule[] }>({
@@ -63,9 +73,9 @@ export const SchedulePage = () => {
       });
       setSchedules(response.data.schedules ?? []);
     } catch {
-      notification.error({message: "Failed to load schedules"});
+      notification.error({message: t('schedulePage.failedToLoad')});
     }
-  }, [guiApi, notification]);
+  }, [guiApi, notification, t]);
 
   useEffect(() => {
     if (fetchedRef.current) return;
@@ -82,8 +92,14 @@ export const SchedulePage = () => {
         format: "json",
       });
       await fetchSchedules();
-    } catch {
-      notification.error({message: "Failed to create schedule"});
+      // New schedules are created disabled for safety; tell the operator so an
+      // untouched starter template doesn't silently never run.
+      notification.info({
+        message: t('schedulePage.createdDisabledTitle'),
+        description: t('schedulePage.createdDisabledBody'),
+      });
+    } catch (e) {
+      notification.error({message: t('schedulePage.failedToCreate'), description: errorMessage(e)});
     } finally {
       setLoading(false);
     }
@@ -91,20 +107,20 @@ export const SchedulePage = () => {
 
   const STARTER_TEMPLATES: { name: string; subtitle: string; body: Partial<Schedule>; icon: string }[] = [
     {
-      name: "Weekend warrior",
-      subtitle: "Saturdays at 10:00",
+      name: t('schedulePage.templateWeekendName'),
+      subtitle: t('schedulePage.templateWeekendSubtitle'),
       body: {time: "10:00", daysOfWeek: [6]},
       icon: "sun",
     },
     {
-      name: "Stealth runs",
-      subtitle: "Mon · Wed · Fri at 06:00",
+      name: t('schedulePage.templateStealthName'),
+      subtitle: t('schedulePage.templateStealthSubtitle'),
       body: {time: "06:00", daysOfWeek: [1, 3, 5]},
       icon: "moon",
     },
     {
-      name: "Daily quick mow",
-      subtitle: "Every day at 08:00",
+      name: t('schedulePage.templateDailyName'),
+      subtitle: t('schedulePage.templateDailySubtitle'),
       body: {time: "08:00", daysOfWeek: [0, 1, 2, 3, 4, 5, 6]},
       icon: "calendar",
     },
@@ -134,7 +150,7 @@ export const SchedulePage = () => {
             onMouseLeave={(e) => { e.currentTarget.style.transform = 'none'; e.currentTarget.style.borderColor = `${color}40`; }}
           >
             <div style={{fontSize: 11, color, fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase'}}>
-              {tpl.icon === 'sun' ? 'Weekly' : tpl.icon === 'moon' ? 'Off-hours' : 'Every day'}
+              {tpl.icon === 'sun' ? t('schedulePage.tagWeekly') : tpl.icon === 'moon' ? t('schedulePage.tagOffHours') : t('schedulePage.tagEveryDay')}
             </div>
             <div style={{fontSize: 14, fontWeight: 700, color: colors.text, marginTop: 4}}>
               {tpl.name}
@@ -152,8 +168,8 @@ export const SchedulePage = () => {
     try {
       await guiApi.request({path: `/schedules/${sched.id}`, method: "PUT", body: sched, format: "json"});
       await fetchSchedules();
-    } catch {
-      notification.error({message: "Failed to update schedule"});
+    } catch (e) {
+      notification.error({message: t('schedulePage.failedToUpdate'), description: errorMessage(e)});
     }
   };
 
@@ -161,24 +177,28 @@ export const SchedulePage = () => {
     try {
       await guiApi.request({path: `/schedules/${id}`, method: "DELETE", format: "json"});
       await fetchSchedules();
-    } catch {
-      notification.error({message: "Failed to delete schedule"});
+    } catch (e) {
+      notification.error({message: t('schedulePage.failedToDelete'), description: errorMessage(e)});
     }
   };
 
   const confirmDelete = (id: string) => {
     modal.confirm({
-      title: "Delete schedule",
-      content: "Are you sure you want to delete this schedule?",
-      okText: "Delete",
+      title: t('schedulePage.deleteScheduleTitle'),
+      content: t('schedulePage.deleteScheduleConfirm'),
+      okText: t('schedulePage.delete'),
       okType: "danger",
-      cancelText: "Cancel",
+      cancelText: t('schedulePage.cancel'),
       onOk: () => handleDelete(id),
     });
   };
 
   const toggleDay = (sched: Schedule, day: number) => {
-    const days = sched.daysOfWeek.includes(day)
+    const isRemoving = sched.daysOfWeek.includes(day);
+    // A schedule with zero days is meaningless and the backend rejects it with
+    // a generic 400. Block un-toggling the last remaining day client-side.
+    if (isRemoving && sched.daysOfWeek.length <= 1) return;
+    const days = isRemoving
       ? sched.daysOfWeek.filter(d => d !== day)
       : [...sched.daysOfWeek, day];
     handleUpdate({...sched, daysOfWeek: days});
@@ -197,7 +217,7 @@ export const SchedulePage = () => {
         day: dayIndex === 0 ? 6 : dayIndex - 1, // convert Sun=0..Sat=6 to Mon=0..Sun=6
         start: startH,
         end: Math.min(startH + 1, 20),
-        zone: areaLabel(sched.area, workingAreas[sched.area]),
+        zone: areaLabel(t, sched.area, workingAreas[sched.area]),
         color: schedColors[si % schedColors.length],
       }));
   });
@@ -206,9 +226,6 @@ export const SchedulePage = () => {
 
   // Schedule card for each schedule (mobile + bottom section on desktop)
   const scheduleCard = (sched: Schedule, idx: number) => {
-    const optionsWithCurrent = areaOptions.some((o) => o.value === sched.area)
-      ? areaOptions
-      : [...areaOptions, {label: areaLabel(sched.area, undefined), value: sched.area}];
     const color = schedColors[idx % schedColors.length];
     return (
       <DashCard key={sched.id} style={{display: 'flex', flexDirection: 'column', gap: 12}}>
@@ -218,13 +235,11 @@ export const SchedulePage = () => {
             checked={sched.enabled}
             onChange={(checked) => handleUpdate({...sched, enabled: checked})}
           />
-          <Select
-            value={sched.area}
-            size="small"
-            style={{flex: 1}}
-            options={optionsWithCurrent}
-            onChange={(val) => handleUpdate({...sched, area: val})}
-          />
+          {/* The backend always issues a full COMMAND_START (see scheduler.go),
+              so the per-schedule area is never honoured. Surface a read-only
+              note instead of a misleading selector; the data field is kept for
+              forward-compat. */}
+          <Tag style={{marginLeft: 'auto'}}>{t('schedulePage.appliesToAllAreas')}</Tag>
         </div>
         <TimePicker
           value={dayjs(sched.time, "HH:mm")}
@@ -234,32 +249,47 @@ export const SchedulePage = () => {
           size="large"
         />
         <div style={{display: 'flex', gap: 6, justifyContent: 'space-between'}}>
-          {DAY_LETTERS.map((letter, i) => {
+          {DAY_LETTER_KEYS.map((letterKey, i) => {
             const isActive = sched.daysOfWeek.includes(i);
-            return (
+            const isLastDay = isActive && sched.daysOfWeek.length <= 1;
+            const dayButton = (
               <button
                 key={i}
                 onClick={() => toggleDay(sched, i)}
+                disabled={isLastDay}
                 style={{
                   width: 44, height: 44, borderRadius: '50%',
                   border: `1.5px solid ${isActive ? color : colors.border}`,
                   background: isActive ? `${color}20` : 'transparent',
                   color: isActive ? color : colors.textSecondary,
-                  fontSize: 13, fontWeight: 600, cursor: 'pointer',
+                  fontSize: 13, fontWeight: 600, cursor: isLastDay ? 'not-allowed' : 'pointer',
                   transition: 'all 0.15s', padding: 0, fontFamily: FONT,
                 }}
               >
-                {letter}
+                {t(`schedulePage.${letterKey}`)}
               </button>
             );
+            return isLastDay
+              ? <Tooltip key={i} title={t('schedulePage.lastDayTooltip')}>{dayButton}</Tooltip>
+              : dayButton;
           })}
         </div>
         <div style={{
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
           borderTop: `1px solid ${colors.borderSubtle}`, paddingTop: 8,
         }}>
-          <span style={{fontSize: 12, color: colors.textSecondary}}>
-            Last: {sched.lastRun ? dayjs(sched.lastRun).format("YYYY-MM-DD HH:mm") : "Never"}
+          <span style={{fontSize: 12, color: colors.textSecondary, display: 'flex', flexDirection: 'column', gap: 2}}>
+            <span>
+              {t('schedulePage.lastRun', {value: sched.lastRun ? dayjs(sched.lastRun).format("YYYY-MM-DD HH:mm") : t('schedulePage.never')})}
+            </span>
+            {sched.lastSkipReason && (
+              <span style={{fontSize: 11, color: colors.sky}} data-testid="schedule-last-skip">
+                {t('schedulePage.lastSkipped', {
+                  value: sched.lastSkippedAt ? dayjs(sched.lastSkippedAt).format("YYYY-MM-DD HH:mm") : '',
+                  reason: sched.lastSkipReason,
+                })}
+              </span>
+            )}
           </span>
           <button
             onClick={() => confirmDelete(sched.id)}
@@ -269,7 +299,7 @@ export const SchedulePage = () => {
               fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: FONT,
             }}
           >
-            Delete
+            {t('schedulePage.delete')}
           </button>
         </div>
       </DashCard>
@@ -282,13 +312,16 @@ export const SchedulePage = () => {
         fontSize: 11, color: colors.textMuted, fontWeight: 600,
         letterSpacing: '0.12em', textTransform: 'uppercase' as const,
       }}>
-        Planning
+        {t('schedulePage.planning')}
       </div>
       <div className="mn-display" style={{
         fontSize: isMobile ? 30 : 40, color: colors.text,
         lineHeight: 1.05, marginTop: 4, letterSpacing: '-0.02em',
       }}>
-        Tontes programmées
+        {t('schedulePage.scheduledMows')}
+      </div>
+      <div style={{marginTop: 8}}>
+        <IrriSenseStatusChip/>
       </div>
     </div>
   );
@@ -298,16 +331,16 @@ export const SchedulePage = () => {
       <div style={{display: 'flex', flexDirection: 'column', gap: 12, paddingBottom: 8}}>
         <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: 12}}>
           {pageHeader}
-          <ActionButton primary icon={<IconPlus size={14}/>} label="New run" onClick={() => handleCreate()} disabled={loading}/>
+          <ActionButton primary icon={<IconPlus size={14}/>} label={t('schedulePage.newRun')} onClick={() => handleCreate()} disabled={loading}/>
         </div>
         {schedules.length === 0 && (
           <>
             <DashCard style={{padding: 18}}>
               <div style={{fontSize: 14, fontWeight: 700, marginBottom: 6}}>
-                Pick a starter
+                {t('schedulePage.pickAStarter')}
               </div>
               <div style={{fontSize: 12, color: colors.textDim, marginBottom: 12}}>
-                One tap to create a schedule. Tune the days, time and area afterwards.
+                {t('schedulePage.pickAStarterDescTap')}
               </div>
               {templateCards}
             </DashCard>
@@ -326,9 +359,9 @@ export const SchedulePage = () => {
       <DashCard>
         <div style={{display: 'grid', gridTemplateColumns: '48px repeat(7, 1fr)', gap: 6}}>
           <div/>
-          {DAYS.map(d => (
-            <div key={d} style={{textAlign: 'center', fontSize: 11, color: colors.textDim, fontWeight: 600, padding: '2px 0 10px'}}>
-              <div>{d}</div>
+          {DAY_KEYS.map(dKey => (
+            <div key={dKey} style={{textAlign: 'center', fontSize: 11, color: colors.textDim, fontWeight: 600, padding: '2px 0 10px'}}>
+              <div>{t(`schedulePage.${dKey}`)}</div>
             </div>
           ))}
           {hours.map(h => (
@@ -336,7 +369,7 @@ export const SchedulePage = () => {
               <div style={{fontSize: 10, color: colors.textMuted, textAlign: 'right', paddingRight: 6, paddingTop: 2}}>
                 {h}:00
               </div>
-              {DAYS.map((_, di) => {
+              {DAY_KEYS.map((_, di) => {
                 const run = gridRuns.find(r => r.day === di && h >= r.start && h < r.end);
                 const isStart = run && run.start === h;
                 return (
@@ -369,13 +402,13 @@ export const SchedulePage = () => {
           <div style={{
             fontSize: 11, color: colors.textMuted, marginBottom: 14,
             letterSpacing: '0.08em', textTransform: 'uppercase' as const, fontWeight: 600,
-          }}>This week</div>
+          }}>{t('schedulePage.thisWeek')}</div>
           <div style={{display: 'flex', alignItems: 'baseline', gap: 8}}>
             <div className="mn-num" style={{fontSize: 46, lineHeight: 1, color: colors.text}}>{activeCount}</div>
-            <div style={{fontSize: 12, color: colors.textDim}}>active schedules</div>
+            <div style={{fontSize: 12, color: colors.textDim}}>{t('schedulePage.activeSchedules')}</div>
           </div>
           <div style={{display: 'flex', gap: 4, marginTop: 12}}>
-            {DAYS.map((d, i) => {
+            {DAY_KEYS.map((dKey, i) => {
               const has = gridRuns.some(r => r.day === i);
               return (
                 <div key={i} style={{
@@ -386,7 +419,7 @@ export const SchedulePage = () => {
                   fontSize: 9, fontWeight: 700,
                   color: has ? '#0a1a10' : colors.textMuted,
                 }}>
-                  {d[0]}
+                  {t(`schedulePage.${dKey}`).charAt(0)}
                 </div>
               );
             })}
@@ -395,26 +428,26 @@ export const SchedulePage = () => {
 
         <DashCard>
           <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12}}>
-            <div style={{fontSize: 13, fontWeight: 600}}>Schedules</div>
-            <ActionButton primary icon={<IconPlus size={14}/>} label="New run"
+            <div style={{fontSize: 13, fontWeight: 600}}>{t('schedulePage.schedules')}</div>
+            <ActionButton primary icon={<IconPlus size={14}/>} label={t('schedulePage.newRun')}
                      onClick={() => handleCreate()} disabled={loading}
                      style={{padding: '8px 14px', fontSize: 12}}/>
           </div>
           <div style={{fontSize: 13, color: colors.textDim, lineHeight: 1.6}}>
             {schedules.length === 0
-              ? 'No schedules yet. Pick a starter below or create a custom run.'
-              : `${schedules.length} schedule${schedules.length > 1 ? 's' : ''} configured.`}
+              ? t('schedulePage.noSchedulesYet')
+              : t('schedulePage.schedulesConfigured', {count: schedules.length})}
           </div>
         </DashCard>
 
         <DashCard>
-          <div style={{fontSize: 13, fontWeight: 600, marginBottom: 4}}>Rules</div>
+          <div style={{fontSize: 13, fontWeight: 600, marginBottom: 4}}>{t('schedulePage.rules')}</div>
           <div style={{fontSize: 11, color: colors.textMuted, marginBottom: 12}}>
-            Built-in safety behaviors — always active.
+            {t('schedulePage.rulesDescription')}
           </div>
           {[
-            {k: 'Rain-aware', on: true, hint: 'pause if rain detected'},
-            {k: 'Auto-dock low', on: true, hint: 'return at <20% battery'},
+            {k: t('schedulePage.ruleRainAware'), on: true, hint: t('schedulePage.ruleRainAwareHint')},
+            {k: t('schedulePage.ruleAutoDockLow'), on: true, hint: t('schedulePage.ruleAutoDockLowHint')},
           ].map(r => (
             <div key={r.k} style={{display: 'flex', alignItems: 'center', gap: 10, padding: '6px 0'}}>
               <span style={{
@@ -425,7 +458,7 @@ export const SchedulePage = () => {
                 borderRadius: 100, padding: '2px 10px', flexShrink: 0,
                 textTransform: 'uppercase' as const,
               }}>
-                {r.on ? 'On' : 'Off'}
+                {r.on ? t('schedulePage.on') : t('schedulePage.off')}
               </span>
               <div style={{flex: 1}}>
                 <div style={{fontSize: 12, fontWeight: 600}}>{r.k}</div>
@@ -441,9 +474,9 @@ export const SchedulePage = () => {
         <DashCard>
           <div style={{display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 12}}>
             <div>
-              <div style={{fontSize: 14, fontWeight: 700}}>Pick a starter</div>
+              <div style={{fontSize: 14, fontWeight: 700}}>{t('schedulePage.pickAStarter')}</div>
               <div style={{fontSize: 12, color: colors.textDim, marginTop: 2}}>
-                One click to create a schedule. Tune the days, time and area afterwards.
+                {t('schedulePage.pickAStarterDescClick')}
               </div>
             </div>
           </div>

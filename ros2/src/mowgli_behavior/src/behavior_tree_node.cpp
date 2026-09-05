@@ -13,7 +13,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -24,11 +26,22 @@
 #include "ament_index_cpp/get_package_share_directory.hpp"
 #include "behaviortree_cpp/behavior_tree.h"
 #include "behaviortree_cpp/loggers/bt_cout_logger.h"
+#include "geometry_msgs/msg/twist_stamped.hpp"
 #include "mowgli_behavior/action_nodes.hpp"
+#include "mowgli_behavior/battery_filter.hpp"
 #include "mowgli_behavior/bt_context.hpp"
 #include "mowgli_behavior/condition_nodes.hpp"
+#include "mowgli_behavior/coverage_nodes.hpp"
+#include "mowgli_behavior/coverage_persistence.hpp"
+#include "mowgli_behavior/escape_nodes.hpp"
+#include "mowgli_behavior/localization_health.hpp"
+#include "mowgli_behavior/recording_nodes.hpp"
+#include "mowgli_behavior/status_snapshot.hpp"
+#include "mowgli_interfaces/gnss_observation_freshness.hpp"
+#include "mowgli_interfaces/gnss_status_utils.hpp"
 #include "mowgli_interfaces/msg/absolute_pose.hpp"
 #include "mowgli_interfaces/msg/emergency.hpp"
+#include "mowgli_interfaces/msg/gnss_status.hpp"
 #include "mowgli_interfaces/msg/power.hpp"
 #include "mowgli_interfaces/msg/status.hpp"
 #include "mowgli_interfaces/srv/high_level_control.hpp"
@@ -36,9 +49,12 @@
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/action/undock_robot.hpp"
 #include "nav2_msgs/msg/collision_monitor_state.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_srvs/srv/trigger.hpp"
 
 using namespace std::chrono_literals;
 
@@ -68,10 +84,45 @@ public:
     context_->tf_listener = std::make_shared<tf2_ros::TransformListener>(*context_->tf_buffer);
     context_->helper_node = rclcpp::Node::make_shared("_bt_helper_node");
 
+    // Disk-backed coverage resume: where FollowStrip persists per-area progress
+    // so an interrupted mow survives a full process/container restart (reboot,
+    // crash, docker restart, power-cycle after an emergency stop) — the in-RAM
+    // BTContext resume only survives a live BT halt. Default lives on the
+    // bind-mounted maps volume so it outlives the container. Empty disables it.
+    context_->coverage_resume_path =
+        declare_parameter<std::string>("coverage_resume_path", "/ros2_ws/maps/coverage_resume.txt");
+    if (loadCoverageResumeState(*context_))
+    {
+      // Auto-continue after a mid-run container restart: the loader also restored
+      // current_command from disk, but only leave it active (so MowingSequence
+      // auto-re-enters) when it was a mow command (COMMAND_START == 1) AND a
+      // resumable snapshot genuinely exists. Any other restored command, or an
+      // empty snapshot, falls back to IDLE so the robot never starts moving on
+      // boot without real resume state. A terminal EndSession deletes the file,
+      // so this branch is only reached for a truly interrupted session.
+      constexpr uint8_t kCommandStart = 1;  // HighLevelControl::Request::COMMAND_START
+      const bool has_resumable_state =
+          !context_->area_resume_pose_index.empty() || !context_->completed_areas.empty();
+      const bool auto_continue = context_->current_command == kCommandStart && has_resumable_state;
+      if (!auto_continue)
+      {
+        context_->current_command = 0;  // IDLE — require an explicit operator start
+      }
+      RCLCPP_INFO(get_logger(),
+                  "Restored coverage resume state from %s (current_area=%d, %zu area(s) with a "
+                  "resume cursor, %zu completed, auto_continue=%s)",
+                  context_->coverage_resume_path.c_str(),
+                  context_->current_area,
+                  context_->area_resume_pose_index.size(),
+                  context_->completed_areas.size(),
+                  auto_continue ? "true" : "false");
+    }
+
     setupSubscribers();
     setupServiceServer();
     setupBehaviorTree();
     setupTimer();
+    setupHighLevelStatusRepublish();
     startNav2WaitTimer();
 
     RCLCPP_INFO(get_logger(), "mowgli_behavior_node ready");
@@ -98,7 +149,47 @@ private:
                                     {
                                       std::lock_guard<std::mutex> lock(context_->context_mutex);
                                       context_->latest_status = *msg;
+                                      // Arrival time, so a consumer can tell a
+                                      // live blade state from a dead stream
+                                      // (issue #487 escape motion).
+                                      context_->last_status_time = std::chrono::steady_clock::now();
                                     });
+
+    // Last commanded MOTION direction, from twist_mux's MERGED output — the
+    // direction source for the #487 start-pose escape.
+    //
+    // /cmd_vel is what actually reached the wheels across EVERY motion lane
+    // (coverage, blade-off transit, docking, the undock BackUp, teleop). A
+    // single controller's lane would miss the undock, which is exactly the case
+    // #487 reported: the robot REVERSED into the blocked cell, so the escape
+    // must drive forward.
+    //
+    // Only the SIGN is used, and only commands above the escape's deadband are
+    // recorded — a zero or near-zero command is not an arrival. Samples inside
+    // last_motion_suppress_until are ignored so the escape's own commands can
+    // never become "the last motion" (that would make a second escape undo the
+    // first).
+    cmd_vel_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
+        "/cmd_vel",
+        rclcpp::QoS(10),
+        [this](geometry_msgs::msg::TwistStamped::ConstSharedPtr msg)
+        {
+          std::lock_guard<std::mutex> lock(context_->context_mutex);
+          const auto now = std::chrono::steady_clock::now();
+          if (context_->last_motion_suppress_until.time_since_epoch().count() != 0 &&
+              now < context_->last_motion_suppress_until)
+          {
+            return;
+          }
+          const double vx = msg->twist.linear.x;
+          if (std::abs(vx) < context_->start_blocked_escape_cfg.min_signal_speed)
+          {
+            return;
+          }
+          context_->last_motion_cmd_vx = vx;
+          context_->last_motion_valid = true;
+          context_->last_motion_time = now;
+        });
 
     emergency_sub_ =
         create_subscription<Emergency>("/hardware_bridge/emergency",
@@ -111,24 +202,32 @@ private:
                                              std::chrono::steady_clock::now();
                                        });
 
-    power_sub_ =
-        create_subscription<Power>("/hardware_bridge/power",
-                                   10,
-                                   [this](Power::ConstSharedPtr msg)
-                                   {
-                                     std::lock_guard<std::mutex> lock(context_->context_mutex);
-                                     context_->latest_power = *msg;
+    power_sub_ = create_subscription<Power>(
+        "/hardware_bridge/power",
+        10,
+        [this](Power::ConstSharedPtr msg)
+        {
+          std::lock_guard<std::mutex> lock(context_->context_mutex);
+          context_->latest_power = *msg;
 
-                                     // Derive battery_percent from voltage using
-                                     // configurable thresholds from ROS parameters.
-                                     const float v_max = battery_full_voltage_;
-                                     const float v_min = battery_empty_voltage_;
-                                     const float clamped = std::clamp(msg->v_battery, v_min, v_max);
-                                     const float range = v_max - v_min;
-                                     context_->battery_percent =
-                                         (range > 0.01f) ? 100.0f * (clamped - v_min) / range
-                                                         : 0.0f;
-                                   });
+          // Smooth the rail voltage before deriving the percent — motor transients
+          // sag it 0.5-1 V and used to trip the docking thresholds at a genuine
+          // 30-40 % SoC. See battery_filter.hpp for the incident, and for why the
+          // time constant rather than a fixed EWMA weight is the tuning knob.
+          const auto v_filtered = battery_filter_.update(msg->v_battery, now().seconds());
+          if (!v_filtered)
+          {
+            // No valid reading yet. Leave battery_percent at its last good value
+            // rather than publishing a 0 % derived from a disconnected pack.
+            return;
+          }
+
+          // Derive battery_percent from voltage using
+          // configurable thresholds from ROS parameters.
+          context_->battery_voltage_filtered = *v_filtered;
+          context_->battery_percent =
+              batteryPercentFromVoltage(*v_filtered, battery_empty_voltage_, battery_full_voltage_);
+        });
 
     // Replan / boundary signals from map_server_node
     replan_needed_sub_ =
@@ -170,7 +269,99 @@ private:
                                                    context_->lethal_boundary_violation = msg->data;
                                                  });
 
-    // GPS position and quality for heading calibration during undock
+    // Repeat-dig escalation feed for DigObstructionGuard. The bridge latches
+    // this after dig_escalate_count dig latches inside dig_escalate_radius_m
+    // within dig_escalate_window_s — the robot is wedged against a physical
+    // object that reversing and keeping-out cannot resolve (issue #500).
+    //
+    // TRANSIENT_LOCAL depth 1 to match the publisher: the flag is a LATCH, so
+    // a BT that starts (or restarts) after the escalation must still see it.
+    // A volatile subscription would silently miss exactly the case the guard
+    // exists for.
+    dig_escalated_sub_ =
+        create_subscription<std_msgs::msg::Bool>("/hardware_bridge/dig_escalated",
+                                                 rclcpp::QoS(1).transient_local(),
+                                                 [this](std_msgs::msg::Bool::ConstSharedPtr msg)
+                                                 {
+                                                   std::lock_guard<std::mutex> lock(
+                                                       context_->context_mutex);
+                                                   context_->dig_escalated = msg->data;
+                                                 });
+
+    // Localization-quality gate feed for LocalizationGuard, latched into
+    // context_->localization_degraded.
+    //
+    // The signal is GNSS SOLUTION QUALITY from the typed /gps/status contract
+    // — NOT the fused marginal covariance. fusion_graph deliberately releases
+    // the X constraint during pivots (pivot_wheel_sigma_x) and slip (adaptive
+    // noise gain), so its σ_xy swings to >1.8 m while the receiver holds
+    // RTK-Fixed at 1.4 cm; keying on it made the guard satisfiable ONLY while
+    // parked and livelocked mowing at 0 %. See localization_health.hpp for the
+    // full derivation and the 2026-08-20 field trace.
+    //
+    // σ_xy is still watched as a deliberately generous DIVERGENCE BACKSTOP
+    // (default 5 m), which no pivot can reach — that covers the localizer
+    // rejecting every fix while the receiver stays healthy.
+    LocalizationHealthCfg loc_cfg;
+    loc_cfg.gnss_acc_pause_m = declare_parameter<double>("loc_gnss_acc_pause_m", 0.30);
+    loc_cfg.gnss_acc_resume_m = declare_parameter<double>("loc_gnss_acc_resume_m", 0.15);
+    loc_cfg.gnss_stale_s = declare_parameter<double>("loc_gnss_stale_s", 5.0);
+    loc_cfg.gnss_pause_persist_s = declare_parameter<double>("loc_sigma_pause_persist_s", 3.0);
+    loc_cfg.gnss_resume_persist_s = declare_parameter<double>("loc_sigma_resume_persist_s", 2.0);
+    loc_cfg.sigma_backstop_pause_m = declare_parameter<double>("loc_sigma_pause_m", 5.0);
+    loc_cfg.sigma_backstop_resume_m = declare_parameter<double>("loc_sigma_resume_m", 2.0);
+    loc_cfg.sigma_backstop_persist_s =
+        declare_parameter<double>("loc_sigma_backstop_persist_s", 10.0);
+    loc_monitor_ = LocalizationHealthMonitor(loc_cfg);
+
+    // ------------------------------------------------------------------
+    // Start-pose escape motion (issue #487)
+    // ------------------------------------------------------------------
+    // SAFETY: this configures the ONLY new physical motion in the #487
+    // workstream — a bounded open-loop nudge off a cell Nav2 refuses to plan
+    // from, fired only on a confirmed START_OCCUPIED-with-zero-progress pass.
+    // Read mowgli_behavior/start_blocked_escape.hpp before changing a default.
+    // Defaults live in the IN-PACKAGE template mowgli_bringup/config/
+    // mowgli_robot.yaml (CLAUDE.md invariant 15) and are forwarded here by
+    // full_system.launch.py; the values below are only the compile-time
+    // fallbacks for a node launched without them.
+    StartBlockedEscapeCfg escape_cfg;
+    escape_cfg.enabled = declare_parameter<bool>("start_blocked_escape_enabled", true);
+    escape_cfg.speed = declare_parameter<double>("start_blocked_escape_speed", 0.10);
+    escape_cfg.distance = declare_parameter<double>("start_blocked_escape_distance", 0.40);
+    escape_cfg.timeout_s = declare_parameter<double>("start_blocked_escape_timeout_s", 6.0);
+    escape_cfg.min_signal_speed =
+        declare_parameter<double>("start_blocked_escape_min_signal_speed", 0.03);
+    escape_cfg.signal_max_age_s =
+        declare_parameter<double>("start_blocked_escape_signal_max_age_s", 90.0);
+    // Clamp to the compiled ceilings HERE, so nothing downstream ever sees an
+    // out-of-envelope value even if the YAML is wrong.
+    context_->start_blocked_escape_cfg = SanitizeEscapeCfg(escape_cfg);
+    RCLCPP_INFO(get_logger(),
+                "Start-pose escape (#487): %s, %.2f m/s, bounded to %.2f m / %.1f s; direction "
+                "signal deadband %.3f m/s, max age %.0f s",
+                context_->start_blocked_escape_cfg.enabled ? "ENABLED" : "disabled",
+                context_->start_blocked_escape_cfg.speed,
+                context_->start_blocked_escape_cfg.distance,
+                context_->start_blocked_escape_cfg.timeout_s,
+                context_->start_blocked_escape_cfg.min_signal_speed,
+                context_->start_blocked_escape_cfg.signal_max_age_s);
+
+    fused_odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        "/odometry/filtered_map",
+        rclcpp::QoS(5),
+        [this](nav_msgs::msg::Odometry::ConstSharedPtr msg)
+        {
+          const double sigma =
+              std::sqrt(std::max({msg->pose.covariance[0], msg->pose.covariance[7], 0.0}));
+          std::lock_guard<std::mutex> lock(context_->context_mutex);
+          loc_obs_.fused_sigma_xy_m = sigma;
+          updateLocalizationHealthLocked();
+        });
+
+    // GPS position for heading calibration during undock. RTK/fix-state comes
+    // from /gps/status so covariance fallout on /gps/fix does not masquerade
+    // as "no RTK fix" in the behavior tree.
     gps_sub_ = create_subscription<mowgli_interfaces::msg::AbsolutePose>(
         "/gps/absolute_pose",
         10,
@@ -188,7 +379,22 @@ private:
           // Drop samples that haven't moved at least 5 cm so a stalled
           // chassis doesn't bloat the buffer; cap the buffer to
           // kUndockGpsSamplesCap and drop the oldest on overflow.
-          if (context_->undock_start_recorded)
+          // Gated on gps_is_fixed (task #41, from the #40 dock-calibration
+          // audit): this is the only one of the three dock_pose_yaw writers
+          // that lacked an RTK-Fixed gate — CalibrateHeadingFromUndock's only
+          // quality check was fit-tightness (sigma_yaw <= 0.02 rad), which
+          // measures precision, not accuracy. A smoothly-converging RTK-Float
+          // solution can produce a tight-looking line fit while still biased
+          // away from the true heading. gps_is_fixed is the same debounced,
+          // authoritative RTK-Fixed+quality signal SetNavMode already gates
+          // on (mowgli_interfaces::gnss_status_utils::BehaviorTreeRtkFixed —
+          // fix_type>=4 AND normalized quality>=0.9), matching writers 1
+          // (calibrate_imu_yaw_node's wait_for_rtk_fixed) and 2
+          // (map_server's set_docking_point covariance gate). A sample
+          // dropped here just means the line fit has fewer points (or falls
+          // back to endpoint / skips persistence for lack of samples) — it
+          // does not touch dock_pose_x/y and does not fail the undock.
+          if (context_->undock_start_recorded && context_->gps_is_fixed)
           {
             auto& buf = context_->undock_gps_samples;
             const double x = context_->gps_x;
@@ -213,48 +419,81 @@ private:
             }
           }
 
-          // Derive fix type from flags. The ordinal MUST be monotonic in
-          // quality (higher = better) because the undock/preflight gates use
-          // ">= min_fix_type". RTK-Fixed is the best fix, so it must be the
-          // highest value — earlier code ranked Float (5) ABOVE Fixed (4),
-          // which let a robot in RTK-Float pass a "require RTK-Fixed" (min=4)
-          // gate and undock/mow on Float-quality GPS (σ 10-50 cm). Ordering:
-          //   FLAG_GPS_RTK_FIXED → 4 (RTK fixed — best)
-          //   FLAG_GPS_RTK_FLOAT → 3 (RTK float — worse than fixed)
-          //   FLAG_GPS_RTK       → 2 (DGPS/RTK)
-          //   otherwise          → 0 (no fix / autonomous)
-          if (msg->flags & AP::FLAG_GPS_RTK_FIXED)
+          if (!has_authoritative_gnss_status_)
           {
-            context_->gps_fix_type = 4;
+            // Fallback for legacy bring-up before /gps/status arrives.
+            if (msg->flags & AP::FLAG_GPS_RTK_FIXED)
+            {
+              context_->gps_fix_type = 4;
+            }
+            else if (msg->flags & AP::FLAG_GPS_RTK_FLOAT)
+            {
+              context_->gps_fix_type = 3;
+            }
+            else if (msg->flags & AP::FLAG_GPS_RTK)
+            {
+              context_->gps_fix_type = 2;
+            }
+            else
+            {
+              context_->gps_fix_type = 0;
+            }
+            context_->gps_is_fixed =
+                (context_->gps_fix_type >= 4) && (msg->position_accuracy < 0.1f);
+            context_->gps_quality = std::clamp(1.0f - msg->position_accuracy, 0.0f, 1.0f);
           }
-          else if (msg->flags & AP::FLAG_GPS_RTK_FLOAT)
+        });
+
+    gnss_status_sub_ = create_subscription<mowgli_interfaces::msg::GnssStatus>(
+        "/gps/status",
+        10,
+        [this](mowgli_interfaces::msg::GnssStatus::ConstSharedPtr msg)
+        {
+          std::lock_guard<std::mutex> lock(context_->context_mutex);
+          has_authoritative_gnss_status_ = true;
+          loc_obs_.gnss_seen = true;
+
+          const rclcpp::Time ros_now = now();
+          const rclcpp::Time receipt_stamp(msg->header.stamp, get_clock()->get_clock_type());
+          const auto observation_update =
+              gnss_observation_freshness_.Observe(msg->position_observation_sequence,
+                                                  receipt_stamp.nanoseconds(),
+                                                  ros_now.nanoseconds(),
+                                                  steadyNowNs());
+          using mowgli_interfaces::gnss_observation_freshness::IsAcceptedObservation;
+          using mowgli_interfaces::gnss_observation_freshness::ObservationUpdate;
+          if (!IsAcceptedObservation(observation_update))
           {
-            context_->gps_fix_type = 3;
-          }
-          else if (msg->flags & AP::FLAG_GPS_RTK)
-          {
-            context_->gps_fix_type = 2;
-          }
-          else
-          {
-            context_->gps_fix_type = 0;
+            if (observation_update == ObservationUpdate::kInvalidProvenance)
+            {
+              RCLCPP_WARN_THROTTLE(get_logger(),
+                                   *get_clock(),
+                                   5000,
+                                   "behavior: GNSS receipt stamp is zero/future; authority denied");
+            }
+            updateLocalizationHealthLocked();
+            return;
           }
 
-          // RTK fixed (fix_type >= 4) with reasonable accuracy → GPS is fixed.
-          // DEBOUNCED: the F9P fix_type flickers RTK-Fixed(4)↔Float(3) per epoch
-          // even at cm-stable position. Writing gps_is_fixed raw made it chatter,
-          // which flapped SetNavMode (precise↔degraded) on every BT tick and reset
-          // the MPPI optimizer ~5-10x/s → jerky, hesitant coverage (the robot
-          // could never warm-start a trajectory). Only flip gps_is_fixed once the
-          // raw condition has held steady for kGpsFixDebounceSec, so the per-epoch
-          // flicker is ignored while a genuine, sustained change still propagates.
+          // LocalizationGuard feed: the receiver's own view of solution
+          // quality. horizontal_accuracy_m is only trusted when the message's
+          // value_flags say it carries a live value; otherwise rtk_mode
+          // decides (see LocalizationHealthMonitor::Update).
+          loc_obs_.rtk_mode = static_cast<mowgli_behavior::RtkMode>(msg->rtk_mode);
+          const auto acc = mowgli_interfaces::gnss_status_utils::HorizontalAccuracyMeters(*msg);
+          loc_obs_.gnss_accuracy_m = acc ? static_cast<double>(*acc) : -1.0;
+
+          context_->gps_fix_type = mowgli_interfaces::gnss_status_utils::BehaviorTreeFixType(*msg);
+          context_->gps_quality = mowgli_interfaces::gnss_status_utils::NormalizedQuality(*msg);
+
+          // Debounce RTK-fixed transitions so the BT does not chatter during
+          // short-lived fix-state flicker while still trusting the typed
+          // /gps/status contract rather than /gps/absolute_pose covariance.
           constexpr double kGpsFixDebounceSec = 2.0;
-          const bool raw_fixed = (context_->gps_fix_type >= 4) && (msg->position_accuracy < 0.1f);
-          const rclcpp::Time gps_now = this->now();
+          const bool raw_fixed = mowgli_interfaces::gnss_status_utils::BehaviorTreeRtkFixed(*msg);
+          const rclcpp::Time gps_now = ros_now;
           if (!gps_fix_debounce_init_)
           {
-            // Seed on the first sample (avoids subtracting an uninitialised Time,
-            // which would also risk a clock-source mismatch exception).
             gps_fix_debounce_init_ = true;
             gps_fix_candidate_ = raw_fixed;
             gps_fix_candidate_since_ = gps_now;
@@ -272,7 +511,7 @@ private:
               context_->gps_is_fixed = gps_fix_candidate_;
             }
           }
-          context_->gps_quality = std::clamp(1.0f - msg->position_accuracy, 0.0f, 1.0f);
+          updateLocalizationHealthLocked();
         });
 
     // collision_monitor state — used by IsObstacleStuck to detect when
@@ -284,7 +523,21 @@ private:
         [this](nav2_msgs::msg::CollisionMonitorState::ConstSharedPtr msg)
         {
           std::lock_guard<std::mutex> lock(context_->context_mutex);
+          const auto now = std::chrono::steady_clock::now();
           const uint8_t prev = context_->collision_action_type;
+          // Detect a re-start of the stream after a silent gap: the monitor
+          // only publishes while cmd_vel_nav flows, so after a tree halt the
+          // latched action is stale. A message arriving after > kStaleGapSec
+          // of silence is a FRESH episode — re-stamp collision_stop_since even
+          // if the latched action was already STOP, so the SensorSafetyGuard
+          // hands the recovery machinery a full new window instead of firing
+          // instantly on the pre-halt timestamp (field 2026-07-23 deadlock).
+          constexpr double kStaleGapSec = 3.0;
+          const bool stream_was_stale =
+              context_->last_collision_state_time.time_since_epoch().count() != 0 &&
+              std::chrono::duration<double>(now - context_->last_collision_state_time).count() >
+                  kStaleGapSec;
+          context_->last_collision_state_time = now;
           context_->collision_action_type = msg->action_type;
 
           // Stamp the entry-into-STOP transition so IsObstacleStuck can
@@ -295,9 +548,9 @@ private:
           // robot for a few seconds and then walked off.
           if (msg->action_type == nav2_msgs::msg::CollisionMonitorState::STOP)
           {
-            if (prev != nav2_msgs::msg::CollisionMonitorState::STOP)
+            if (prev != nav2_msgs::msg::CollisionMonitorState::STOP || stream_was_stale)
             {
-              context_->collision_stop_since = std::chrono::steady_clock::now();
+              context_->collision_stop_since = now;
             }
           }
           else
@@ -308,6 +561,21 @@ private:
             }
             context_->collision_stop_since = std::chrono::steady_clock::time_point{};
           }
+        });
+
+    // Scan-stream liveness (SAFETY_REVIEW_2026-07-23 A-C2) — stamp every
+    // /scan_collision arrival so IsScanStale can detect a dead LiDAR /
+    // scan-filter chain and the SensorSafetyGuard can halt mowing (blade off).
+    // The payload is ignored; only the arrival time matters. SensorDataQoS
+    // matches the publisher (best-effort). On a no-LiDAR install nothing ever
+    // arrives and the default-constructed last_scan_time keeps the guard inert.
+    scan_liveness_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
+        "/scan_collision",
+        rclcpp::SensorDataQoS(),
+        [this](sensor_msgs::msg::LaserScan::ConstSharedPtr /*msg*/)
+        {
+          std::lock_guard<std::mutex> lock(context_->context_mutex);
+          context_->last_scan_time = std::chrono::steady_clock::now();
         });
 
     RCLCPP_DEBUG(get_logger(), "Topic subscribers created");
@@ -323,9 +591,36 @@ private:
                HighLevelControl::Response::SharedPtr resp)
         {
           RCLCPP_INFO(get_logger(), "HighLevelControl: received command=%u", req->command);
+          // COMMAND_S2 (4, "mow next area" — the GUI's onMowNextArea button) has
+          // no dedicated MainLogic branch: in this architecture mowing always
+          // resumes from the next UN-mowed area (GetNextUnmowedArea), so "mow
+          // next area" is functionally COMMAND_START. Normalise 4 -> 1 here so the
+          // button actually mows instead of falling through to IdleSequence
+          // (which stops the robot). If a distinct "skip current, jump to next"
+          // semantic is ever needed, give it its own branch instead.
+          uint8_t cmd = req->command;
+          if (cmd == HighLevelControl::Request::COMMAND_S2)
+          {
+            cmd = HighLevelControl::Request::COMMAND_START;
+            RCLCPP_INFO(get_logger(),
+                        "HighLevelControl: COMMAND_S2 normalised to COMMAND_START (mow next area)");
+          }
           {
             std::lock_guard<std::mutex> lock(context_->context_mutex);
-            context_->current_command = req->command;
+            context_->current_command = cmd;
+            // A plain COMMAND_START means "mow the lawn", so it must cancel any
+            // single-area clip still latched from an earlier ~/start_in_area run.
+            // EndSession normally clears it, but a session can legitimately stay
+            // alive without one (low-battery dock + auto-resume, emergency), and
+            // the clip is session state by design — it has to survive
+            // GetNextUnmowedArea re-entering after the targeted area finishes.
+            // Safe to do here: the GUI's "mow this area" button calls
+            // ~/start_in_area, which sets current_command itself and never
+            // reaches this handler, so this cannot cancel a targeted request.
+            if (cmd == HighLevelControl::Request::COMMAND_START)
+            {
+              clearSingleAreaMode(*context_);
+            }
           }
           resp->success = true;
         });
@@ -333,9 +628,12 @@ private:
     RCLCPP_DEBUG(get_logger(), "~/high_level_control service server created");
 
     // ~/start_in_area: GUI hook for "mow this specific area only".
-    // Pre-loads target_area_index for the next GetNextUnmowedArea call,
-    // then issues COMMAND_START so MowingSequence picks it up. The BT
-    // exits after that single area is done (no roll-over to other areas).
+    // Pre-loads target_area_index for the next GetNextUnmowedArea call, then
+    // issues COMMAND_START so MowingSequence picks it up. GetNextUnmowedArea
+    // consumes that request once and latches it into
+    // BTContext::single_area_target, which constrains the run for as long as
+    // the session lasts — so the BT exits after that single area is done (no
+    // roll-over to other areas) even though it re-enters MowingSequence.
     using StartInArea = mowgli_interfaces::srv::StartInArea;
     start_in_area_srv_ = create_service<StartInArea>(
         "~/start_in_area",
@@ -351,6 +649,163 @@ private:
         });
 
     RCLCPP_DEBUG(get_logger(), "~/start_in_area service server created");
+
+    // ~/clear_coverage_resume: "Start fresh" — discard any persisted mowing
+    // progress so the NEXT COMMAND_START begins at the first line instead of
+    // resuming mid-path. The GUI offers this vs "Resume" when
+    // coverage_resume_available is true (a prior session was interrupted without
+    // reaching a dock/EndSession boundary). This is the operator's explicit
+    // resume-vs-restart choice (issue: "starts at 2nd/3rd line"); the automatic
+    // in-session resume after an e-stop is unaffected.
+    // The clear is DEFERRED to the BT tick thread (processed at the top of
+    // tickTree) rather than done inline: the BT nodes (FollowStrip,
+    // GetNextUnmowedArea, EndSession) read/write these maps WITHOUT the context
+    // mutex — safe today only because every callback of this node shares the
+    // default MutuallyExclusive callback group, so tick/service/timers are
+    // serialized even under the MultiThreadedExecutor. Deferring keeps every
+    // map mutation on the tick thread, so a future Reentrant group / callback
+    // re-homing can't silently turn this into a data race against a mid-tick
+    // `const auto& done = ctx->area_completed_swaths[...]` reference.
+    clear_coverage_resume_srv_ = create_service<std_srvs::srv::Trigger>(
+        "~/clear_coverage_resume",
+        [this](const std_srvs::srv::Trigger::Request::SharedPtr /*req*/,
+               std_srvs::srv::Trigger::Response::SharedPtr resp)
+        {
+          clear_resume_requested_.store(true);
+          RCLCPP_INFO(get_logger(),
+                      "Coverage resume clear requested — applied before the next BT tick");
+          resp->success = true;
+          resp->message = "coverage resume state cleared";
+        });
+
+    // Latched signal the GUI reads to decide whether to offer "Resume vs Start
+    // fresh". True when a prior session left recoverable progress.
+    resume_available_pub_ = create_publisher<std_msgs::msg::Bool>("~/coverage_resume_available",
+                                                                  rclcpp::QoS(1).transient_local());
+    publishResumeAvailable();
+    resume_available_timer_ = create_wall_timer(1s,
+                                                [this]()
+                                                {
+                                                  publishResumeAvailable();
+                                                });
+
+    RCLCPP_DEBUG(get_logger(), "~/clear_coverage_resume service + resume-available signal created");
+  }
+
+  // Fold the latest observation into the LocalizationGuard latch and log
+  // transitions. Caller MUST hold context_->context_mutex — both the
+  // /gps/status and /odometry/filtered_map callbacks take it before writing
+  // loc_obs_, so the monitor sees a consistent snapshot.
+  void updateLocalizationHealthLocked()
+  {
+    const rclcpp::Time ros_now = now();
+    const auto maximum_age_ns = static_cast<std::int64_t>(loc_monitor_.gnss_stale_s() * 1.0e9);
+    loc_obs_.gnss_fresh = gnss_observation_freshness_.ObservationIsFresh(ros_now.nanoseconds(),
+                                                                         steadyNowNs(),
+                                                                         maximum_age_ns);
+    if (gnss_observation_freshness_.ConsumeEpochReset())
+    {
+      // Force a fresh semantic epoch: old debounce state must not survive a
+      // ROS/steady rewind and become authoritative when the clock catches up.
+      gps_fix_debounce_init_ = false;
+    }
+    if (loc_obs_.gnss_seen && !loc_obs_.gnss_fresh)
+    {
+      // Fixed-only behavior must fail closed at the physical-observation
+      // deadline even though LocalizationHealth keeps its existing latch
+      // persistence before pausing the whole mowing tree.
+      context_->gps_fix_type = 0;
+      context_->gps_quality = 0.0f;
+      context_->gps_is_fixed = false;
+      gps_fix_debounce_init_ = false;
+    }
+
+    const double now_s = ros_now.seconds();
+    const bool was_degraded = context_->localization_degraded;
+    const bool degraded = loc_monitor_.Update(now_s, loc_obs_);
+    if (degraded == was_degraded)
+      return;
+
+    context_->localization_degraded = degraded;
+    if (degraded)
+    {
+      RCLCPP_WARN(get_logger(),
+                  "Localization degraded (%s: GNSS acc %.3f m, rtk_mode %u, fused σ_xy %.2f m) — "
+                  "pausing blade-on mowing.",
+                  LocalizationFaultName(loc_monitor_.fault()),
+                  loc_obs_.gnss_accuracy_m,
+                  static_cast<unsigned>(loc_obs_.rtk_mode),
+                  loc_obs_.fused_sigma_xy_m);
+    }
+    else
+    {
+      RCLCPP_INFO(get_logger(),
+                  "Localization recovered (GNSS acc %.3f m, rtk_mode %u) — resuming.",
+                  loc_obs_.gnss_accuracy_m,
+                  static_cast<unsigned>(loc_obs_.rtk_mode));
+    }
+  }
+
+  // Re-publish the last HighLevelStatus at a steady cadence. PublishHighLevelStatus
+  // is a SyncActionNode that only fires on tree transitions, so during a
+  // multi-minute FollowStrip the topic would otherwise go silent for the whole
+  // traversal — a GUI opened/refreshed mid-mow then receives nothing and renders
+  // "idle". This keeps a fresh status flowing regardless of tree activity. It runs
+  // on the same default (MutuallyExclusive) callback group as the BT tick, so it
+  // never races the tick's own publish; context_mutex still guards the shared
+  // publisher/cache for defence in depth.
+  void setupHighLevelStatusRepublish()
+  {
+    high_level_status_timer_ = create_wall_timer(1s,
+                                                 [this]()
+                                                 {
+                                                   republishHighLevelStatus();
+                                                 });
+  }
+
+  // Re-publish the last state identity with the LIVE context fields folded in.
+  // Publishing the cached message verbatim froze everything the operator
+  // watches for as long as the tree sat in a transition-free branch: the
+  // low-battery charge hold publishes "CHARGING" once and then loops on a 30 s
+  // wait, so the GUI battery gauge stayed pinned at the percent captured at
+  // dock contact for the whole charge (observed 2026-08-23: 46.03 % while the
+  // pack actually climbed 25.84 V → 26.42 V), and a multi-minute FollowStrip
+  // froze the mowing progress the same way. Only state/state_name/sub_state_name
+  // are genuinely tree-owned; see status_snapshot.hpp.
+  void republishHighLevelStatus()
+  {
+    std::lock_guard<std::mutex> lock(context_->context_mutex);
+    if (!context_->has_high_level_status || !context_->high_level_status_pub)
+    {
+      return;
+    }
+    context_->high_level_status_pub->publish(
+        withLiveStatusFields(context_->last_high_level_status, *context_));
+  }
+
+  // Publish whether a coverage session can be resumed (a persisted resume cursor
+  // or completed-area set survives from an interrupted session). Republished on
+  // change; latched so a late GUI subscriber always gets the current value.
+  void publishResumeAvailable()
+  {
+    if (!resume_available_pub_)
+    {
+      return;
+    }
+    bool available;
+    {
+      std::lock_guard<std::mutex> lock(context_->context_mutex);
+      available = !context_->area_resume_pose_index.empty() || !context_->completed_areas.empty();
+    }
+    if (available == last_resume_available_ && resume_available_published_)
+    {
+      return;
+    }
+    std_msgs::msg::Bool msg;
+    msg.data = available;
+    resume_available_pub_->publish(msg);
+    last_resume_available_ = available;
+    resume_available_published_ = true;
   }
 
   // Non-blocking check for Nav2 action servers.  The BT tick loop starts
@@ -463,13 +918,22 @@ private:
     const double undock_distance = declare_parameter<double>("undock_distance", 1.0);
     blackboard_->set("undock_distance", undock_distance);
 
+    // idle_nav2_suspend (default false): when true, the BT PAUSEs the Nav2
+    // lifecycle stack (via SetNav2Lifecycle) while parked on the dock to cut
+    // the idle CPU/thermal load of the always-looping costmaps, and RESUMEs
+    // it (root Nav2ResumeGuard) before any motion. Default-off so enabling
+    // it is a deliberate, per-site operator decision. Read by the
+    // SetNav2Lifecycle nodes from the blackboard.
+    const bool idle_nav2_suspend = declare_parameter<bool>("idle_nav2_suspend", false);
+    blackboard_->set("idle_nav2_suspend", idle_nav2_suspend);
+
     // Transit / mowing speeds, sourced from mowgli_robot.yaml and applied to
     // the live controllers by SetNavMode (FollowPath.desired_linear_vel for the
-    // RPP transit controller, FollowCoveragePath.vx_max for MPPI coverage).
+    // RPP transit controller, FollowCoveragePath.speed_fast for FTC coverage).
     // Stored on the shared BTContext so SetNavMode's tick is a pure read.
     // Previously SetNavMode hardcoded 0.5 (precise) / 0.25 (degraded), which
     // stomped the launch-injected values — the configured speeds never applied.
-    context_->transit_speed = declare_parameter<double>("transit_speed", 0.25);
+    context_->transit_speed = declare_parameter<double>("transit_speed", 0.2);
     context_->mowing_speed = declare_parameter<double>("mowing_speed", 0.2);
 
     // Rain delay: parameter in minutes, blackboard in seconds.
@@ -538,6 +1002,34 @@ private:
     blackboard_->set("battery_critical_recovery_pct",
                      static_cast<float>(battery_critical_recovery_pct));
 
+    // Swath (mow) angle — operator-tunable in mowgli_robot.yaml and surfaced
+    // on the GUI Mowing settings. < 0 = AUTO (coverage server picks the
+    // swath-count-minimising angle); 0..179 = a fixed swath angle in degrees.
+    // Pushed onto the blackboard so PlanCoverageArea::buildGoal reads it into
+    // the plan_coverage action goal (mow_angle_deg).
+    const double mow_angle_deg = declare_parameter<double>("mow_angle_deg", kMowAngleAutoDeg);
+    blackboard_->set("mow_angle_deg", mow_angle_deg);
+
+    // Area-recording boundary resolution — operator-tunable in
+    // mowgli_robot.yaml, previously HARDCODED in main_tree.xml (a 0.2 m
+    // Douglas-Peucker tolerance and a 2 Hz sample rate, which together gave a
+    // field recording 24 vertices for a 38 m perimeter). Pushed onto the
+    // blackboard so the XML pulls them as {area_simplification_tolerance} /
+    // {area_record_rate_hz}. See RecordArea's class comment for the derivation
+    // of both defaults.
+    const double area_simplification_tolerance =
+        declare_parameter<double>("area_simplification_tolerance",
+                                  RecordArea::kDefaultSimplificationToleranceM);
+    const double area_record_rate_hz =
+        declare_parameter<double>("area_record_rate_hz", RecordArea::kDefaultRecordRateHz);
+    blackboard_->set("area_simplification_tolerance", area_simplification_tolerance);
+    blackboard_->set("area_record_rate_hz", area_record_rate_hz);
+
+    // RecordArea samples once per BT tick at best, so it needs the tick rate to
+    // warn when a configured record rate is unachievable rather than silently
+    // sampling slower than asked.
+    blackboard_->set("bt_tick_rate", get_parameter("tick_rate").as_double());
+
     tree_ = factory_.createTreeFromFile(tree_file, blackboard_);
 
     // Optionally attach a console logger for debugging BT state transitions.
@@ -568,6 +1060,36 @@ private:
 
   void tickTree()
   {
+    {
+      std::lock_guard<std::mutex> lock(context_->context_mutex);
+      updateLocalizationHealthLocked();
+    }
+
+    // Apply a pending "Start fresh" clear BEFORE ticking, on the tick thread —
+    // every coverage-map mutation stays on this thread (see the service
+    // registration comment). Between ticks no BT node holds a reference into
+    // the maps, so clearing here is race-free by construction.
+    if (clear_resume_requested_.exchange(false))
+    {
+      std::lock_guard<std::mutex> lock(context_->context_mutex);
+      context_->area_completed_swaths.clear();
+      context_->area_swath_count.clear();
+      context_->area_resume_pose_index.clear();
+      context_->area_path_pose_count.clear();
+      context_->area_plan_fingerprint.clear();
+      context_->completed_areas.clear();
+      context_->attempted_areas.clear();
+      context_->area_attempt_count.clear();
+      context_->area_last_coverage.clear();
+      context_->coverage_start_blocked = false;
+      context_->start_blocked_area.reset();
+      context_->area_start_blocked_count.clear();
+      // Disarm the #487 escape motion too — see EndSession for why.
+      context_->start_blocked_escape_armed = false;
+      clearCoverageResumeState(*context_);
+      RCLCPP_INFO(get_logger(),
+                  "Cleared coverage resume state on request — next start begins fresh");
+    }
     try
     {
       const BT::NodeStatus status = tree_.tickOnce();
@@ -598,20 +1120,54 @@ private:
   bool gps_fix_debounce_init_{false};
   bool gps_fix_candidate_{false};
   rclcpp::Time gps_fix_candidate_since_;
+  bool has_authoritative_gnss_status_{false};
+
+  static std::int64_t steadyNowNs()
+  {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
 
   // Subscribers
   rclcpp::Subscription<mowgli_interfaces::msg::Status>::SharedPtr status_sub_;
   rclcpp::Subscription<mowgli_interfaces::msg::Emergency>::SharedPtr emergency_sub_;
+  /// Merged twist_mux output — direction source for the #487 escape.
+  rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_vel_sub_;
   rclcpp::Subscription<mowgli_interfaces::msg::Power>::SharedPtr power_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr replan_needed_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr boundary_violation_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr lethal_boundary_violation_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr dig_escalated_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr fused_odom_sub_;
+  // LocalizationGuard state. Both feeds write loc_obs_ under
+  // context_->context_mutex and then call updateLocalizationHealthLocked().
+  LocalizationHealthMonitor loc_monitor_{};
+  LocalizationObservation loc_obs_{};
+  mowgli_interfaces::gnss_observation_freshness::PhysicalObservationTracker
+      gnss_observation_freshness_;
   rclcpp::Subscription<mowgli_interfaces::msg::AbsolutePose>::SharedPtr gps_sub_;
+  rclcpp::Subscription<mowgli_interfaces::msg::GnssStatus>::SharedPtr gnss_status_sub_;
   rclcpp::Subscription<nav2_msgs::msg::CollisionMonitorState>::SharedPtr collision_monitor_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_liveness_sub_;
 
   // Service server
   rclcpp::Service<mowgli_interfaces::srv::HighLevelControl>::SharedPtr high_level_control_srv_;
   rclcpp::Service<mowgli_interfaces::srv::StartInArea>::SharedPtr start_in_area_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_coverage_resume_srv_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr resume_available_pub_;
+  rclcpp::TimerBase::SharedPtr resume_available_timer_;
+  // Periodic re-publish of the last HighLevelStatus so the topic stays fresh
+  // during long-running actions (see setupHighLevelStatusRepublish).
+  rclcpp::TimerBase::SharedPtr high_level_status_timer_;
+  // Set by the ~/clear_coverage_resume service, consumed by tickTree() so the
+  // actual map clearing happens on the BT tick thread (see the service comment).
+  std::atomic<bool> clear_resume_requested_{false};
+  // Only touched from this node's mutually-exclusive callback group (timer +
+  // service + init), so plain bools would work today — atomic future-proofs
+  // them against a Reentrant-group conversion, same rationale as the deferral.
+  std::atomic<bool> last_resume_available_{false};
+  std::atomic<bool> resume_available_published_{false};
 
   // BehaviorTree.CPP
   BT::BehaviorTreeFactory factory_;
@@ -633,6 +1189,11 @@ private:
   // Battery voltage curve parameters
   float battery_full_voltage_{28.0f};
   float battery_empty_voltage_{24.0f};
+
+  // Low-pass state for v_battery. Rate-independent (time-constant based), so
+  // the robot's 4 Hz status packets and the sim bridge's 10 Hz both behave the
+  // same. See battery_filter.hpp.
+  BatteryVoltageFilter battery_filter_;
 };
 
 }  // namespace mowgli_behavior

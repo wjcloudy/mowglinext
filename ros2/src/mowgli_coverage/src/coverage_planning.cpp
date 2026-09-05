@@ -7,8 +7,19 @@
 #include "mowgli_coverage/coverage_planning.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <memory>
+#include <string>
+
+#include "mowgli_interfaces/coverage_geometry.hpp"
+
+// GDAL/OGR (F2C's geometry backend) — bufferRingOutward grows drawn-obstacle
+// rings with OGRPolygon::Buffer. Explicit include: the transitive path via
+// fields2cover.h is an implementation detail of F2C.
+#include "ogr_geometry.h"
 
 namespace mowgli_coverage
 {
@@ -17,6 +28,99 @@ namespace
 {
 
 constexpr double kDensifyStep = 0.10;  // m between ring polyline points
+
+// Format a "dropped <what> <val><cmp><thresh>" diagnostics line without pulling
+// in <sstream>/<iomanip>. Values are short distances/areas, so 4 decimals is
+// plenty of resolution for a log line.
+std::string fmtDrop(const char* what, double value, const char* cmp, double thresh)
+{
+  char buf[128];
+  std::snprintf(buf, sizeof(buf), "dropped %s%.4f%s%.4f", what, value, cmp, thresh);
+  return std::string(buf);
+}
+
+// AUTO swath-angle field-size gate. f2c::sg::BruteForce::generateBestSwaths
+// sweeps 180 candidate angles (1° step) and regenerates the full swath set at
+// each, so its cost scales ~linearly with field area and explodes on large
+// fields — a 100×100 m field takes ~24 s, far past the action (15 s) and BT
+// (12 s) planning timeouts, so the coverage action fails outright. Above this
+// area we skip the exhaustive search and use the boundary's longest-edge
+// orientation (the angle the search almost always converges to on a rectangular
+// lawn anyway — swaths along the long side minimise turns), which is ~3 orders
+// of magnitude cheaper and equally deterministic across re-plans.
+//
+// The threshold is deliberately conservative: the exhaustive search measures
+// ~1.7 s at 400 m² on an x86 dev host, and the target ARM SBC is ~5× slower, so
+// even a ~400 m² field is ~8 s of search there — already close to the 12 s BT
+// timeout. Keeping the gate at 400 m² guarantees AUTO planning never times out
+// on hardware; larger lawns simply use the (near-optimal) longest-edge angle.
+constexpr double kAutoAngleMaxAreaM2 = 400.0;  // ~20 × 20 m
+
+// AUTO swath-angle search resolution (radians). f2c::sg::BruteForce defaults to
+// a 1° step, which — sweeping the FULL 2π — regenerates the entire swath set 360
+// times per plan (the dominant coverage-planning cost, and single-threaded on
+// the Pi4 / Cortex-A72 target). The swath-count objective (NSwath) is near-flat
+// within a few degrees of the optimum, so a 5° step (72 candidates over 2π) cuts
+// that cost ~5× while leaving the chosen angle — and thus the whole plan —
+// essentially unchanged. It is a FIXED constant (not tuned per plan) so the
+// argmin is deterministic across re-plans, which the resume cursor relies on.
+constexpr double kAutoAngleStepRad = 5.0 * M_PI / 180.0;
+
+// On-edge tolerance for allInside(). The outermost DRIVEN geometry can lie
+// EXACTLY on the ring it is validated against: with the headland ring stage
+// DISABLED (num_headland_passes < 0 → n_rings == 0, issue #429) the swath ENDS
+// are GEOS intersection points sitting on safe_cells' exterior, which is also
+// the connector clearance ring. pointInRing() is a strict-`>` ray-crossing
+// test, so a pose exactly ON an edge is judged inside on one side of the
+// polygon and outside on the opposite side — roughly half those ends would be
+// rejected, and buildConnector's allInside() check would then split the
+// sub-path at every U-turn (one blade-off Nav2 transit per swath).
+//
+// The fix belongs in the PREDICATE, not in the geometry. 1 mm is ~1e9× the
+// double round-off at map-frame coordinate magnitudes, 1/80th of op_width/2 and
+// 1/50th of the server's kBoundarySlackM (0.05 m) verify slack, so it cannot
+// enable any turn arc and cannot move the chassis measurably. Mirrors the
+// tolerant-containment pattern coverage_server.cpp already uses (!pointInRing
+// && distanceToRing > slack).
+//
+// An earlier revision instead EXPANDED the zero-ring clearance ring outward by
+// 0.03 m. Do not reintroduce that: 0.03 m is ~5× too small to fit any Dubins
+// turn-around (buildConnector's min radius is min_turning_radius = 0.15 m), so
+// it bought no arc it was added for, yet it let a connector centerline ride
+// 3 cm PAST the recorded line — invisible to the server's 0.05 m verify slack —
+// which erodes the keep-inside contract that is the SHIPPED mode at the default
+// chassis_safety_inset (0.20 m == robot_width/2). Companion to
+// kClearanceClampMarginM (see the second anonymous namespace below).
+constexpr double kOnEdgeTolM = 0.001;
+
+// Orientation (radians) of the longest edge of a cell's outer ring. A cheap,
+// deterministic AUTO swath angle for large fields. Falls back to 0 (sweep along
+// +x) for a degenerate ring.
+double longestEdgeAngle(const f2c::types::Cell& cell)
+{
+  if (cell.size() == 0)
+  {
+    return 0.0;
+  }
+  const auto ring = cell.getGeometry(0);  // outer boundary
+  const std::size_t n = ring.size();
+  double best_len = -1.0;
+  double best_angle = 0.0;
+  for (std::size_t i = 0; i + 1 < n; ++i)
+  {
+    const auto a = ring.getGeometry(i);
+    const auto b = ring.getGeometry(i + 1);
+    const double dx = b.getX() - a.getX();
+    const double dy = b.getY() - a.getY();
+    const double len = std::hypot(dx, dy);
+    if (len > best_len)
+    {
+      best_len = len;
+      best_angle = std::atan2(dy, dx);
+    }
+  }
+  return best_angle;
+}
 
 // Append the densified [a, b) segment to `out` (b exclusive: the next segment
 // starts at b, so shared vertices are emitted once and segments chain).
@@ -393,15 +497,38 @@ std::vector<std::pair<double, double>> sampleDubins(
   return pts;
 }
 
-// True iff every sampled point of `pts` is inside `boundary`.
+// True iff every sampled point of `pts` is inside `boundary`. A point lying ON
+// the boundary (within kOnEdgeTolM) counts as inside — pointInRing() alone
+// resolves on-edge poses inconsistently, and the outermost driven geometry sits
+// exactly on this ring when the headland stage is off (see kOnEdgeTolM).
 bool allInside(const std::vector<std::pair<double, double>>& pts,
                const std::vector<std::pair<double, double>>& boundary)
 {
   for (const auto& p : pts)
   {
-    if (!pointInRing(p.first, p.second, boundary))
+    if (!pointInRing(p.first, p.second, boundary) &&
+        distanceToRing(p.first, p.second, boundary) > kOnEdgeTolM)
     {
       return false;
+    }
+  }
+  return true;
+}
+
+// True iff no sampled point of `pts` falls inside any hole ring (issue #333: a
+// turn-around connector or corner fillet must not cut through an obstacle).
+// Empty `holes` → trivially clear.
+bool clearOfHoles(const std::vector<std::pair<double, double>>& pts,
+                  const std::vector<std::vector<std::pair<double, double>>>& holes)
+{
+  for (const auto& hole : holes)
+  {
+    for (const auto& p : pts)
+    {
+      if (pointInRing(p.first, p.second, hole))
+      {
+        return false;
+      }
     }
   }
   return true;
@@ -417,6 +544,7 @@ std::vector<std::pair<double, double>> buildConnector(
     const Pose& start,
     const Pose& goal,
     const std::vector<std::pair<double, double>>& boundary,
+    const std::vector<std::vector<std::pair<double, double>>>& holes,
     double turn_radius,
     double min_radius,
     double step,
@@ -428,12 +556,15 @@ std::vector<std::pair<double, double>> buildConnector(
   {
     double len = 0.0;
     auto pts = sampleDubins(start, goal, r, step, len);
-    if (!pts.empty() && allInside(pts, boundary))
+    // Accept the largest radius whose arc is both inside the boundary AND clear
+    // of every hole → smoothest turn-around that stays out of obstacles (#333).
+    if (!pts.empty() && allInside(pts, boundary) && clearOfHoles(pts, holes))
     {
-      return pts;  // largest in-bounds radius first → smoothest that fits
+      return pts;
     }
   }
-  // Last resort: straight blind connector (may be out-of-bounds → real gap).
+  // Last resort: straight blind connector (may leave the boundary OR cross a
+  // hole → a real, reportable gap the server surfaces).
   used_fallback = true;
   std::vector<std::pair<double, double>> straight;
   densifySegmentStep(start.x, start.y, goal.x, goal.y, step, straight);
@@ -454,6 +585,7 @@ std::vector<std::pair<double, double>> buildConnector(
 std::vector<std::pair<double, double>> roundSharpCorners(
     const std::vector<std::pair<double, double>>& pts,
     const std::vector<std::pair<double, double>>& boundary,
+    const std::vector<std::vector<std::pair<double, double>>>& holes,
     double max_turn_rad,
     double fillet_r,
     double min_radius,
@@ -513,9 +645,9 @@ std::vector<std::pair<double, double>> roundSharpCorners(
       const Pose t1{B.first + outx * d, B.second + outy * d, out_dir};  // arc exit
       double arc_len = 0.0;
       auto arc = sampleDubins(t0, t1, r, step, arc_len);  // start-incl, end-excl
-      if (arc.empty() || !allInside(arc, boundary))
+      if (arc.empty() || !allInside(arc, boundary) || !clearOfHoles(arc, holes))
       {
-        continue;
+        continue;  // off-boundary or through a hole (#333) → try a smaller radius
       }
       // Sanity: a fillet should be short (a single tangent arc, not a loop).
       if (arc_len > 3.0 * r + 0.5)
@@ -541,7 +673,84 @@ std::vector<std::pair<double, double>> roundSharpCorners(
   return out;
 }
 
+// Collapse the collinear runs of a densified polyline back to its sparse
+// vertices (endpoints always kept). On a headland ring — straight polygon edges
+// densified at kDensifyStep — this recovers the original polygon, giving
+// roundSharpCorners the TRUE edge lengths. Feeding it the densified polyline
+// instead silently disabled every ring fillet: the trim budget (0.49 × in_len)
+// with in_len = one 0.10 m densify step caps the fillet radius at ~0.03 m,
+// below the min_turning_radius floor, so every corner was "left sharp".
+std::vector<std::pair<double, double>> sparsifyCollinear(
+    const std::vector<std::pair<double, double>>& pts, double angle_eps_rad)
+{
+  if (pts.size() < 3)
+  {
+    return pts;
+  }
+  std::vector<std::pair<double, double>> out;
+  out.reserve(64);
+  out.push_back(pts.front());
+  for (std::size_t i = 1; i + 1 < pts.size(); ++i)
+  {
+    const double ax = pts[i].first - out.back().first;
+    const double ay = pts[i].second - out.back().second;
+    const double bx = pts[i + 1].first - pts[i].first;
+    const double by = pts[i + 1].second - pts[i].second;
+    const double na = std::hypot(ax, ay), nb = std::hypot(bx, by);
+    if (na < 1e-9 || nb < 1e-9)
+    {
+      continue;
+    }
+    double c = (ax * bx + ay * by) / (na * nb);
+    c = std::max(-1.0, std::min(1.0, c));
+    if (std::acos(c) > angle_eps_rad)
+    {
+      out.push_back(pts[i]);  // a real vertex — the heading changes here
+    }
+  }
+  out.push_back(pts.back());
+  return out;
+}
+
+// Densify the straight gaps of `pts` so consecutive points sit at most `step`
+// apart (fillet arc samples are already dense and pass through unchanged).
+std::vector<std::pair<double, double>> densifyPolyline(
+    const std::vector<std::pair<double, double>>& pts, double step)
+{
+  std::vector<std::pair<double, double>> out;
+  if (pts.empty())
+  {
+    return out;
+  }
+  out.reserve(pts.size() * 4);
+  for (std::size_t i = 0; i + 1 < pts.size(); ++i)
+  {
+    densifySegmentStep(pts[i].first, pts[i].second, pts[i + 1].first, pts[i + 1].second, step, out);
+  }
+  out.push_back(pts.back());
+  return out;
+}
+
 }  // namespace
+
+// Expand a cell's exterior ring outward by `margin`, preserving its holes.
+// Used to place the outermost headland ring ON the recorded boundary (the
+// perimeter the operator drove) instead of the op_width/2 inside it that
+// generateHeadlandSwaths would otherwise produce. Holes (drawn obstacles) are
+// carried over unchanged — the outer buffer does not move them.
+static f2c::types::Cell expandCellOutward(const f2c::types::Cell& in, double margin)
+{
+  if (in.size() == 0)
+  {
+    return in;
+  }
+  f2c::types::Cell out(bufferRingOutward(in.getGeometry(0), margin));
+  for (std::size_t r = 1; r < in.size(); ++r)  // ring 0 = exterior, 1.. = holes
+  {
+    out.addRing(in.getGeometry(r));
+  }
+  return out;
+}
 
 BoustrophedonPlan planBoustrophedon(const f2c::types::Cell& field_cell,
                                     double op_width,
@@ -549,62 +758,387 @@ BoustrophedonPlan planBoustrophedon(const f2c::types::Cell& field_cell,
                                     int num_headland_passes_override,
                                     double chassis_safety_inset,
                                     double mow_angle_rad,
-                                    double min_swath_length)
+                                    double min_swath_length,
+                                    int ring_direction,
+                                    double min_turn_radius)
 {
   BoustrophedonPlan plan;
+  // Polygon area the planned-coverage fraction is taken over (the operator's
+  // authorised area, before any inset). Instrumentation only.
+  plan.diagnostics.field_area = field_cell.area();
+
+  // Per-stage wall-clock instrumentation (surfaced as a diagnostics note the
+  // server logs). Lets the maintainer see, on the Pi4, which F2C stage dominates
+  // a plan — expected: the AUTO swath-angle sweep. Pure accounting.
+  using Clock = std::chrono::steady_clock;
+  auto elapsedMs = [](Clock::time_point t0)
+  {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  };
+  double t_headland_ms = 0.0;
+  double t_mainland_ms = 0.0;
+  double t_swaths_ms = 0.0;
+  int swath_angle_candidates = 1;  // 1 = fixed/longest-edge; >1 = exhaustive sweep
+  double mainland_area_m2 = 0.0;
+
+  // Raw operator boundary as (x, y) pairs — the ring-corner fillet's in-bounds
+  // fallback when no chassis-safety inset was applied (plan.safe_boundary empty).
+  std::vector<std::pair<double, double>> field_outer_pts;
+  if (field_cell.size() > 0)
+  {
+    const auto outer_ring = field_cell.getGeometry(0);
+    field_outer_pts.reserve(outer_ring.size());
+    for (std::size_t i = 0; i < outer_ring.size(); ++i)
+    {
+      const auto p = outer_ring.getGeometry(i);
+      field_outer_pts.emplace_back(p.getX(), p.getY());
+    }
+  }
 
   f2c::hg::ConstHL hl;
   f2c::types::Cells cells;
   cells.addGeometry(field_cell);
 
-  // (1) Chassis-safety pre-inset: everything (rings AND swaths) is planned at
-  // least this far inside the operator polygon, so tracking error can't push
-  // the chassis over the boundary.
-  f2c::types::Cells safe_cells = cells;
-  if (chassis_safety_inset > 1e-3)
+  // (0) Headland ring count — resolved FIRST because the boundary offset (1),
+  // the clearance ring (below) and the mainland (3) all depend on whether there
+  // is a ring 0 at all. Three-way contract on num_headland_passes_override:
+  //   < 0  NONE   — no perimeter rings; the serpentine swaths mow straight to
+  //                 the boundary (issue #429). Every ring-dependent stage below
+  //                 is skipped.
+  //   == 0 AUTO   — ceil(headland_width / op_width), floored at 1 (unchanged).
+  //   > 0  FORCED — exactly that many rings (unchanged).
+  const int n_rings =
+      (num_headland_passes_override < 0)
+          ? 0
+          : ((num_headland_passes_override > 0)
+                 ? num_headland_passes_override
+                 : std::max(1, static_cast<int>(std::ceil(headland_width / op_width - 1e-9))));
+  if (n_rings == 0)
   {
-    safe_cells = hl.generateHeadlands(cells, chassis_safety_inset);
+    plan.diagnostics.notes.push_back(
+        "headland rings disabled (num_headland_passes < 0): swaths mow to the boundary");
+  }
+
+  // (1) Boundary offset so the OUTERMOST DRIVEN PASS's centerline sits
+  // `chassis_safety_inset` inside the recorded line. Shift the planning field by
+  // (chassis_safety_inset - op_width/2):
+  //   > 0  shrink INWARD  — operator asked to keep the chassis further inside
+  //                         (chassis_safety_inset > op_width/2);
+  //   < 0  expand OUTWARD — inset 0: the outermost pass rides ON the recorded
+  //                         line, so the blade mows to the edge and the chassis
+  //                         straddles the boundary. The half-chassis-width lethal
+  //                         band the keepout mask places outside the line is the
+  //                         safety stop, replacing the old inset floor.
+  //
+  // The −op_width/2 term is NOT a ring-specific correction: upstream F2C v3
+  // (pinned @884d895) places the outermost pass op_width/2 inside the planning
+  // cell in BOTH generators — ConstHL::generateHeadlandSwaths uses
+  // `field.buffer(-swath_width * (i + 0.5))` (ring 0 at op_width/2) and
+  // SwathGeneratorBase::getSwathsDistribution uses `sx[0] = 0.5 * cov_width`
+  // measured from the rotated cell's bbox edge (outermost swath at op_width/2).
+  // Same convention, two implementations. So the term applies with rings OFF
+  // too; dropping it there does not remove a correction, it inserts an
+  // op_width/2 OUTWARD bias into every swath — at the shipped defaults
+  // (inset 0.20, op_width 0.16) that made "no rings" leave a 0.20 m uncut border
+  // versus 0.12 m for 2 rings, i.e. the feature that promises to mow closer to
+  // the edge mowed 8 cm FURTHER from it.
+  //
+  // The zero-rings branch is floored at 0 (never an outward expansion). With
+  // rings, ring 0 riding ON the recorded line is deliberate and the swath ENDS
+  // still sit n_rings*op_width inside. With no rings the ends ARE the outermost
+  // geometry and the robot meets the boundary head-on there, a direction
+  // chassis_safety_inset has never modelled (the server's footprint check offsets
+  // ±robot_width/2 PERPENDICULAR to heading), so keep them on or inside the
+  // recorded line.
+  const double field_offset = (n_rings > 0) ? (chassis_safety_inset - 0.5 * op_width)
+                                            : std::max(0.0, chassis_safety_inset - 0.5 * op_width);
+  f2c::types::Cells safe_cells = cells;
+  if (field_offset > 1e-3)
+  {
+    safe_cells = hl.generateHeadlands(cells, field_offset);
     if (safe_cells.size() == 0 || safe_cells.area() < 1e-6)
     {
       return plan;  // inset consumed the field
+    }
+  }
+  else if (field_offset < -1e-3)
+  {
+    // Expand the field exterior outward so ring 0 lands on the recorded line.
+    f2c::types::Cells expanded;
+    expanded.addGeometry(expandCellOutward(field_cell, -field_offset));
+    if (expanded.size() > 0 && expanded.area() > 1e-6)
+    {
+      safe_cells = expanded;
+    }
+    // else: buffer degeneracy — fall back to the raw field (safe_cells = cells).
+  }
+
+  // Expose the planning outer ring so the continuous-path connectors/fillets are
+  // bounded by the SAME polygon the rings/swaths are planned against (not the raw
+  // operator boundary). If an inset split the field, take the largest cell's
+  // exterior ring (the dominant drivable region). Populated UNCONDITIONALLY from
+  // safe_cells: when no boundary offset was applied (chassis_safety_inset ==
+  // op_width/2 exactly → field_offset == 0, or a buffer degeneracy) safe_cells ==
+  // the raw field, so safe_boundary becomes the raw operator ring — which is
+  // still the correct drivable envelope (the outermost ring rides on it). Gating
+  // this on boundary_offset_applied left safe_boundary EMPTY in the field_offset
+  // ≈ 0 case, and buildContinuousSubPaths then validated every turn-around
+  // connector against an empty polygon (allInside always false) → a split at
+  // every segment → gross sub-path over-fragmentation.
+  {
+    std::size_t largest = 0;
+    double largest_area = -1.0;
+    for (std::size_t i = 0; i < safe_cells.size(); ++i)
+    {
+      const double a = safe_cells.getGeometry(i).area();
+      if (a > largest_area)
+      {
+        largest_area = a;
+        largest = i;
+      }
+    }
+    if (safe_cells.size() > 0)
+    {
+      const auto safe_ring = safe_cells.getGeometry(largest).getGeometry(0);  // exterior
+      plan.safe_boundary.reserve(safe_ring.size());
+      for (std::size_t i = 0; i < safe_ring.size(); ++i)
+      {
+        const auto p = safe_ring.getGeometry(i);
+        plan.safe_boundary.emplace_back(p.getX(), p.getY());
+      }
+    }
+  }
+
+  // Turn-around connectors/fillets are bounded by the OUTERMOST RING's centerline,
+  // NOT safe_boundary. generateHeadlandSwaths places ring 0 op_width/2 inside the
+  // planning field (safe_cells), so eroding safe_cells inward by op_width/2 yields
+  // exactly that centerline (== the recorded line eroded by chassis_safety_inset).
+  // allInside() only tests the path CENTERLINE, so validating connectors against
+  // safe_boundary let a turn arc's centerline ride op_width/2 further out than any
+  // ring/swath, pushing the swept chassis/blade footprint that far past the
+  // operator boundary (excursion grew with the turn radius). Bounding connectors
+  // to this ring instead caps a turn's footprint at the perimeter ring the robot
+  // already drives. op_width/2 (NOT robot_width/2): eroding by the chassis
+  // half-width would keep turns robot_width/2 − op_width/2 TIGHTER than the
+  // perimeter ring → edge turn-arounds forced below min_turning_radius → straight
+  // fallback → sub-path fragmentation. On degeneracy (tiny field) leave it empty;
+  // the caller falls back to safe_boundary (the pre-fix, looser bound).
+  //
+  // WITH NO RINGS (n_rings == 0, issue #429) there is no ring 0 to erode to: the
+  // outermost driven geometry is the swath ENDS, which sit exactly ON safe_cells'
+  // exterior. The clearance ring is then safe_cells EXACTLY — no buffer call at
+  // all (which also dodges the GEOS buffer(-0.0) re-noding hazard the mainland
+  // stage documents below). The invariant is the same in both branches: a
+  // connector centerline may go no further out than the OUTERMOST DRIVEN PASS.
+  // On-edge swath ends are handled by allInside()'s kOnEdgeTolM tolerance, NOT
+  // by expanding this ring outward — see the constant.
+  {
+    f2c::types::Cells clearance_cells;
+    if (n_rings > 0)
+    {
+      clearance_cells = hl.generateHeadlands(safe_cells, 0.5 * op_width);
+    }
+    else
+    {
+      clearance_cells = safe_cells;
+    }
+    if (clearance_cells.size() > 0 && clearance_cells.area() > 1e-6)
+    {
+      std::size_t largest = 0;
+      double largest_area = -1.0;
+      for (std::size_t i = 0; i < clearance_cells.size(); ++i)
+      {
+        const double a = clearance_cells.getGeometry(i).area();
+        if (a > largest_area)
+        {
+          largest_area = a;
+          largest = i;
+        }
+      }
+      const auto clr_ring = clearance_cells.getGeometry(largest).getGeometry(0);  // exterior
+      plan.connector_clearance_boundary.reserve(clr_ring.size());
+      for (std::size_t i = 0; i < clr_ring.size(); ++i)
+      {
+        const auto p = clr_ring.getGeometry(i);
+        plan.connector_clearance_boundary.emplace_back(p.getX(), p.getY());
+      }
+    }
+  }
+
+  // Expose the interior hole rings the continuous-path connectors/fillets must
+  // stay OUT of (issue #333). Use safe_cells' holes: when an inward inset was
+  // applied they are grown outward by the inset (so the blade clears an obstacle
+  // by the same margin it clears the outer boundary); when the field was
+  // expanded outward (ring on the line) or left unchanged, safe_cells carries
+  // the raw operator holes. Collect across every cell (the inset may have split
+  // the field) so a connector near any hole is caught.
+  {
+    const f2c::types::Cells& hole_src = safe_cells;
+    for (std::size_t i = 0; i < hole_src.size(); ++i)
+    {
+      const auto& cell = hole_src.getGeometry(i);
+      for (std::size_t r = 1; r < cell.size(); ++r)  // ring 0 = exterior, 1.. = holes
+      {
+        const auto ring = cell.getGeometry(r);
+        std::vector<std::pair<double, double>> hole;
+        hole.reserve(ring.size());
+        for (std::size_t j = 0; j < ring.size(); ++j)
+        {
+          const auto p = ring.getGeometry(j);
+          hole.emplace_back(p.getX(), p.getY());
+        }
+        if (hole.size() >= 3)
+        {
+          plan.safe_holes.push_back(std::move(hole));
+        }
+      }
     }
   }
 
   // (2) Headland rings — n concentric mowed loops spaced op_width, outermost
   // first. Ring i's centerline sits (i + 0.5) * op_width inside the safe
   // boundary, so n rings cut the band [0, n*op_width].
-  const int n_rings =
-      (num_headland_passes_override > 0)
-          ? num_headland_passes_override
-          : std::max(1, static_cast<int>(std::ceil(headland_width / op_width - 1e-9)));
-  const auto headland_passes =
-      hl.generateHeadlandSwaths(safe_cells, op_width, n_rings, /*dir_out2in=*/true);
   // Drop degenerate micro-loops (a near-consumed tiny field can yield a
   // centimetre-scale innermost ring that isn't worth driving).
   constexpr double kMinRingPerimeter = 1.0;  // m
-  for (const auto& pass_lines : headland_passes)
+  double ring_strip_area = 0.0;  // Σ perimeter·op_width of KEPT rings (for the fraction)
+  // Skipped ENTIRELY when the ring stage is disabled (n_rings == 0, issue
+  // #429): generateHeadlandSwaths(…, 0, dir_out2in=true) happens to return {}
+  // at the pinned F2C commit, but entering ringPassToLoops/fillet/ring_strip
+  // accounting with nothing to do is noise, not intent.
+  if (n_rings > 0)
   {
-    auto loops = ringPassToLoops(pass_lines);
-    for (auto& loop : loops)
+    const auto t_headland0 = Clock::now();
+    const auto headland_passes =
+        hl.generateHeadlandSwaths(safe_cells, op_width, n_rings, /*dir_out2in=*/true);
+    t_headland_ms = elapsedMs(t_headland0);
+    for (const auto& pass_lines : headland_passes)
     {
-      double perim = 0.0;
-      for (std::size_t i = 1; i < loop.size(); ++i)
+      auto loops = ringPassToLoops(pass_lines);
+      for (auto& loop : loops)
       {
-        perim += std::hypot(loop[i].first - loop[i - 1].first, loop[i].second - loop[i - 1].second);
+        double perim = 0.0;
+        for (std::size_t i = 1; i < loop.size(); ++i)
+        {
+          perim +=
+              std::hypot(loop[i].first - loop[i - 1].first, loop[i].second - loop[i - 1].second);
+        }
+        if (perim < kMinRingPerimeter)
+        {
+          plan.diagnostics.drops.push_back(fmtDrop("ring perim=", perim, "<", kMinRingPerimeter));
+          continue;
+        }
+        // Perimeter/headland travel winding (#335): flip the loop so a side-mounted
+        // blade stays on the cut side. Shoelace signed area > 0 = CCW, < 0 = CW.
+        // ring_direction: 1 = clockwise, 2 = counter-clockwise, 0 = leave as F2C
+        // emitted it.
+        if (ring_direction != 0)
+        {
+          double area2 = 0.0;
+          for (std::size_t i = 0; i + 1 < loop.size(); ++i)
+          {
+            area2 += loop[i].first * loop[i + 1].second - loop[i + 1].first * loop[i].second;
+          }
+          const bool is_ccw = area2 > 0.0;
+          const bool want_ccw = (ring_direction == 2);
+          if (is_ccw != want_ccw)
+          {
+            std::reverse(loop.begin(), loop.end());
+          }
+        }
+
+        // Ring corner smoothing (field report 2026-07: "the robot stalls after
+        // every headland ring, oscillating, before moving on"). Two fixes here:
+        //
+        // 1. START THE LOOP MID-LONGEST-EDGE. F2C closes every concentric ring at
+        //    the same polygon corner, so the loop closure sat ON a corner: the
+        //    closure vertex is the one corner roundSharpCorners can never fillet
+        //    (it only processes interior vertices), and the ring→ring junction
+        //    then demanded the full corner turn across a ~op_width gap (measured
+        //    112° on the field replica) — a near-cusp FTC fights the drivetrain
+        //    deadband through. Rotating the closure onto the middle of the
+        //    longest straight edge makes the closure a straight-line point and
+        //    stacks the junctions of consecutive rings on parallel edges (a
+        //    tangent ~op_width sideways shift).
+        //
+        // 2. FILLET AT SPARSE (true-edge-length) LEVEL. roundSharpCorners' trim
+        //    budget is 0.49 × the incoming edge length; fed the DENSIFIED loop,
+        //    in_len is one 0.10 m densify step, capping the fillet radius at
+        //    ~0.03 m — below the min_turn_radius floor — so every ring-corner
+        //    fillet silently failed and all polygon corners stayed sharp.
+        //    Collapse the collinear runs first, fillet on real edges, then
+        //    re-densify.
+        {
+          auto sparse = sparsifyCollinear(loop, 0.01 /* rad — straight-run merge */);
+          if (sparse.size() >= 5)
+          {
+            sparse.pop_back();  // open the closed loop for rotation
+            std::size_t le = 0;
+            double le_len = -1.0;
+            for (std::size_t j = 0; j < sparse.size(); ++j)
+            {
+              const auto& a = sparse[j];
+              const auto& b = sparse[(j + 1) % sparse.size()];
+              const double len = std::hypot(b.first - a.first, b.second - a.second);
+              if (len > le_len)
+              {
+                le_len = len;
+                le = j;
+              }
+            }
+            // New start = the longest edge's midpoint. Rotate so the loop begins
+            // at the vertex AFTER the edge (v_{le+1}) and stitch the midpoint on
+            // both ends: mid → v_{le+1} → … → v_le → mid. (Rotating to v_le
+            // instead would make the path step BACKWARD from mid to v_le — a
+            // 180° reversal baked into the ring.)
+            const std::pair<double, double> mid{
+                (sparse[le].first + sparse[(le + 1) % sparse.size()].first) * 0.5,
+                (sparse[le].second + sparse[(le + 1) % sparse.size()].second) * 0.5};
+            std::rotate(sparse.begin(),
+                        sparse.begin() + static_cast<std::ptrdiff_t>((le + 1) % sparse.size()),
+                        sparse.end());
+            sparse.insert(sparse.begin(), mid);
+            sparse.push_back(mid);
+            // Fillet every corner sharper than ~30° with a forward arc (floored at
+            // min_turn_radius so MPPI/FTC can track it); corners that cannot be
+            // rounded in-bounds are left sharp, as before.
+            const auto& fillet_boundary =
+                plan.safe_boundary.size() >= 3 ? plan.safe_boundary : field_outer_pts;
+            constexpr double kRingCornerThreshold = 30.0 * M_PI / 180.0;
+            auto rounded = roundSharpCorners(sparse,
+                                             fillet_boundary,
+                                             plan.safe_holes,
+                                             kRingCornerThreshold,
+                                             std::max(2.0 * min_turn_radius, min_turn_radius),
+                                             std::max(0.02, min_turn_radius),
+                                             0.03);
+            loop = densifyPolyline(rounded, kDensifyStep);
+          }
+        }
+
+        ring_strip_area += perim * op_width;
+        plan.rings.push_back(std::move(loop));
       }
-      if (perim < kMinRingPerimeter)
-      {
-        continue;
-      }
-      plan.rings.push_back(std::move(loop));
     }
   }
 
   // (3) Mainland: what's left inside the rings' cut band. May be empty on a
-  // small field (rings-only plan — still valid coverage).
-  f2c::types::Cells mainland = hl.generateHeadlands(safe_cells, n_rings * op_width);
+  // small field (rings-only plan — still valid coverage). With no rings the
+  // mainland IS the (already inset) planning field — do NOT call
+  // generateHeadlands(safe_cells, 0.0): upstream that is Cells::buffer(-0.0), a
+  // full OGR/GEOS buffer round-trip that re-nodes the polygon and can drop
+  // marginal parts. A needless, non-deterministic no-op (issue #429).
+  const auto t_mainland0 = Clock::now();
+  f2c::types::Cells mainland =
+      (n_rings > 0) ? hl.generateHeadlands(safe_cells, n_rings * op_width) : safe_cells;
+  t_mainland_ms = elapsedMs(t_mainland0);
+  mainland_area_m2 = mainland.area();
   if (mainland.size() == 0 || mainland.area() < 1e-6)
   {
+    // Rings-only is a valid plan — still report the planned fraction it covers.
+    plan.diagnostics.planned_area = ring_strip_area;
+    plan.diagnostics.planned_fraction =
+        (plan.diagnostics.field_area > 1e-9) ? ring_strip_area / plan.diagnostics.field_area : 0.0;
     return plan;
   }
 
@@ -617,17 +1151,50 @@ BoustrophedonPlan planBoustrophedon(const f2c::types::Cell& field_cell,
   // swath-count-minimising angle, which is equally deterministic for a fixed
   // polygon.
   f2c::sg::BruteForce bf;
+  // Coarsen the AUTO best-angle sweep from F2C's 1° default to kAutoAngleStepRad
+  // (5°) — ~5× fewer candidate angles at a negligible plan-quality change (see
+  // the constant). No effect on fixed-angle plans (they skip the sweep).
+  bf.setStepAngle(kAutoAngleStepRad);
   f2c::obj::NSwath n_swath_obj;
   f2c::rp::BoustrophedonOrder order;
+  double swath_strip_area = 0.0;  // Σ length·op_width of KEPT swaths (for the fraction)
+  const auto t_swaths0 = Clock::now();
   for (std::size_t i = 0; i < mainland.size(); ++i)
   {
     const auto cell = mainland.getGeometry(i);
     if (cell.area() < 1e-6)
     {
+      plan.diagnostics.drops.push_back(fmtDrop("mainland cell area=", cell.area(), "<", 1e-6));
       continue;
     }
-    f2c::types::Swaths swaths = (mow_angle_rad >= 0.0)
-                                    ? bf.generateSwaths(mow_angle_rad, op_width, cell)
+    // Resolve the swath angle. Fixed angle (>= 0) is used as-is. AUTO (< 0)
+    // normally runs the exhaustive best-angle search, but on a large cell that
+    // search is too slow (see kAutoAngleMaxAreaM2) — fall back to the cheap
+    // longest-edge angle so big fields still plan within the action timeout.
+    double cell_angle = mow_angle_rad;
+    if (cell_angle < 0.0 && cell.area() > kAutoAngleMaxAreaM2)
+    {
+      cell_angle = longestEdgeAngle(cell);
+      char buf[160];
+      std::snprintf(buf,
+                    sizeof(buf),
+                    "auto-angle: cell area=%.1f m² > %.1f → longest-edge angle %.1f° "
+                    "(skipped exhaustive search)",
+                    cell.area(),
+                    kAutoAngleMaxAreaM2,
+                    cell_angle * 180.0 / M_PI);
+      plan.diagnostics.notes.push_back(std::string(buf));
+    }
+    if (cell_angle < 0.0)
+    {
+      // Exhaustive sweep actually runs on this cell — record its candidate count
+      // (2π / step) for the timing note.
+      swath_angle_candidates =
+          std::max(swath_angle_candidates,
+                   static_cast<int>(std::lround(2.0 * M_PI / kAutoAngleStepRad)));
+    }
+    f2c::types::Swaths swaths = (cell_angle >= 0.0)
+                                    ? bf.generateSwaths(cell_angle, op_width, cell)
                                     : bf.generateBestSwaths(n_swath_obj, op_width, cell);
     if (swaths.size() == 0)
     {
@@ -647,39 +1214,325 @@ BoustrophedonPlan planBoustrophedon(const f2c::types::Cell& field_cell,
       const double len = std::hypot(p1.getX() - p0.getX(), p1.getY() - p0.getY());
       if (len < min_swath_length)
       {
+        plan.diagnostics.drops.push_back(fmtDrop("swath len=", len, "<", min_swath_length));
         continue;  // sliver clip — not worth a pivot
       }
       if (plan.swaths.empty())
       {
         plan.swath_angle_rad = std::atan2(p1.getY() - p0.getY(), p1.getX() - p0.getX());
       }
+      swath_strip_area += len * op_width;
       plan.swaths.push_back({{p0.getX(), p0.getY()}, {p1.getX(), p1.getY()}});
     }
   }
+
+  t_swaths_ms = elapsedMs(t_swaths0);
+
+  // Per-stage timing note (server logs it). "swaths" is the dominant stage — the
+  // AUTO best-angle sweep over `angles` candidates.
+  {
+    char buf[200];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "timing: headland=%.0fms mainland=%.0fms swaths=%.0fms "
+                  "(angles=%d, mainland_area=%.1f m²)",
+                  t_headland_ms,
+                  t_mainland_ms,
+                  t_swaths_ms,
+                  swath_angle_candidates,
+                  mainland_area_m2);
+    plan.diagnostics.notes.push_back(std::string(buf));
+  }
+
+  // Planned-coverage fraction: strip areas of the kept rings + swaths over the
+  // polygon area. Coarse (strips butt rather than overlap; corners double-count
+  // slightly), so it is a visibility metric, not a guarantee — but it makes a
+  // partially-planned area (slivers/rings/cells silently dropped above) VISIBLE
+  // in the server log so the next iteration can decide.
+  plan.diagnostics.planned_area = ring_strip_area + swath_strip_area;
+  plan.diagnostics.planned_fraction =
+      (plan.diagnostics.field_area > 1e-9)
+          ? plan.diagnostics.planned_area / plan.diagnostics.field_area
+          : 0.0;
 
   return plan;
 }
 
 // ── Continuous cusp-free path (forward turn-around connectors) ───────────────
 
-std::vector<std::pair<double, double>> buildContinuousPath(
+namespace
+{
+
+// How far INSIDE the clearance ring a clamped (previously out-of-bounds) pose is
+// placed. The clearance ring is the outermost headland ring's centerline (== the
+// recorded line eroded by chassis_safety_inset). A pose that pokes PAST it — the
+// only source being the F2C offset mismatch between generateHeadlandSwaths (the
+// ring) and generateHeadlands (the clearance boundary), which round convex
+// corners differently — is projected back to `kClearanceClampMarginM` inside the
+// nearest ring edge. Small enough that the local deformation stays trackable, and
+// far below the server's kBoundarySlackM (0.05 m) verify slack so the clamped
+// path passes the in-bounds check. See issue #388.
+constexpr double kClearanceClampMarginM = 0.02;
+
+// Project a pose that lies OUTSIDE `ring` back to `margin` inside the nearest ring
+// edge. Poses already inside are returned unchanged, so applying this to a whole
+// path only nudges the out-of-bounds convex-corner pokes and is a no-op for every
+// ring/swath/connector pose the planner already kept in-bounds.
+std::pair<double, double> clampInsideRing(double x,
+                                          double y,
+                                          const std::vector<std::pair<double, double>>& ring,
+                                          double margin)
+{
+  // A pose sitting exactly ON the ring is left alone: with the headland stage
+  // off the swath ENDS lie on this ring by construction, and pointInRing()
+  // resolves such poses inconsistently — clamping them would silently deform
+  // half the swath ends inward. Same tolerance allInside() uses (kOnEdgeTolM).
+  if (ring.size() < 3 || pointInRing(x, y, ring) || distanceToRing(x, y, ring) <= kOnEdgeTolM)
+  {
+    return {x, y};
+  }
+  // Nearest point on the ring boundary.
+  const std::size_t n = ring.size();
+  double best_d2 = std::numeric_limits<double>::max();
+  double px = x, py = y;
+  for (std::size_t i = 0, j = n - 1; i < n; j = i++)
+  {
+    const double ax = ring[j].first, ay = ring[j].second;
+    const double bx = ring[i].first, by = ring[i].second;
+    const double dx = bx - ax, dy = by - ay;
+    const double len2 = dx * dx + dy * dy;
+    double t = (len2 > 0.0) ? ((x - ax) * dx + (y - ay) * dy) / len2 : 0.0;
+    t = std::max(0.0, std::min(1.0, t));
+    const double qx = ax + t * dx, qy = ay + t * dy;
+    const double d2 = (x - qx) * (x - qx) + (y - qy) * (y - qy);
+    if (d2 < best_d2)
+    {
+      best_d2 = d2;
+      px = qx;
+      py = qy;
+    }
+  }
+  // The direction from the exterior pose toward its nearest boundary projection
+  // points INTO the polygon; stepping `margin` past the projection lands inside
+  // (unless the ring is thinner than the margin there, in which case snap to the
+  // boundary rather than risk crossing to the far side).
+  double inx = px - x, iny = py - y;
+  const double inl = std::hypot(inx, iny);
+  if (inl < 1e-9)
+  {
+    return {px, py};
+  }
+  inx /= inl;
+  iny /= inl;
+  const double cx = px + margin * inx, cy = py + margin * iny;
+  if (pointInRing(cx, cy, ring))
+  {
+    return {cx, cy};
+  }
+  return {px, py};
+}
+
+}  // namespace
+
+std::vector<std::vector<std::pair<double, double>>> buildContinuousSubPaths(
     const BoustrophedonPlan& plan,
     const std::vector<std::pair<double, double>>& boundary,
     double turn_radius,
     double min_turn_radius,
-    double step)
+    double step,
+    ConnectorStats* stats)
 {
   // Flatten the plan into ordered drivable segments (densified polylines),
-  // rings first (outermost → inner) then serpentine swaths.
-  std::vector<std::vector<std::pair<double, double>>> segs;
-  for (const auto& loop : plan.rings)
+  // rings first (outermost → inner) then the swaths.
+  //
+  // Ring start alignment (field report 2026-07: "the robot stalls after every
+  // headland ring, oscillating, before moving on"). F2C starts every concentric
+  // ring at the same polygon corner, so the loop CLOSURE sits on that corner and
+  // the ring→ring junction demanded a 45–90° heading change across a ~op_width
+  // gap — no trackable Dubins fits, the join degenerates to a near-cusp, and FTC
+  // fights the drivetrain deadband pivoting through it (the observed stall +
+  // wz oscillation). Rotate each ring loop (they are CLOSED polylines, any
+  // vertex is a valid start) so it begins at the vertex nearest the previous
+  // ring's end: concentric rings are locally parallel there, so the junction
+  // becomes a gentle ~op_width sideways shift the connector joins tangentially.
+  // The first ring keeps F2C's start (TransitToStrip already targets it).
+  // Ring DRIVE-ORDER grouping. F2C's generateHeadlandSwaths emits ring loops PER
+  // PASS as [outer, hole, outer, hole, …], so consecutive concentric OUTER rings
+  // are interleaved with the field-centre hole rings. Driven in that raw order the
+  // path jumps outer-ring → hole-ring → outer-ring every pass, and each jump is a
+  // field-crossing relocation the join-gap split below (Split A) turns into a
+  // spurious blade-off Nav2 transit (3–4 extra transits, purely an ordering
+  // artifact). Partition into outer-boundary rings FIRST (outermost-first order
+  // preserved) then the obstacle-encircling rings, so each group drives
+  // contiguously and only ONE relocation separates the two. A ring is an OUTER
+  // ring iff it encloses a MAINLAND point (a swath endpoint): the mainland lies
+  // inside every nested outer ring and outside every small hole ring. Falls back
+  // to the raw order when there are no swaths (rings-only field: no mainland probe,
+  // and a fully-consumed field rarely carries hole rings worth reordering). Ring
+  // GEOMETRY is untouched — only the order the loops are appended.
+  std::vector<std::size_t> ring_order;
+  ring_order.reserve(plan.rings.size());
+  if (!plan.swaths.empty())
   {
-    if (loop.size() >= 2)
+    const double probe_x =
+        0.5 * (plan.swaths.front().first.first + plan.swaths.front().second.first);
+    const double probe_y =
+        0.5 * (plan.swaths.front().first.second + plan.swaths.front().second.second);
+    std::vector<std::size_t> hole_rings;
+    for (std::size_t i = 0; i < plan.rings.size(); ++i)
     {
-      segs.push_back(loop);
+      if (pointInRing(probe_x, probe_y, plan.rings[i]))
+      {
+        ring_order.push_back(i);  // outer ring (encloses the mainland)
+      }
+      else
+      {
+        hole_rings.push_back(i);  // encircles a hole
+      }
+    }
+    ring_order.insert(ring_order.end(), hole_rings.begin(), hole_rings.end());
+  }
+  else
+  {
+    for (std::size_t i = 0; i < plan.rings.size(); ++i)
+    {
+      ring_order.push_back(i);
     }
   }
-  for (const auto& sw : plan.swaths)
+
+  std::vector<std::vector<std::pair<double, double>>> segs;
+  for (const std::size_t ring_idx : ring_order)
+  {
+    const auto& loop_in = plan.rings[ring_idx];
+    if (loop_in.size() < 2)
+    {
+      continue;
+    }
+    std::vector<std::pair<double, double>> loop = loop_in;
+    if (!segs.empty() && loop.size() >= 4)
+    {
+      const auto& prev = segs.back();
+      const auto& prev_end = prev.back();
+      // Exit heading of the previous ring (its last step direction).
+      const double ex = prev_end.first - prev[prev.size() - 2].first;
+      const double ey = prev_end.second - prev[prev.size() - 2].second;
+      const double en = std::hypot(ex, ey);
+      // Drop the duplicated closure vertex, rotate, then re-close.
+      loop.pop_back();
+      // Nearest vertex ALONE is not enough: F2C closes every concentric ring at
+      // the same polygon corner, so the nearest vertex IS that corner and the
+      // junction still demanded the full corner turn (measured 112° — the stall).
+      // Require the candidate's OUTGOING heading to align with the previous
+      // ring's exit heading (within 45°): concentric rings have a parallel edge
+      // there, so the join becomes a tangent ~op_width sideways shift. Fall back
+      // to plain nearest if nothing aligns (degenerate tiny ring).
+      const double kAlignCos = 0.7071;  // cos(45°)
+      std::size_t best = 0;
+      double best_d2 = std::numeric_limits<double>::max();
+      bool found_aligned = false;
+      for (int pass = 0; pass < 2 && !found_aligned; ++pass)
+      {
+        for (std::size_t j = 0; j < loop.size(); ++j)
+        {
+          if (pass == 0 && en > 1e-9)
+          {
+            const auto& nxt = loop[(j + 1) % loop.size()];
+            const double ox = nxt.first - loop[j].first;
+            const double oy = nxt.second - loop[j].second;
+            const double on = std::hypot(ox, oy);
+            if (on < 1e-9 || (ex * ox + ey * oy) / (en * on) < kAlignCos)
+            {
+              continue;  // outgoing heading not parallel to the previous exit
+            }
+          }
+          const double dx = loop[j].first - prev_end.first;
+          const double dy = loop[j].second - prev_end.second;
+          const double d2 = dx * dx + dy * dy;
+          if (d2 < best_d2)
+          {
+            best_d2 = d2;
+            best = j;
+            found_aligned = (pass == 0);
+          }
+        }
+        if (pass == 0 && !found_aligned)
+        {
+          best_d2 = std::numeric_limits<double>::max();  // retry unfiltered
+        }
+      }
+      std::rotate(loop.begin(), loop.begin() + static_cast<std::ptrdiff_t>(best), loop.end());
+      loop.push_back(loop.front());
+    }
+    segs.push_back(std::move(loop));
+  }
+
+  // Nearest-endpoint chaining of the swath pieces. BoustrophedonOrder's
+  // serpentine interleaves the pieces of a sweep line that a concave bite (or a
+  // hole) split — below,above,below,above… — which forced one field-crossing
+  // blade-on join PER COLUMN through/around the bite (user report: "the plan
+  // lands in the middle at the rounded parts"). Greedy nearest-endpoint chaining
+  // is identical to the plain serpentine on a convex field (the nearest unvisited
+  // piece IS the adjacent swath, entered at the near end), but on a split field
+  // it mows each lobe contiguously and leaves ONE long hop per lobe change —
+  // which the join-gap split below turns into a single blade-off Nav2 transit.
+  // Deterministic for a fixed plan (greedy from a fixed seed). O(n²), n = a few
+  // hundred swaths at most.
+  std::vector<std::pair<std::pair<double, double>, std::pair<double, double>>> ordered_swaths;
+  {
+    const auto& sw_in = plan.swaths;
+    std::vector<bool> used(sw_in.size(), false);
+    // Seed from BoustrophedonOrder's OWN first swath, NOT from the last ring's
+    // end. Seeding from the ring end couples the serpentine direction to where
+    // the ring closure happens to sit (the mid-longest-edge rotation above moved
+    // it), and a flipped serpentine relocates every U-turn to the opposite swath
+    // ends — where the turn-around teardrop may no longer fit inside the safety
+    // inset (measured on the recorded garden: 7 extra cusp-splits from bottom-
+    // edge U-turns that no longer had headland room). BoustrophedonOrder's own
+    // start reproduces the field-proven serpentine regardless of ring layout;
+    // the ring→first-swath hop is then joined blade-on when short or bridged by
+    // one Nav2 transit when long.
+    std::pair<double, double> cur =
+        !sw_in.empty() ? sw_in.front().first : std::pair<double, double>{0.0, 0.0};
+    ordered_swaths.reserve(sw_in.size());
+    for (std::size_t n = 0; n < sw_in.size(); ++n)
+    {
+      std::size_t best = sw_in.size();
+      bool flip = false;
+      double best_d = std::numeric_limits<double>::max();
+      for (std::size_t i = 0; i < sw_in.size(); ++i)
+      {
+        if (used[i])
+        {
+          continue;
+        }
+        const double d0 =
+            std::hypot(sw_in[i].first.first - cur.first, sw_in[i].first.second - cur.second);
+        const double d1 =
+            std::hypot(sw_in[i].second.first - cur.first, sw_in[i].second.second - cur.second);
+        if (d0 < best_d)
+        {
+          best_d = d0;
+          best = i;
+          flip = false;
+        }
+        if (d1 < best_d)
+        {
+          best_d = d1;
+          best = i;
+          flip = true;
+        }
+      }
+      used[best] = true;
+      auto sw = sw_in[best];
+      if (flip)
+      {
+        std::swap(sw.first, sw.second);
+      }
+      cur = sw.second;
+      ordered_swaths.push_back(sw);
+    }
+  }
+  for (const auto& sw : ordered_swaths)
   {
     std::vector<std::pair<double, double>> pts;
     densifySegmentStep(
@@ -691,10 +1544,10 @@ std::vector<std::pair<double, double>> buildContinuousPath(
     }
   }
 
-  std::vector<std::pair<double, double>> path;
+  std::vector<std::vector<std::pair<double, double>>> subpaths;
   if (segs.empty())
   {
-    return path;
+    return subpaths;
   }
 
   // Heading at a polyline's start (p[0]→p[1]) and end (p[n-2]→p[n-1]).
@@ -712,29 +1565,90 @@ std::vector<std::pair<double, double>> buildContinuousPath(
   // radius (mowgli_robot.yaml min_turning_radius). Shrinking a turn-around below
   // this to "fit in-bounds" produced loops MPPI could not track (wz≈vx/r), so the
   // robot looped/hesitated; when no arc >= this fits, buildConnector falls back
-  // to a straight join (reportable gap) instead of an untrackable loop.
+  // to a straight join instead of an untrackable loop.
   const double min_radius = std::max(0.02, min_turn_radius);
 
+  std::vector<std::pair<double, double>> path;  // the sub-path being accumulated
   for (std::size_t i = 0; i < segs.size(); ++i)
   {
-    if (i > 0)
+    if (i > 0 && !path.empty())
     {
       // Forward turn-around connector from the previous segment's exit pose to
       // this segment's entry pose. Both are oriented, so the Dubins path leaves
       // and arrives tangent → no cusp at either junction.
       const Pose start{path.back().first, path.back().second, exitHeading(segs[i - 1])};
       const Pose goal{segs[i].front().first, segs[i].front().second, entryHeading(segs[i])};
-      bool fallback = false;
-      auto conn = buildConnector(start, goal, boundary, turn_radius, min_radius, step, fallback);
-      // conn is start-inclusive (== path.back()) / goal-exclusive; drop the
-      // duplicate start so the polyline stays simple.
-      if (!conn.empty())
+      // A blade-on connector is a TURN-AROUND between adjacent passes (~op_width
+      // apart). A join longer than this is a RELOCATION (lobe change across a
+      // concave bite, innermost-ring → far first swath): an in-bounds Dubins for
+      // it "works" but mows a long diagonal across the middle of the lawn (user
+      // report). Split instead — FollowStrip bridges it with a blade-off Nav2
+      // transit. Single-sourced from mowgli_interfaces so this matches the BT's
+      // FollowStrip::kSegmentTransitGap for the same decision — see
+      // coverage_geometry.hpp for why the two sides must agree.
+      // Attempt a blade-on connector for EVERY segment join, regardless of length.
+      // buildConnector fits a forward turn-around arc when one fits (adjacent
+      // passes ~op_width apart) and otherwise falls back to a straight join. The
+      // sub-path is BROKEN — finalized here, the next started fresh at segs[i], so
+      // FollowStrip bridges the gap with a blade-off, costmap-aware Nav2 transit —
+      // ONLY when that connector is genuinely un-drivable blade-on: empty, or a
+      // straight fallback that leaves the boundary OR crosses an interior hole
+      // (issue #333, the split's sole purpose — routing AROUND an obstacle).
+      //
+      // A long but CLEAR join (e.g. innermost-ring → first-swath on a hole-free
+      // field, or a lobe change that passes to the side of a hole) is kept blade-on
+      // as ONE continuous sub-path. The earlier length gate (join_gap >
+      // kSegmentTransitGapM ⇒ split) fragmented such clear joins into needless
+      // blade-off transits — a hole-free field split into 2+ sub-paths, and every
+      // one-hole field carried an extra ring→swath transit. kSegmentTransitGapM
+      // remains the BT-side FollowStrip threshold for classifying the gaps BETWEEN
+      // the sub-paths this function emits; it no longer drives the split decision.
+      bool conn_safe = false;
       {
-        path.insert(path.end(), conn.begin() + 1, conn.end());
+        bool fallback = false;
+        auto conn = buildConnector(
+            start, goal, boundary, plan.safe_holes, turn_radius, min_radius, step, fallback);
+        conn_safe =
+            !conn.empty() &&
+            (!fallback || (allInside(conn, boundary) && clearOfHoles(conn, plan.safe_holes)));
+        // Pure accounting of how this join resolved (issue #499) — see
+        // ConnectorStats. Deliberately AFTER conn_safe so the classification
+        // reflects what is actually driven, not just whether buildConnector
+        // reached its straight-connector last resort: a straight fallback that
+        // verifies in-bounds is driven blade-on, one that does not becomes a
+        // sub-path split. Changes no decision.
+        if (stats != nullptr)
+        {
+          ++stats->attempted;
+          if (!conn_safe)
+          {
+            ++stats->split;
+          }
+          else if (fallback)
+          {
+            ++stats->straight_kept;
+          }
+          else
+          {
+            ++stats->arc;
+          }
+        }
+        if (conn_safe)
+        {
+          // conn is start-inclusive (== path.back()) / goal-exclusive; drop the
+          // duplicate start so the polyline stays simple.
+          path.insert(path.end(), conn.begin() + 1, conn.end());
+        }
+      }
+      if (!conn_safe)
+      {
+        subpaths.push_back(std::move(path));
+        path.clear();
       }
     }
-    // Append this segment. path.back() (== goal of the connector) coincides
-    // with segs[i].front(), so skip the first point to avoid a zero-length step.
+    // Append this segment. When continuing a sub-path, path.back() (== goal of
+    // the connector) coincides with segs[i].front(), so skip the first point to
+    // avoid a zero-length step; at a fresh sub-path start, take the whole segment.
     const auto& s = segs[i];
     if (path.empty())
     {
@@ -744,6 +1658,10 @@ std::vector<std::pair<double, double>> buildContinuousPath(
     {
       path.insert(path.end(), s.begin() + 1, s.end());
     }
+  }
+  if (!path.empty())
+  {
+    subpaths.push_back(std::move(path));
   }
 
   // Round ONLY the true cusps — corners that exceed the 90° inversion limit
@@ -756,11 +1674,153 @@ std::vector<std::pair<double, double>> buildContinuousPath(
   // findFirstPathInversion would flag (>90°) is still rounded. The fillet radius
   // is floored at min_radius (= min_turn_radius): a corner that can only be
   // rounded tighter than that is left sharp (pivoted through) rather than turned
-  // into a sub-trackable loop.
+  // into a sub-trackable loop. Applied PER sub-path (each is independently
+  // continuous; a fillet must never span a break).
   constexpr double kCornerThreshold = 88.0 * M_PI / 180.0;
   const double fillet_r = std::max(turn_radius * 0.5, min_radius);
-  path = roundSharpCorners(path, boundary, kCornerThreshold, fillet_r, min_radius, step);
+  std::vector<std::vector<std::pair<double, double>>> out;
+  out.reserve(subpaths.size());
+  for (auto& sp : subpaths)
+  {
+    if (sp.size() < 2)
+    {
+      continue;
+    }
+    auto rounded = roundSharpCorners(
+        sp, boundary, plan.safe_holes, kCornerThreshold, fillet_r, min_radius, step);
+    // SAFETY (#388): the ring/swath poses are appended verbatim from F2C, and the
+    // OUTERMOST ring's convex-corner vertices can poke a few cm PAST the clearance
+    // ring — generateHeadlandSwaths (the ring) and generateHeadlands (this
+    // `boundary`) round corners differently, so the two nominally-coincident
+    // offsets disagree at corners. Left uncorrected, the first such pose is the
+    // seg-1 start TransitToStrip drives to; sitting outside the recorded line (in
+    // the keepout mask's lethal band) it made the blade-off transit un-drivable
+    // and the whole sub-path was skipped. Project every out-of-bounds pose back
+    // just inside the clearance ring so the path — and its start — stay drivable.
+    // A no-op for the in-bounds majority.
+    if (boundary.size() >= 3)
+    {
+      for (auto& pt : rounded)
+      {
+        pt = clampInsideRing(pt.first, pt.second, boundary, kClearanceClampMarginM);
+      }
+    }
+    // Emit each rounded sub-path WHOLE — sub-paths split ONLY at Split A (a real
+    // obstacle-gap / relocation), never at an interior cusp. FTC (restored
+    // 2026-06-19, reverting MPPI) tracks the continuous full_path through the
+    // forward turn-around arcs with a single PRE_ROTATE, so a residual sharp
+    // U-turn between antiparallel swaths that no forward teardrop can fit (op_width
+    // ~0.16 m apart, needs ~2·r) must stay in ONE sub-path: its cusp tip lies in
+    // already-mowed headland (no coverage lost), and cutting there would fragment
+    // the plan into a blade-off Nav2 transit PER U-turn (measured 18 sub-paths /
+    // 17 transits on a 1-hole 72 m² field). The old MPPI-era residual-cusp split
+    // (>115° corners) was removed with the MPPI revert.
+    if (rounded.size() >= 2)
+    {
+      out.emplace_back(std::move(rounded));
+    }
+  }
 
+  // Sub-path DRIVE ORDER: minimize the blade-off Nav2 transit BETWEEN sub-paths.
+  // The sub-paths above come out in swath-chain order; on a multi-hole field that
+  // leaves the driver criss-crossing the lawn between lobes (measured 77 m of
+  // blade-off transit on the recorded 4-hole garden). Greedy nearest-neighbour
+  // over the FINISHED sub-path polylines, entering each at whichever end is
+  // nearer, mows spatially adjacent lobes consecutively (77 → 47 m there).
+  //   * Reversing a FINISHED polyline is safe: the points are identical, so every
+  //     turn-around / fillet stays exactly as in-bounds and trackable as before —
+  //     only reversing the swath ORDER *before* the path is built relocates
+  //     U-turns (the hazard the seed-from-BoustrophedonOrder note above guards);
+  //     driving the same polyline backwards moves nothing.
+  //   * Sub-path 0 stays the seed — TransitToStrip already drives the robot to
+  //     its start, and the BT resumes by sub-path index (deterministic: a fixed
+  //     plan yields a fixed NN order, so indices are stable across re-plans).
+  //   * Adopt the NN order ONLY when it actually shortens the transit, so a field
+  //     the chain order already sequenced well can never regress.
+  if (out.size() > 1)
+  {
+    auto gap = [](const std::pair<double, double>& a, const std::pair<double, double>& b)
+    {
+      return std::hypot(a.first - b.first, a.second - b.second);
+    };
+    double chain_transit = 0.0;
+    for (std::size_t i = 1; i < out.size(); ++i)
+    {
+      chain_transit += gap(out[i - 1].back(), out[i].front());
+    }
+    std::vector<std::size_t> order{0};
+    std::vector<bool> reversed_flag(out.size(), false);
+    std::vector<bool> used(out.size(), false);
+    used[0] = true;
+    std::pair<double, double> cur = out[0].back();
+    double nn_transit = 0.0;
+    for (std::size_t n = 1; n < out.size(); ++n)
+    {
+      std::size_t best = 0;
+      bool best_rev = false;
+      double best_d = std::numeric_limits<double>::max();
+      for (std::size_t j = 0; j < out.size(); ++j)
+      {
+        if (used[j])
+        {
+          continue;
+        }
+        const double ds = gap(cur, out[j].front());  // enter forward
+        const double de = gap(cur, out[j].back());  // enter reversed
+        if (ds < best_d)
+        {
+          best_d = ds;
+          best = j;
+          best_rev = false;
+        }
+        if (de < best_d)
+        {
+          best_d = de;
+          best = j;
+          best_rev = true;
+        }
+      }
+      used[best] = true;
+      reversed_flag[best] = best_rev;
+      order.push_back(best);
+      nn_transit += best_d;
+      cur = best_rev ? out[best].front() : out[best].back();
+    }
+    if (nn_transit + 1e-6 < chain_transit)
+    {
+      std::vector<std::vector<std::pair<double, double>>> reordered;
+      reordered.reserve(out.size());
+      for (const std::size_t idx : order)
+      {
+        std::vector<std::pair<double, double>> sp = std::move(out[idx]);
+        if (reversed_flag[idx])
+        {
+          std::reverse(sp.begin(), sp.end());
+        }
+        reordered.push_back(std::move(sp));
+      }
+      out = std::move(reordered);
+    }
+  }
+  return out;
+}
+
+std::vector<std::pair<double, double>> buildContinuousPath(
+    const BoustrophedonPlan& plan,
+    const std::vector<std::pair<double, double>>& boundary,
+    double turn_radius,
+    double min_turn_radius,
+    double step)
+{
+  // Concatenate the hole-free sub-paths into one polyline (GUI full_path + the
+  // no-hole common case, where there is exactly one sub-path). The driver uses
+  // buildContinuousSubPaths so any inter-sub-path gap becomes a Nav2 transit.
+  const auto subs = buildContinuousSubPaths(plan, boundary, turn_radius, min_turn_radius, step);
+  std::vector<std::pair<double, double>> path;
+  for (const auto& sp : subs)
+  {
+    path.insert(path.end(), sp.begin(), sp.end());
+  }
   return path;
 }
 
@@ -809,38 +1869,222 @@ double distanceToRing(double x, double y, const std::vector<std::pair<double, do
   return best;
 }
 
-f2c::types::LinearRing dedupClosedRing(const f2c::types::LinearRing& in)
+f2c::types::LinearRing bufferRingOutward(const f2c::types::LinearRing& in, double margin)
 {
-  f2c::types::LinearRing out;
-  bool have_prev = false;
-  double px = 0.0, py = 0.0;
+  if (margin < 1e-3 || in.size() < 3)
+  {
+    return dedupClosedRing(in);
+  }
+  // Grow the ring's polygon outward with GDAL/OGR (F2C's own geometry
+  // backend): drawn map obstacles get an operator-tunable safety margin
+  // (obstacle_margin) so the planner keeps swaths, connectors and headlands
+  // off root zones the 2D LiDAR cannot see. Rounded joins (8 quadrant
+  // segments) avoid miter spikes on concave operator polygons.
+  OGRLinearRing ogr_ring;
   for (std::size_t i = 0; i < in.size(); ++i)
   {
     const auto p = in.getGeometry(i);
-    const double x = p.getX();
-    const double y = p.getY();
-    if (have_prev && std::fabs(x - px) < 1e-9 && std::fabs(y - py) < 1e-9)
-    {
-      continue;  // zero-length edge — boost/F2C would reject the ring
-    }
-    out.addPoint(f2c::types::Point(x, y));
-    px = x;
-    py = y;
-    have_prev = true;
+    ogr_ring.addPoint(p.getX(), p.getY());
   }
-  // Close the ring (F2C wants first == last). The closing seam is the ring's
-  // standard representation, not a degenerate interior edge.
-  if (out.size() >= 2)
+  ogr_ring.closeRings();
+  OGRPolygon poly;
+  poly.addRing(&ogr_ring);
+  std::unique_ptr<OGRGeometry> grown(poly.Buffer(margin, 8));
+  // Buffer degeneracies (self-intersecting input, collapsed area) fall back
+  // to the raw ring — the planner still avoids the drawn polygon itself,
+  // just without the extra margin. Never drop the obstacle.
+  if (!grown)
   {
-    const auto first = out.getGeometry(0);
-    const auto last = out.getGeometry(out.size() - 1);
-    if (std::fabs(first.getX() - last.getX()) > 1e-9 ||
-        std::fabs(first.getY() - last.getY()) > 1e-9)
+    return dedupClosedRing(in);
+  }
+  const OGRPolygon* grown_poly = nullptr;
+  const auto flat_type = wkbFlatten(grown->getGeometryType());
+  if (flat_type == wkbPolygon)
+  {
+    grown_poly = grown->toPolygon();
+  }
+  else if (flat_type == wkbMultiPolygon)
+  {
+    // Outward buffering can merge lobes of a degenerate ring into several
+    // parts; keep the largest (the obstacle body).
+    double best_area = -1.0;
+    for (const auto* part : *grown->toMultiPolygon())
     {
-      out.addPoint(f2c::types::Point(first.getX(), first.getY()));
+      const double a = part->get_Area();
+      if (a > best_area)
+      {
+        best_area = a;
+        grown_poly = part;
+      }
     }
+  }
+  if (!grown_poly || !grown_poly->getExteriorRing() ||
+      grown_poly->getExteriorRing()->getNumPoints() < 4)
+  {
+    return dedupClosedRing(in);
+  }
+  const OGRLinearRing* ext = grown_poly->getExteriorRing();
+  f2c::types::LinearRing out;
+  for (int i = 0; i < ext->getNumPoints(); ++i)
+  {
+    out.addPoint(f2c::types::Point(ext->getX(i), ext->getY(i)));
+  }
+  return dedupClosedRing(out);
+}
+
+namespace
+{
+
+// Ring sanitization tolerances. Operator-recorded field boundaries carry
+// mm-scale geometric degeneracies (a real 252 m² field had a 1.2 mm near-
+// duplicate closure vertex and several 1–10 mm sliver edges). These are EXACT
+// enough that boost::geometry accepts the points yet degenerate enough that
+// F2C's generateHeadlands offset and BruteForce swath clip silently produce
+// PARTIAL coverage. Both tolerances sit safely below op_width (0.16 m) so no
+// real corner is ever removed.
+constexpr double kRingDedupTolM = 0.01;  // drop a vertex within 1 cm of the last kept one
+constexpr double kRingSpikeTolM = 0.005;  // drop a vertex within 5 mm of its neighbours' chord
+
+// Repair a ring into a boost::geometry-valid one via F2C's own OGR backend.
+// Buffer-by-zero is the standard OGR self-intersection fix (the same Buffer call
+// bufferRingOutward already relies on); it returns the valid equivalent of a
+// self-touching / sliver-laden ring. Keep the largest resulting polygon's
+// exterior. Any degeneracy (null buffer, empty result, collapsed ring) returns
+// the input unchanged — the planner must NEVER drop the field.
+f2c::types::LinearRing makeRingValid(const f2c::types::LinearRing& in)
+{
+  if (in.size() < 4)
+  {
+    return in;
+  }
+  OGRLinearRing ogr_ring;
+  for (std::size_t i = 0; i < in.size(); ++i)
+  {
+    const auto p = in.getGeometry(i);
+    ogr_ring.addPoint(p.getX(), p.getY());
+  }
+  ogr_ring.closeRings();
+  OGRPolygon poly;
+  poly.addRing(&ogr_ring);
+  std::unique_ptr<OGRGeometry> fixed(poly.Buffer(0.0));
+  if (!fixed)
+  {
+    return in;
+  }
+  const OGRPolygon* fixed_poly = nullptr;
+  const auto flat_type = wkbFlatten(fixed->getGeometryType());
+  if (flat_type == wkbPolygon)
+  {
+    fixed_poly = fixed->toPolygon();
+  }
+  else if (flat_type == wkbMultiPolygon)
+  {
+    // Repair can split a bow-tie ring into several parts; keep the field body.
+    double best_area = -1.0;
+    for (const auto* part : *fixed->toMultiPolygon())
+    {
+      const double a = part->get_Area();
+      if (a > best_area)
+      {
+        best_area = a;
+        fixed_poly = part;
+      }
+    }
+  }
+  if (!fixed_poly || !fixed_poly->getExteriorRing() ||
+      fixed_poly->getExteriorRing()->getNumPoints() < 4)
+  {
+    return in;
+  }
+  const OGRLinearRing* ext = fixed_poly->getExteriorRing();
+  f2c::types::LinearRing out;
+  for (int i = 0; i < ext->getNumPoints(); ++i)
+  {
+    out.addPoint(f2c::types::Point(ext->getX(i), ext->getY(i)));
   }
   return out;
+}
+
+}  // namespace
+
+f2c::types::LinearRing dedupClosedRing(const f2c::types::LinearRing& in)
+{
+  // 1. Metric dedup: drop any vertex within kRingDedupTolM of the previous kept
+  // vertex. A 1e-9 (nanometre) tolerance let mm-scale near-duplicates through —
+  // boost accepts the points but F2C's headland offset / swath clip then drop
+  // whole swaths. 1 cm is well below op_width, so real corners are preserved.
+  std::vector<f2c::types::Point> pts;
+  for (std::size_t i = 0; i < in.size(); ++i)
+  {
+    const auto p = in.getGeometry(i);
+    if (!pts.empty() &&
+        std::hypot(p.getX() - pts.back().getX(), p.getY() - pts.back().getY()) < kRingDedupTolM)
+    {
+      continue;  // near-zero-length edge — boost/F2C would reject or mis-clip it
+    }
+    pts.push_back(f2c::types::Point(p.getX(), p.getY()));
+  }
+  // Drop a near-duplicate closing vertex (the 1.2 mm seam) so the open vertex
+  // list carries no first≈last pair; the ring is re-closed explicitly below.
+  while (pts.size() >= 2 && std::hypot(pts.front().getX() - pts.back().getX(),
+                                       pts.front().getY() - pts.back().getY()) < kRingDedupTolM)
+  {
+    pts.pop_back();
+  }
+
+  // 2. Spike / near-collinear removal: drop any vertex whose perpendicular
+  // distance to the chord between its PREVIOUS KEPT vertex and its next neighbour
+  // is below kRingSpikeTolM. This clears both exactly-collinear points and
+  // mm-scale hooks (a 1 mm needle is invalid to boost even when each of its edges
+  // exceeds kRingDedupTolM). Chaining off the last kept vertex (rather than the
+  // raw predecessor) bounds the total deviation along a genuine curve to
+  // kRingSpikeTolM, so a rounded corner from an OGR buffer is simplified — not
+  // collapsed to a chamfer. Single deterministic pass (resume-by-index depends
+  // on the plan being reproducible).
+  if (pts.size() >= 4)
+  {
+    std::vector<f2c::types::Point> kept;
+    const std::size_t n = pts.size();
+    for (std::size_t i = 0; i < n; ++i)
+    {
+      const f2c::types::Point& a = kept.empty() ? pts[n - 1] : kept.back();
+      const f2c::types::Point& b = pts[i];
+      const f2c::types::Point& c = pts[(i + 1) % n];
+      const double dx = c.getX() - a.getX();
+      const double dy = c.getY() - a.getY();
+      const double len2 = dx * dx + dy * dy;
+      const double cross = dx * (a.getY() - b.getY()) - dy * (a.getX() - b.getX());
+      double perp = std::hypot(b.getX() - a.getX(), b.getY() - a.getY());
+      if (len2 > 0.0)
+      {
+        perp = std::fabs(cross) / std::sqrt(len2);
+      }
+      if (perp >= kRingSpikeTolM)
+      {
+        kept.push_back(b);
+      }
+    }
+    if (kept.size() >= 3)  // never collapse the field below a triangle
+    {
+      pts = kept;
+    }
+  }
+
+  // Re-close the ring (F2C wants first == last).
+  f2c::types::LinearRing out;
+  for (const auto& p : pts)
+  {
+    out.addPoint(p);
+  }
+  if (pts.size() >= 2)
+  {
+    out.addPoint(f2c::types::Point(pts.front().getX(), pts.front().getY()));
+  }
+
+  // 3. OGR validity repair: even after the metric/spike passes a ring can retain
+  // a self-touch boost::geometry rejects. makeRingValid returns the boost-valid
+  // equivalent, or the deduped ring unchanged if the repair degenerates.
+  return makeRingValid(out);
 }
 
 }  // namespace mowgli_coverage

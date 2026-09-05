@@ -1,5 +1,6 @@
-import { useCallback, useState } from "react";
-import { Alert, Badge, Button, Input, Spin, Typography } from "antd";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Alert, App, Badge, Button, Empty, Input, Space, Spin, Typography } from "antd";
 import {
     ReloadOutlined,
     SaveOutlined,
@@ -23,14 +24,21 @@ import { MowingSection } from "../components/settings/MowingSection.tsx";
 import { DockingSection } from "../components/settings/DockingSection.tsx";
 import { BatterySection } from "../components/settings/BatterySection.tsx";
 import { SafetySection } from "../components/settings/SafetySection.tsx";
+import { ObstaclesSection } from "../components/settings/ObstaclesSection.tsx";
 import { NavigationSection } from "../components/settings/NavigationSection.tsx";
 import { RainSection } from "../components/settings/RainSection.tsx";
+import { LedsSection } from "../components/settings/LedsSection.tsx";
+import { IrriSenseSection } from "../components/settings/IrriSenseSection.tsx";
 import { AdvancedSection } from "../components/settings/AdvancedSection.tsx";
 import { SettingsPreview } from "../components/settings/SettingsPreview.tsx";
+import { DisplayModeSection } from "../components/settings/DisplayModeSection.tsx";
+import { LogTimeZoneSection } from "../components/settings/LogTimeZoneSection.tsx";
 
 const { Text } = Typography;
 
 export const SettingsPage = () => {
+    const { t } = useTranslation();
+    const { modal } = App.useApp();
     const guiApi = useApi();
     const isMobile = useIsMobile();
     const { colors } = useThemeMode();
@@ -42,14 +50,21 @@ export const SettingsPage = () => {
         loading,
         saving,
         isDirty,
+        dirtyCount,
+        registerExternalSaver,
+        unregisterExternalSaver,
         dirtyKeys,
         restartRequired,
         searchQuery,
         advancedKeys,
         setSearchQuery,
+        matchesSearch,
         handleChange,
         handleBulkChange,
         isSectionDirty,
+        hasDefault,
+        isOverridden,
+        resetToDefault,
         save,
         savePartialValues,
         saveAndRestartGps,
@@ -61,19 +76,66 @@ export const SettingsPage = () => {
     // Long-running: container restart + rosbridge reconnect. Disable button
     // until ROS2 is reachable again to avoid duplicate-click restart storms.
     const ros2Restart = useContainerRestart({
-        pendingLabel: "Redémarrage ROS2…",
-        successMessage: "ROS2 redémarré",
-        errorMessage: "Échec du redémarrage ROS2",
+        pendingLabel: t('settingsPage.ros2Restarting'),
+        successMessage: t('settingsPage.ros2Restarted'),
+        errorMessage: t('settingsPage.ros2RestartFailed'),
     });
     const handleRestartRos2 = useCallback(
         () => ros2Restart.run(() => restartRos2(guiApi)),
         [ros2Restart, guiApi],
     );
+    const confirmRestartRos2 = useCallback(() => {
+        modal.confirm({
+            title: t("settingsPage.restartConfirmTitle"),
+            content: t("settingsPage.restartConfirmBody"),
+            okText: t("settingsPage.restartConfirmOk"),
+            cancelText: t("settingsPage.restartConfirmCancel"),
+            onOk: handleRestartRos2,
+        });
+    }, [modal, t, handleRestartRos2]);
+
+    // Search filter: a section is visible when the query is empty, or when it
+    // matches ANY of the section's keys, or the section's translated
+    // label/description. Empty query shows everything.
+    const visibleSections = useMemo(() => {
+        if (!searchQuery) return sections;
+        return sections.filter(
+            (section) =>
+                section.keys.some((key) => matchesSearch(key)) ||
+                matchesSearch("", t(section.label)) ||
+                matchesSearch("", t(section.description)),
+        );
+    }, [sections, searchQuery, matchesSearch, t]);
+
+    // When the active section gets filtered out by the search, jump to the
+    // first still-visible section so the content pane never goes blank.
+    useEffect(() => {
+        if (visibleSections.length === 0) return;
+        if (!visibleSections.some((s) => s.id === activeSection)) {
+            setActiveSection(visibleSections[0].id);
+        }
+    }, [visibleSections, activeSection]);
 
     const renderSection = () => {
         switch (activeSection) {
+            case "appearance":
+                return (
+                    <Space direction="vertical" size={16} style={{width: "100%"}}>
+                        <DisplayModeSection />
+                        <LogTimeZoneSection />
+                    </Space>
+                );
             case "hardware":
-                return <HardwareSection values={values} onChange={handleChange} onBulkChange={handleBulkChange} />;
+                return (
+                    <HardwareSection
+                        values={values}
+                        onChange={handleChange}
+                        onBulkChange={handleBulkChange}
+                        isOverridden={isOverridden}
+                        hasDefault={hasDefault}
+                        onReset={resetToDefault}
+                    />
+                );
             case "drive_motor":
                 return (
                     <DriveMotorSection
@@ -95,7 +157,7 @@ export const SettingsPage = () => {
                         onSave={save}
                         onPersistGnssSettings={(settings) => savePartialValues(settings, {
                             silentSuccess: true,
-                            errorMessage: "Failed to save GNSS settings before running the receiver action",
+                            errorMessage: t("settingsPage.gnssSaveError"),
                         })}
                         onSaveAndRestartGps={saveAndRestartGps}
                     />
@@ -105,17 +167,76 @@ export const SettingsPage = () => {
             case "localization":
                 return <LocalizationSection values={values} onChange={handleChange} />;
             case "mowing":
-                return <MowingSection values={values} onChange={handleChange} />;
+                return (
+                    <MowingSection
+                        values={values}
+                        onChange={handleChange}
+                        isOverridden={isOverridden}
+                        hasDefault={hasDefault}
+                        onReset={resetToDefault}
+                    />
+                );
             case "docking":
-                return <DockingSection values={values} onChange={handleChange} />;
+                return (
+                    <DockingSection
+                        values={values}
+                        onChange={handleChange}
+                        isOverridden={isOverridden}
+                        hasDefault={hasDefault}
+                        onReset={resetToDefault}
+                    />
+                );
             case "battery":
-                return <BatterySection values={values} onChange={handleChange} />;
+                return (
+                    <BatterySection
+                        values={values}
+                        onChange={handleChange}
+                        isOverridden={isOverridden}
+                        hasDefault={hasDefault}
+                        onReset={resetToDefault}
+                    />
+                );
             case "safety":
                 return <SafetySection values={values} onChange={handleChange} />;
+            case "obstacles":
+                return (
+                    <ObstaclesSection
+                        values={values}
+                        onChange={handleChange}
+                        isOverridden={isOverridden}
+                        hasDefault={hasDefault}
+                        onReset={resetToDefault}
+                    />
+                );
             case "navigation":
-                return <NavigationSection values={values} onChange={handleChange} />;
+                return (
+                    <NavigationSection
+                        values={values}
+                        onChange={handleChange}
+                        isOverridden={isOverridden}
+                        hasDefault={hasDefault}
+                        onReset={resetToDefault}
+                    />
+                );
             case "rain":
                 return <RainSection values={values} onChange={handleChange} />;
+            case "leds":
+                return (
+                    <LedsSection
+                        values={values}
+                        onChange={handleChange}
+                        isOverridden={isOverridden}
+                        hasDefault={hasDefault}
+                        onReset={resetToDefault}
+                    />
+                );
+            case "irrisense":
+                return (
+                    <IrriSenseSection
+                        registerSaver={registerExternalSaver}
+                        unregisterSaver={unregisterExternalSaver}
+                    />
+                );
             case "advanced":
                 return <AdvancedSection values={values} advancedKeys={advancedKeys} onChange={handleChange} />;
             default:
@@ -140,7 +261,7 @@ export const SettingsPage = () => {
                 <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
                     <Input
                         prefix={<SearchOutlined style={{ color: colors.muted }} />}
-                        placeholder="Rechercher un réglage…"
+                        placeholder={t('settingsPage.searchSettingPlaceholder')}
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
                         allowClear
@@ -149,7 +270,7 @@ export const SettingsPage = () => {
                     <div style={{ flex: 1 }} />
                     {isDirty && (
                         <Badge count={dirtyKeys.size} size="small" offset={[-4, 0]}>
-                            <Text type="secondary" style={{ fontSize: 11 }}>unsaved changes</Text>
+                            <Text type="secondary" style={{ fontSize: 11 }}>{t("settingsPage.unsavedChanges")}</Text>
                         </Badge>
                     )}
                 </div>
@@ -159,17 +280,17 @@ export const SettingsPage = () => {
                     <Alert
                         type="warning"
                         showIcon
-                        message="Restart required to apply saved changes"
+                        message={t("settingsPage.restartRequired")}
                         action={
                             <Button
                                 size="small"
                                 type="primary"
                                 icon={<ReloadOutlined />}
-                                onClick={handleRestartRos2}
+                                onClick={confirmRestartRos2}
                                 loading={ros2Restart.pending}
                                 disabled={ros2Restart.pending}
                             >
-                                {ros2Restart.pending ? ros2Restart.pendingLabel : "Restart ROS2"}
+                                {ros2Restart.pending ? ros2Restart.pendingLabel : t("settingsPage.restartRos2")}
                             </Button>
                         }
                         style={{ marginBottom: 12 }}
@@ -198,12 +319,20 @@ export const SettingsPage = () => {
                     top: isMobile ? undefined : 8,
                     alignSelf: isMobile ? undefined : "flex-start",
                 }}>
-                    <SettingsNav
-                        sections={sections}
-                        activeSection={activeSection}
-                        onSectionChange={setActiveSection}
-                        isSectionDirty={isSectionDirty}
-                    />
+                    {visibleSections.length > 0 ? (
+                        <SettingsNav
+                            sections={visibleSections}
+                            activeSection={activeSection}
+                            onSectionChange={setActiveSection}
+                            isSectionDirty={isSectionDirty}
+                        />
+                    ) : (
+                        <Empty
+                            image={Empty.PRESENTED_IMAGE_SIMPLE}
+                            description={t("settingsPage.noSearchResults")}
+                            style={{ marginTop: 24 }}
+                        />
+                    )}
                 </div>
 
                 {/* Section content */}
@@ -215,22 +344,22 @@ export const SettingsPage = () => {
                     minWidth: 0,
                 }}>
                     {/* Section header */}
-                    {currentSectionMeta && (
+                    {visibleSections.length > 0 && currentSectionMeta && (
                         <div style={{ marginBottom: 20 }}>
                             <div className="mn-display" style={{
                                 fontSize: 28, color: colors.text, lineHeight: 1.1, letterSpacing: '-0.01em',
                             }}>
-                                {currentSectionMeta.label}
+                                {t(currentSectionMeta.label)}
                             </div>
                             <div style={{
                                 fontSize: 12, color: colors.textDim, marginTop: 4,
                             }}>
-                                {currentSectionMeta.description}
+                                {t(currentSectionMeta.description)}
                             </div>
                         </div>
                     )}
 
-                    {renderSection()}
+                    {visibleSections.length > 0 && renderSection()}
                 </div>
 
                 {/* Live preview rail (desktop only) */}
@@ -270,25 +399,25 @@ export const SettingsPage = () => {
                     loading={saving}
                     disabled={!isDirty}
                 >
-                    {isDirty ? `Save (${dirtyKeys.size} changes)` : "Saved"}
+                    {isDirty ? t("settingsPage.saveWithCount", {count: dirtyCount}) : t("settingsPage.saved")}
                 </Button>
                 {isDirty && (
                     <Button
                         icon={<UndoOutlined />}
                         onClick={revert}
                     >
-                        Revert
+                        {t("settingsPage.revert")}
                     </Button>
                 )}
                 <div style={{ flex: 1 }} />
                 <Button
                     icon={<ReloadOutlined />}
-                    onClick={handleRestartRos2}
+                    onClick={confirmRestartRos2}
                     size="small"
                     loading={ros2Restart.pending}
                     disabled={ros2Restart.pending}
                 >
-                    {ros2Restart.pending ? ros2Restart.pendingLabel : "Restart ROS2"}
+                    {ros2Restart.pending ? ros2Restart.pendingLabel : t("settingsPage.restartRos2")}
                 </Button>
             </div>
         </div>

@@ -53,6 +53,35 @@ static float charge_end_voltage=BAT_CHARGE_CUTOFF_VOLTAGE ;
 static uint16_t cv_entry_debounce = 0; //CLOUDY consecutive CC cycles with battery_voltage >= trip
 #endif
 
+/* Runtime charge ceiling (PKT_ID_SET_SAFETY_LIMITS). Seeded with the compile-time
+ * board_defaults.h values, which stay the power-on fallback AND the hard upper
+ * bound the wire can never exceed (see charger_clamp_*): the host can only LOWER
+ * the charge envelope, never overcharge. An unconnected host runs these vetted
+ * defaults. */
+static volatile float g_max_charge_voltage = (float)MAX_CHARGE_VOLTAGE;
+static volatile float g_max_charge_current = (float)MAX_CHARGE_CURRENT;
+
+/* Lower-only clamp to (floor, compiled ceiling]. Non-finite is rejected upstream
+ * in the packet handler; an out-of-range value here falls back to the compiled
+ * ceiling (invalid) or is capped to it (too high) — never above it. */
+static float charger_clamp_voltage(float v) {
+  if (v <= 0.0f) return (float)MAX_CHARGE_VOLTAGE;
+  if (v < LOW_BAT_THRESHOLD) return (float)LOW_BAT_THRESHOLD;
+  if (v > (float)MAX_CHARGE_VOLTAGE) return (float)MAX_CHARGE_VOLTAGE;
+  return v;
+}
+static float charger_clamp_current(float i) {
+  if (i <= 0.0f) return (float)MAX_CHARGE_CURRENT;
+  if (i < 0.1f) return 0.1f;
+  if (i > (float)MAX_CHARGE_CURRENT) return (float)MAX_CHARGE_CURRENT;
+  return i;
+}
+
+void charger_set_charge_limits(float max_voltage, float max_current) {
+  g_max_charge_voltage = charger_clamp_voltage(max_voltage);
+  g_max_charge_current = charger_clamp_current(max_current);
+}
+
 /******************************************************************************
  * Function Prototypes
  *******************************************************************************/
@@ -164,8 +193,8 @@ static uint16_t cv_entry_debounce = 0; //CLOUDY consecutive CC cycles with batte
 
  void charger_set_end_voltage(float v) {
     /* Limit input to reasonable values. */
-    if (v>MAX_CHARGE_VOLTAGE) {
-      v=MAX_CHARGE_VOLTAGE;
+    if (v>g_max_charge_voltage) {
+      v=g_max_charge_voltage;
     } else if (v<LOW_BAT_THRESHOLD) {
       v=LOW_BAT_THRESHOLD;
     }
@@ -185,6 +214,12 @@ static uint16_t cv_entry_debounce = 0; //CLOUDY consecutive CC cycles with batte
 void ChargeController(void)
 {                        
   static uint32_t timestamp = 0;
+  float charge_target = charge_end_voltage;
+#if BOARD_YARDFORCE500B_LFP
+  if (charge_target > g_max_charge_voltage) charge_target = g_max_charge_voltage;
+  const float float_current_limit = (g_max_charge_current < FLOAT_CV_CURRENT)
+      ? g_max_charge_current : FLOAT_CV_CURRENT;
+#endif
 
   /*charger disconnected force idle state*/
 #if BOARD_YARDFORCE500B_LFP
@@ -200,6 +235,7 @@ void ChargeController(void)
   }
   if (undock_debounce >= UNDOCK_DEBOUNCE_CYCLES) {
     charger_state = CHARGER_STATE_IDLE;
+    cv_entry_debounce = 0;
   }
 #else
   if(( chargerInputVoltage < MIN_DOCKED_VOLTAGE) ){
@@ -244,10 +280,10 @@ void ChargeController(void)
         // until a redock). The proportional backoff claws PWM down hard on a real spike, matching
         // the reference build that runs 1395 trip-free. Floored at MIN_PWM_VALUE so CC never
         // slams PWM to zero - it ramps down to the floor and hands off to CV / IDLE.
-        if ((current > (MAX_CHARGE_CURRENT + 0.1f)) || (battery_voltage > charge_end_voltage))
+        if ((current > (g_max_charge_current + 0.1f)) || (battery_voltage > charge_target))
         {
             uint16_t step = 1;
-            float over = current - MAX_CHARGE_CURRENT;   // <=0 when backing off for the CV knee
+            float over = current - g_max_charge_current;   // <=0 when backing off for the CV knee
             if (over > 0.5f)       step = 16;            // hard overcurrent: dump PWM before the OCP latches
             else if (over > 0.25f) step = 6;
             else if (over > 0.1f)  step = 2;
@@ -256,7 +292,7 @@ void ChargeController(void)
             else
                 chargecontrol_pwm_val = MIN_PWM_VALUE;
         }
-        if ((battery_voltage < charge_end_voltage) && (current < (MAX_CHARGE_CURRENT - 0.1f))
+        if ((battery_voltage < charge_target) && (current < (g_max_charge_current - 0.1f))
             && (chargecontrol_pwm_val < MAX_PWM_VALUE))
         {
             chargecontrol_pwm_val++;
@@ -266,7 +302,7 @@ void ChargeController(void)
         //but DEBOUNCE it. LFP's IR drop at high charge current lifts the terminal voltage
         //~1.5 V above the resting/SoC voltage, so a transient trip must not latch CV while
         //the pack is only part full. Require the trip to hold CV_ENTRY_DEBOUNCE_CYCLES.
-        if (battery_voltage >= charge_end_voltage) {
+        if (battery_voltage >= charge_target) {
             if (cv_entry_debounce < CV_ENTRY_DEBOUNCE_CYCLES) {
                 cv_entry_debounce++;
             }
@@ -279,16 +315,16 @@ void ChargeController(void)
         }
 #else
         // cap charge current at 1.5 Amps
-        if ((battery_voltage > charge_end_voltage && (chargecontrol_pwm_val > 0)) || ((current > MAX_CHARGE_CURRENT) && (chargecontrol_pwm_val > 39)))
+        if ((battery_voltage > charge_target && (chargecontrol_pwm_val > 0)) || ((current > g_max_charge_current) && (chargecontrol_pwm_val > 39)))
         {
             chargecontrol_pwm_val--;
         }
-        if ((battery_voltage < charge_end_voltage) && (current < MAX_CHARGE_CURRENT) && (chargecontrol_pwm_val < 1350))
+        if ((battery_voltage < charge_target) && (current < g_max_charge_current) && (chargecontrol_pwm_val < 1350))
         {
             chargecontrol_pwm_val++;
         }
 
-        if(charge_voltage >= charge_end_voltage) {
+        if(charge_voltage >= charge_target) {
             charger_state = CHARGER_STATE_CHARGING_CV;
         }
 #endif
@@ -300,10 +336,10 @@ void ChargeController(void)
     {
         //CLOUDY CV->CC fallback. If the (heavily smoothed) pack voltage has sagged well
         //below the CV trip, we latched CV early on a load-induced spike while the pack was
-        //not actually full - resume bulk CC instead of floating at FLOAT_CV_CURRENT forever.
+        //not actually full - resume bulk CC instead of floating at float_current_limit forever.
         //CC re-entry is debounced (CV_ENTRY_DEBOUNCE_CYCLES) so this won't thrash; raise
         //CV_EXIT_HYSTERESIS if you see top-of-charge hunting.
-        if (battery_voltage < (charge_end_voltage - CV_EXIT_HYSTERESIS))
+        if (battery_voltage < (charge_target - CV_EXIT_HYSTERESIS))
         {
             charger_state = CHARGER_STATE_CHARGING_CC;
         }
@@ -311,26 +347,26 @@ void ChargeController(void)
         {
         //CLOUDY hold an LFP-friendly float voltage that never exceeds the runtime target.
         //(LFP must not be held at a high CV like Li-ion; float a little lower.)
-        float cv_target = (charge_end_voltage < MAX_FLOAT_CV_VOLTAGE) ? charge_end_voltage : MAX_FLOAT_CV_VOLTAGE;
+        float cv_target = (charge_target < MAX_FLOAT_CV_VOLTAGE) ? charge_target : MAX_FLOAT_CV_VOLTAGE;
 
         //CLOUDY deadband around cv_target (+/- CV_VOLTAGE_DEADBAND): don't step PWM while the
         //pack is already near the float target. Without it the bang-bang nudges every cycle and
         //limit-cycles - and on the LFP's steep top-of-charge knee a tiny ripple becomes a big
         //terminal-voltage swing (observed 27.5<->28.7V at ~1Hz).
-        if ((battery_voltage < (cv_target - CV_VOLTAGE_DEADBAND)) && (charge_voltage < (MAX_CHARGE_VOLTAGE)) && (chargecontrol_pwm_val < MAX_PWM_VALUE))
+        if ((battery_voltage < (cv_target - CV_VOLTAGE_DEADBAND)) && (charge_voltage < (g_max_charge_voltage)) && (chargecontrol_pwm_val < MAX_PWM_VALUE))
         {
           //CLOUDY only push more current while we are below the float-current target
-          if (current < FLOAT_CV_CURRENT) {
+          if (current < float_current_limit) {
             chargecontrol_pwm_val++;
           }
         }
-        if ((battery_voltage > (cv_target + CV_VOLTAGE_DEADBAND) && (chargecontrol_pwm_val > MIN_PWM_VALUE)) || (charge_voltage > (MAX_CHARGE_VOLTAGE) && (chargecontrol_pwm_val > MIN_PWM_VALUE)))
+        if ((battery_voltage > (cv_target + CV_VOLTAGE_DEADBAND) && (chargecontrol_pwm_val > MIN_PWM_VALUE)) || (charge_voltage > (g_max_charge_voltage) && (chargecontrol_pwm_val > MIN_PWM_VALUE)))
         {
           chargecontrol_pwm_val--;
         }
 
-        //CLOUDY fixed float/CV current limit (was MAX_CHARGE_CURRENT/10), floored at MIN_PWM_VALUE
-        if ((current > FLOAT_CV_CURRENT) && chargecontrol_pwm_val > MIN_PWM_VALUE)
+        //CLOUDY fixed float/CV current limit (was g_max_charge_current/10), floored at MIN_PWM_VALUE
+        if ((current > float_current_limit) && chargecontrol_pwm_val > MIN_PWM_VALUE)
         {
             chargecontrol_pwm_val--;
         }
@@ -346,17 +382,17 @@ void ChargeController(void)
     }
 #else
         // set PWM to approach 29.4V  charge voltage
-        if ((battery_voltage < charge_end_voltage) && (charge_voltage < (MAX_CHARGE_VOLTAGE)) && (chargecontrol_pwm_val < 1350))
+        if ((battery_voltage < charge_target) && (charge_voltage < (g_max_charge_voltage)) && (chargecontrol_pwm_val < 1350))
         {
           chargecontrol_pwm_val++;
         }
-        if ((battery_voltage > charge_end_voltage && (chargecontrol_pwm_val > 0)) || (charge_voltage > (MAX_CHARGE_VOLTAGE) && (chargecontrol_pwm_val > 39)))
+        if ((battery_voltage > charge_target && (chargecontrol_pwm_val > 0)) || (charge_voltage > (g_max_charge_voltage) && (chargecontrol_pwm_val > 39)))
         {
           chargecontrol_pwm_val--;
         }
 
         /* the current is limited to 150ma */
-        if ((current > (MAX_CHARGE_CURRENT/10)) && chargecontrol_pwm_val > 0)
+        if ((current > (g_max_charge_current/10)) && chargecontrol_pwm_val > 0)
         {
             chargecontrol_pwm_val--;
         }
@@ -366,7 +402,6 @@ void ChargeController(void)
           //charger_state = CHARGER_STATE_END_CHARGING;
           /*consider as the battery full */
           ampere_acc.f = 2.8;
-          SOC = 100;
         }
 #endif
 

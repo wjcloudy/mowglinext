@@ -1,14 +1,22 @@
 import {App, Input, Select, Space} from "antd";
 import {useEffect, useMemo, useRef, useState} from "react";
+import {useTranslation} from "react-i18next";
 import AsyncButton from "../components/AsyncButton.tsx";
 import {useWS} from "../hooks/useWS.ts";
 import {useApi} from "../hooks/useApi.ts";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
 import {useIsMobile} from "../hooks/useIsMobile";
+import {appendCappedBatch, createLogBatcher, type LogBatcher} from "./logBatcher.ts";
+import {useTimeFormat} from "../hooks/useTimeFormat.tsx";
+import {parseLogTimestamp, type LogTimestampSource} from "../utils/logTime.ts";
 
 type Severity = 'ERROR' | 'WARN' | 'INFO' | 'DEBUG' | 'OTHER';
 
 const LEVEL_PATTERN = /\b(ERROR|ERR|FATAL|CRITICAL|WARN(?:ING)?|INFO|DEBUG|TRACE)\b/i;
+// ESC is a control character by definition -- an ANSI escape matcher cannot
+// be written without it. Silenced at the one site that needs it rather than
+// globally, so a genuine stray control character elsewhere still reports.
+// eslint-disable-next-line no-control-regex
 const ANSI_REGEX = /\x1b\[[0-9;]*m/g;
 
 function detectSeverity(line: string): Severity {
@@ -24,25 +32,39 @@ function detectSeverity(line: string): Severity {
 
 interface ParsedLog {
     id: number;
+    /** The line with its producer-baked timestamp removed. */
     plain: string;
     severity: Severity;
+    /** Epoch ms, parsed once at ingest — never re-parsed during render. */
+    tsMs: number;
+    tsSource: LogTimestampSource;
 }
 
 const LEVEL_OPTIONS: { value: Severity; label: string }[] = [
-    {value: 'ERROR', label: 'Errors'},
-    {value: 'WARN', label: 'Warnings'},
-    {value: 'INFO', label: 'Info'},
-    {value: 'DEBUG', label: 'Debug'},
-    {value: 'OTHER', label: 'Other'},
+    {value: 'ERROR', label: 'logsPage.levelErrors'},
+    {value: 'WARN', label: 'logsPage.levelWarnings'},
+    {value: 'INFO', label: 'logsPage.levelInfo'},
+    {value: 'DEBUG', label: 'logsPage.levelDebug'},
+    {value: 'OTHER', label: 'logsPage.levelOther'},
 ];
 
 const DEFAULT_LEVELS: Severity[] = ['ERROR', 'WARN', 'INFO', 'OTHER'];
 const MAX_LINES = 5000;
+const LOG_BATCH_INTERVAL_MS = 100;
+// Width of the monospace timestamp column: "YYYY-MM-DDTHH:mm:ss" is 19 chars,
+// "HH:mm:ss" is 8. Fixed so the bodies line up.
+const TIMESTAMP_COLUMN_CH = 19;
+const TIMESTAMP_COLUMN_MOBILE_CH = 8;
+// A query with no digit in it cannot match a timestamp, so it never needs to
+// pay for formatting the buffer. Guards the search-the-time-column path below.
+const QUERY_HAS_DIGIT = /\d/;
 
 type ContainerList = { value: string, label: string, status: "started" | "stopped", labels: Record<string, string> };
 
 export const LogsPage = () => {
+    const {t} = useTranslation();
     const {colors} = useThemeMode();
+    const {timeZoneMode, setTimeZoneMode, zoneLabel, formatLogTime} = useTimeFormat();
     const guiApi = useApi();
     const {notification} = App.useApp();
     const isMobile = useIsMobile();
@@ -54,21 +76,46 @@ export const LogsPage = () => {
     const [autoScroll, setAutoScroll] = useState(true);
     const nextIdRef = useRef(0);
     const listRef = useRef<HTMLDivElement | null>(null);
+    const batcherRef = useRef<LogBatcher<ParsedLog> | null>(null);
+    if (batcherRef.current === null) {
+        batcherRef.current = createLogBatcher<ParsedLog>((batch) => {
+            setLogs(prev => appendCappedBatch(prev, batch, MAX_LINES));
+        }, LOG_BATCH_INTERVAL_MS);
+    }
+
+    const resetLogs = () => {
+        batcherRef.current?.reset();
+        nextIdRef.current = 0;
+        setLogs([]);
+    };
+    // useWS.onClose fires for BOTH server-side drops and our own stop()/container
+    // switches. Flag the deliberate ones so we don't surface an error toast for
+    // an intentional stop or a container change.
+    const intentionalStopRef = useRef(false);
 
     const stream = useWS<string>(
-        () => { notification.error({message: "Logs stream closed"}); },
+        () => {
+            if (intentionalStopRef.current) {
+                intentionalStopRef.current = false;
+                return;
+            }
+            notification.error({message: t('logsPage.streamClosed')});
+        },
         () => { /* connected */ },
         (line, first) => {
-            setLogs(prev => {
-                const plain = line.replace(ANSI_REGEX, '');
-                const entry: ParsedLog = {
-                    id: nextIdRef.current++,
-                    plain,
-                    severity: detectSeverity(plain),
-                };
-                const base = first ? [] : prev;
-                const next = [...base, entry];
-                return next.length > MAX_LINES ? next.slice(next.length - MAX_LINES) : next;
+            if (first) resetLogs();
+            const stripped = line.replace(ANSI_REGEX, '');
+            // Parse ONCE here, at ingest. Doing it in the render map or the
+            // `filtered` memo would re-parse the whole 5000-line buffer on
+            // every frame, on the very path logBatcher.bench.ts exists to
+            // protect.
+            const {epochMs, source, body} = parseLogTimestamp(stripped, Date.now());
+            batcherRef.current?.push({
+                id: nextIdRef.current++,
+                plain: body,
+                severity: detectSeverity(body),
+                tsMs: epochMs,
+                tsSource: source,
             });
         });
 
@@ -90,7 +137,7 @@ export const LogsPage = () => {
             if (options?.length && !containerId) setContainerId(options[0].value);
         } catch (e: unknown) {
             notification.error({
-                message: "Failed to list containers",
+                message: t('logsPage.failedToListContainers'),
                 description: e instanceof Error ? e.message : String(e),
             });
         }
@@ -100,14 +147,20 @@ export const LogsPage = () => {
 
     useEffect(() => {
         if (!containerId) return;
-        nextIdRef.current = 0;
-        setLogs([]);
+        resetLogs();
         stream.start(`/api/containers/${containerId}/logs`);
-        return () => { stream?.stop(); };
+        // Switching containers (or unmounting) closes the socket on purpose.
+        return () => { intentionalStopRef.current = true; stream?.stop(); };
     }, [containerId]);
 
+    useEffect(() => () => batcherRef.current?.reset(), []);
+
     const commandContainer = (command: "start" | "stop" | "restart") => async () => {
-        const messages = {start: "Container started", stop: "Container stopped", restart: "Container restarted"};
+        const messages = {
+            start: t('logsPage.containerStarted'),
+            stop: t('logsPage.containerStopped'),
+            restart: t('logsPage.containerRestarted'),
+        };
         try {
             if (!containerId) return;
             const res = await guiApi.containers.containersCreate(containerId, command);
@@ -115,13 +168,15 @@ export const LogsPage = () => {
             if (command === "start" || command === "restart") {
                 stream.start(`/api/containers/${containerId}/logs`);
             } else {
+                // Stopping the container intentionally closes the stream.
+                intentionalStopRef.current = true;
                 stream?.stop();
             }
             await listContainers();
             notification.success({message: messages[command]});
         } catch (e: unknown) {
             notification.error({
-                message: `Failed to ${command} container`,
+                message: t('logsPage.failedToCommandContainer', {command}),
                 description: e instanceof Error ? e.message : String(e),
             });
         }
@@ -129,15 +184,34 @@ export const LogsPage = () => {
 
     const selectedContainer = containers.find(c => c.value === containerId);
 
+    // Issue #207 moved the timestamp out of the line body and into its own
+    // rendered column, so `plain` no longer contains it and a search for
+    // "22:02" — or for an epoch pasted out of a bug report — silently stopped
+    // matching. Search the rendered column too, but only for queries that can
+    // possibly match one: formatting the whole buffer costs ~11 ms per
+    // keystroke at MAX_LINES (with the formatter cache in logTime.ts; ~110 ms
+    // without it), and an ordinary word search must not pay that.
     const filtered = useMemo(() => {
         const levelSet = new Set(levels);
         const q = search.trim().toLowerCase();
+        const searchesTime = q !== '' && QUERY_HAS_DIGIT.test(q);
         return logs.filter(l => {
             if (!levelSet.has(l.severity)) return false;
-            if (q && !l.plain.toLowerCase().includes(q)) return false;
-            return true;
+            if (!q) return true;
+            if (l.plain.toLowerCase().includes(q)) return true;
+            if (!searchesTime) return false;
+            // Raw epochs, as pasted from a bug report or an older ROS console.
+            if (String(Math.floor(l.tsMs / 1000)).includes(q)) return true;
+            if (String(l.tsMs).includes(q)) return true;
+            // The rendered column, so "22:02" or "2026-05-12" match what is on
+            // screen. withMillis is a strict superset of both the desktop
+            // (YYYY-MM-DDTHH:mm:ss) and the mobile (HH:mm:ss) column, so one
+            // format call covers every layout and also matches ".123".
+            return formatLogTime(l.tsMs, {withMillis: true}).toLowerCase().includes(q);
         });
-    }, [logs, levels, search]);
+        // formatLogTime is a useCallback keyed on timeZoneMode: without it in
+        // the deps, toggling UTC would leave a stale filter result on screen.
+    }, [logs, levels, search, formatLogTime]);
 
     const counts = useMemo(() => {
         const c: Record<Severity, number> = {ERROR: 0, WARN: 0, INFO: 0, DEBUG: 0, OTHER: 0};
@@ -145,11 +219,15 @@ export const LogsPage = () => {
         return c;
     }, [logs]);
 
+    // Once the buffer hits MAX_LINES, filtered.length plateaus even as new
+    // lines keep arriving, so an effect keyed on it stops firing and autoscroll
+    // dies. Key on the last line's monotonic id, which always advances.
+    const lastLineId = filtered.length > 0 ? filtered[filtered.length - 1].id : -1;
     useEffect(() => {
         if (!autoScroll) return;
         const el = listRef.current;
         if (el) el.scrollTop = el.scrollHeight;
-    }, [filtered.length, autoScroll]);
+    }, [lastLineId, autoScroll]);
 
     const handleScroll = () => {
         const el = listRef.current;
@@ -181,21 +259,21 @@ export const LogsPage = () => {
                     value={containerId}
                     style={{flex: 1, minWidth: isMobile ? undefined : 200}}
                     onSelect={(value) => setContainerId(value)}
-                    placeholder="Select container"
+                    placeholder={t('logsPage.selectContainer')}
                 />
                 <Space size={8} style={{flexShrink: 0}}>
                     {selectedContainer?.status === "started" && (
                         <>
-                            <AsyncButton onAsyncClick={commandContainer("restart")} size={isMobile ? "middle" : "small"}>Restart</AsyncButton>
+                            <AsyncButton onAsyncClick={commandContainer("restart")} size={isMobile ? "middle" : "small"}>{t('logsPage.restart')}</AsyncButton>
                             <AsyncButton
                                 disabled={selectedContainer.labels.app === "gui"}
                                 onAsyncClick={commandContainer("stop")}
                                 size={isMobile ? "middle" : "small"}
-                            >Stop</AsyncButton>
+                            >{t('logsPage.stop')}</AsyncButton>
                         </>
                     )}
                     {selectedContainer?.status === "stopped" && (
-                        <AsyncButton onAsyncClick={commandContainer("start")} size={isMobile ? "middle" : "small"}>Start</AsyncButton>
+                        <AsyncButton onAsyncClick={commandContainer("start")} size={isMobile ? "middle" : "small"}>{t('logsPage.start')}</AsyncButton>
                     )}
                 </Space>
             </div>
@@ -208,7 +286,7 @@ export const LogsPage = () => {
                 flexWrap: 'wrap',
             }}>
                 <Input.Search
-                    placeholder="Search logs..."
+                    placeholder={t('logsPage.searchPlaceholder')}
                     value={search}
                     onChange={(e) => setSearch(e.target.value)}
                     allowClear
@@ -231,16 +309,30 @@ export const LogsPage = () => {
                                     border: `1px solid ${active ? accent : colors.border}`,
                                     background: active ? `${accent}1f` : 'transparent',
                                     color: active ? accent : colors.textDim,
-                                    cursor: 'pointer', transition: 'all 0.15s',
+                                    cursor: 'pointer',
+                                    transition: 'border-color 0.15s, background-color 0.15s, color 0.15s',
                                 }}
                                 aria-pressed={active}
                             >
-                                {opt.label} <span style={{opacity: 0.7, marginLeft: 4}}>{counts[opt.value]}</span>
+                                {t(opt.label)} <span style={{opacity: 0.7, marginLeft: 4}}>{counts[opt.value]}</span>
                             </button>
                         );
                     })}
                 </div>
                 <div style={{display: 'flex', gap: 6, marginLeft: isMobile ? 0 : 'auto'}}>
+                    <button
+                        onClick={() => setTimeZoneMode(timeZoneMode === 'utc' ? 'local' : 'utc')}
+                        aria-label={t('logTime.toggleAria')}
+                        title={t('logTime.toggleAria')}
+                        style={{
+                            padding: '4px 10px', borderRadius: 999, fontSize: 12, fontWeight: 600,
+                            border: `1px solid ${colors.border}`, background: 'transparent',
+                            color: colors.textDim, cursor: 'pointer',
+                        }}
+                    >
+                        {timeZoneMode === 'utc' ? t('logsPage.timeZoneUtc') : t('logsPage.timeZoneLocal')}
+                        <span style={{opacity: 0.7, marginLeft: 4}}>{zoneLabel}</span>
+                    </button>
                     <button
                         onClick={() => setAutoScroll(a => !a)}
                         style={{
@@ -251,16 +343,16 @@ export const LogsPage = () => {
                             cursor: 'pointer',
                         }}
                     >
-                        {autoScroll ? '↓ Live' : '↓ Paused'}
+                        {autoScroll ? `↓ ${t('logsPage.live')}` : `↓ ${t('logsPage.paused')}`}
                     </button>
                     <button
-                        onClick={() => { setLogs([]); nextIdRef.current = 0; }}
+                        onClick={resetLogs}
                         style={{
                             padding: '4px 10px', borderRadius: 999, fontSize: 12, fontWeight: 600,
                             border: `1px solid ${colors.border}`, background: 'transparent',
                             color: colors.textDim, cursor: 'pointer',
                         }}
-                    >Clear</button>
+                    >{t('logsPage.clear')}</button>
                 </div>
             </div>
 
@@ -278,7 +370,7 @@ export const LogsPage = () => {
             >
                 {filtered.length === 0 && (
                     <div style={{padding: '40px 16px', textAlign: 'center', color: colors.textMuted}}>
-                        {logs.length === 0 ? 'Waiting for log output...' : 'No lines match the active filters.'}
+                        {logs.length === 0 ? t('logsPage.waitingForOutput') : t('logsPage.noLinesMatch')}
                     </div>
                 )}
                 {filtered.map(line => {
@@ -286,6 +378,7 @@ export const LogsPage = () => {
                     return (
                         <div
                             key={line.id}
+                            data-testid="log-line"
                             style={{
                                 padding: '3px 14px 3px 12px',
                                 borderLeft: `3px solid ${line.severity === 'OTHER' ? 'transparent' : accent}`,
@@ -296,8 +389,23 @@ export const LogsPage = () => {
                                         : 'transparent',
                                 color: colors.text,
                                 whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                                contentVisibility: 'auto',
+                                containIntrinsicSize: 'auto 26px',
                             }}
                         >
+                            <span
+                                title={line.tsSource === 'received'
+                                    ? t('logTime.approximate')
+                                    : formatLogTime(line.tsMs, {withMillis: true})}
+                                style={{
+                                    color: line.tsSource === 'received' ? colors.textMuted : colors.textDim,
+                                    marginRight: 10, fontSize: 11,
+                                    display: 'inline-block',
+                                    minWidth: `${isMobile ? TIMESTAMP_COLUMN_MOBILE_CH : TIMESTAMP_COLUMN_CH}ch`,
+                                }}
+                            >
+                                {formatLogTime(line.tsMs, {timeOnly: isMobile})}
+                            </span>
                             {line.severity !== 'OTHER' && (
                                 <span style={{
                                     color: accent, fontWeight: 700,

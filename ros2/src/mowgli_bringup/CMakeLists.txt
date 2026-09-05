@@ -63,6 +63,28 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_gnss_launch_config test/test_gnss_launch_config.py
     TIMEOUT 30
   )
+  # Verifies the sparse-installed-config deep-merge (robot_config_util):
+  # template-only defaults, sparse overrides + fall-through, reset-to-default,
+  # and full-config backward compat.
+  ament_add_pytest_test(test_robot_config_util test/test_robot_config_util.py
+    TIMEOUT 30
+  )
+  ament_add_pytest_test(test_urdf_xacro test/test_urdf_xacro.py
+    TIMEOUT 30
+  )
+
+  # Static guard for Inv 2 (TF sole ownership) — greps sources/configs, no
+  # nodes spun up.
+  ament_add_pytest_test(test_tf_ownership test/test_tf_ownership.py
+    TIMEOUT 30
+  )
+
+  # Static guards for the single-line mowgli_robot.yaml -> node-parameter
+  # injections in the launch files (num_headland_passes, mowing_enabled,
+  # dock_max_retries, dock_use_charger_detection). AST-based, no ROS2 runtime.
+  ament_add_pytest_test(test_launch_injection test/test_launch_injection.py
+    TIMEOUT 30
+  )
 
 endif()
 

@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cedbossneo/mowglinext/pkg/foxglove"
-	"github.com/cedbossneo/mowglinext/pkg/msgs/mowgli"
-	types2 "github.com/cedbossneo/mowglinext/pkg/types"
+	"github.com/mowglinext/mowglinext/pkg/foxglove"
+	"github.com/mowglinext/mowglinext/pkg/msgs/mowgli"
+	types2 "github.com/mowglinext/mowglinext/pkg/types"
 	"github.com/sirupsen/logrus"
 )
 
@@ -28,6 +28,9 @@ type topicDef struct {
 var topicMap = map[string]topicDef{
 	"status":          {"/hardware_bridge/status", "mowgli_interfaces/msg/Status"},
 	"highLevelStatus": {"/behavior_tree_node/high_level_status", "mowgli_interfaces/msg/HighLevelStatus"},
+	// One-click dock calibration live status (the GUI's foxglove-friendly
+	// window into the CalibrateDock action — foxglove_bridge has no action op).
+	"dockCalibrationStatus": {"/calibrate_imu_yaw_node/dock_calibration/status", "mowgli_interfaces/msg/DockCalibrationStatus"},
 	"gps":             {"/gps/fix", "sensor_msgs/msg/NavSatFix"},
 	"gnssStatus":      {"/gps/status", "mowgli_interfaces/msg/GnssStatus"},
 	// The robot's global pose comes from fusion_graph_node, the sole
@@ -41,18 +44,23 @@ var topicMap = map[string]topicDef{
 	"imu":                 {"/imu/data", "sensor_msgs/msg/Imu"},
 	"ticks":               {"/wheel_ticks", "mowgli_interfaces/msg/WheelTick"},
 	"wheelOdom":           {"/wheel_odom", "nav_msgs/msg/Odometry"},
-	"map":                 {"", ""},                                                            // virtual – populated via map_server services
+	"map":                 {"", ""},                                     // virtual – populated via map_server services
 	"path":                {"/coverage/full_plan", "nav_msgs/msg/Path"}, // full F2C coverage plan (headland + all swaths; execution is swath-by-swath)
-	"plan":                {"/plan", "nav_msgs/msg/Path"},                                      // infrequent event
+	"plan":                {"/plan", "nav_msgs/msg/Path"},               // infrequent event
 	"power":               {"/hardware_bridge/power", "mowgli_interfaces/msg/Power"},
 	"emergency":           {"/hardware_bridge/emergency", "mowgli_interfaces/msg/Emergency"}, // safety-critical
 	"lidar":               {"/scan", "sensor_msgs/msg/LaserScan"},                            // large message
 	"mowProgress":         {"/map_server_node/mow_progress", "nav_msgs/msg/OccupancyGrid"},   // mowed-area overlay (large)
 	"diagnostics":         {"/diagnostics", "diagnostic_msgs/msg/DiagnosticArray"},
 	"fusionDiag":          {"/fusion_graph/diagnostics", "diagnostic_msgs/msg/DiagnosticArray"},
+	"icpOdom":             {"/fusion_graph/icp_odometry", "nav_msgs/msg/Odometry"}, // LiDAR-only odom (ICP monitor)
 	"obstacles":           {"/obstacle_tracker/obstacles", "mowgli_interfaces/msg/ObstacleArray"},
 	"robotDescription":    {"/robot_description", "std_msgs/msg/String"},                     // published once
 	"recordingTrajectory": {"/behavior_tree_node/recording_trajectory", "nav_msgs/msg/Path"}, // area recording preview
+	// Latched std_msgs/Bool: true when a prior interrupted mow can be resumed, so
+	// the GUI offers "Resume" vs "Start fresh" instead of silently resuming (the
+	// "starts at 2nd/3rd line" report).
+	"coverageResumeAvailable": {"/behavior_tree_node/coverage_resume_available", "std_msgs/msg/Bool"},
 	// Synthetic heading sources fused by fusion_graph_node as yaw unary
 	// factors. Both carry sensor_msgs/Imu with only `orientation` and
 	// `orientation_covariance[8]` populated — see cog_to_imu.py and
@@ -166,8 +174,8 @@ func (r *RosSubscriber) run() {
 // and /wheel_odom no longer chew CPU when the browser is closed and the
 // optional MQTT/HomeKit providers are disabled.
 type RosProvider struct {
-	client       *foxglove.Client
-	cmdVelRelay  *cmdVelRelayClient
+	client      *foxglove.Client
+	cmdVelRelay *cmdVelRelayClient
 
 	mtx                sync.Mutex
 	subscribers        map[string]map[string]*RosSubscriber // logicalKey -> id -> subscriber
@@ -327,6 +335,13 @@ func (r *RosProvider) fanOut(logicalKey string, msg []byte) {
 	if logicalKey == "highLevelStatus" && r.sessionTracker != nil {
 		msgCopy := append([]byte(nil), msg...)
 		r.sessionTracker.Enqueue(msgCopy)
+	}
+	// Feed wheel odometry to the session odometer (total distance / blade-wear
+	// proxy). Kept alive by the MQTT persistent "wheelOdom" subscription, same as
+	// highLevelStatus above.
+	if logicalKey == "wheelOdom" && r.sessionTracker != nil {
+		msgCopy := append([]byte(nil), msg...)
+		r.sessionTracker.EnqueueOdometry(msgCopy)
 	}
 }
 

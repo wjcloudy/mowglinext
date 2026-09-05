@@ -19,14 +19,18 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nav2_core/controller_exceptions.hpp>
 #include <nav2_costmap_2d/costmap_2d.hpp>
 #include <nav2_util/node_utils.hpp>
 #include <tf2/utils.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/transform_listener.hpp>
 
+#include "mowgli_nav2_plugins/ftc_stall.hpp"
+#include "mowgli_nav2_plugins/ftc_start_index.hpp"
 #include "mowgli_nav2_plugins/obstacle_deviation.hpp"
 
 namespace mowgli_nav2_plugins
@@ -64,6 +68,34 @@ void FTCController::configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr& pa
   obstacle_marker_pub_ =
       node->create_publisher<visualization_msgs::msg::Marker>(plugin_name_ + "/costmap_marker", 10);
 
+  // Subscribe to the GLOBAL costmap (map frame, latched). It carries the
+  // mowing-zone boundary as lethal cells (keepout / lethal_outside_areas
+  // filter). We rebuild boundary_costmap_ from each update so the lateral-
+  // OFFSET deviation checks can refuse to skirt out of the zone.
+  boundary_costmap_sub_ = node->create_subscription<nav_msgs::msg::OccupancyGrid>(
+      "/global_costmap/costmap",
+      rclcpp::QoS(1).transient_local(),
+      [this](const nav_msgs::msg::OccupancyGrid::SharedPtr og)
+      {
+        auto cm = std::make_unique<nav2_costmap_2d::Costmap2D>(og->info.width,
+                                                               og->info.height,
+                                                               og->info.resolution,
+                                                               og->info.origin.position.x,
+                                                               og->info.origin.position.y);
+        unsigned char* char_map = cm->getCharMap();
+        const std::size_t n = static_cast<std::size_t>(og->info.width) * og->info.height;
+        for (std::size_t i = 0; i < n; ++i)
+        {
+          // OccupancyGrid 100/99 = lethal/inscribed (keepout boundary or a
+          // global obstacle — both are things we must not skirt into);
+          // unknown (-1) and free → 0.
+          char_map[i] = (og->data[i] >= 99) ? 254u : 0u;
+        }
+        std::lock_guard<std::mutex> lock(boundary_mutex_);
+        boundary_costmap_ = std::move(cm);
+        boundary_frame_ = og->header.frame_id;
+      });
+
   current_state_ = PlannerState::PRE_ROTATE;
   last_time_ = clock_->now();
   time_last_oscillation_ = clock_->now();
@@ -80,6 +112,11 @@ void FTCController::cleanup()
   global_point_pub_.reset();
   global_plan_pub_.reset();
   obstacle_marker_pub_.reset();
+  boundary_costmap_sub_.reset();
+  {
+    std::lock_guard<std::mutex> lock(boundary_mutex_);
+    boundary_costmap_.reset();
+  }
 }
 
 void FTCController::activate()
@@ -133,6 +170,10 @@ void FTCController::declareParameters(const rclcpp_lifecycle::LifecycleNode::Sha
   config_.speed_slow = declare_double("speed_slow", 0.2);
   config_.speed_angular = declare_double("speed_angular", 20.0);
   config_.acceleration = declare_double("acceleration", 1.0);
+  config_.min_speed_mps = declare_double("min_speed_mps", 0.15);
+  config_.stall_speed_ratio = declare_double("stall_speed_ratio", 0.35);
+  config_.stall_grace_s = declare_double("stall_grace_s", 0.6);
+  config_.stall_crawl_speed = declare_double("stall_crawl_speed", 0.08);
 
   // PID longitudinal
   config_.kp_lon = declare_double("kp_lon", 1.0);
@@ -151,6 +192,13 @@ void FTCController::declareParameters(const rclcpp_lifecycle::LifecycleNode::Sha
   config_.ki_ang = declare_double("ki_ang", 0.0);
   config_.ki_ang_max = declare_double("ki_ang_max", 10.0);
   config_.kd_ang = declare_double("kd_ang", 0.0);
+  // FOLLOWING-only heading gain; defaults to kp_ang so behaviour is unchanged
+  // unless explicitly lowered (it is, in nav2_params_base.yaml, to kill the
+  // straight-swath weave without softening the PRE_ROTATE pivot).
+  config_.kp_ang_following = declare_double("kp_ang_following", config_.kp_ang);
+
+  // Derivative low-pass time constant (s); 0 = raw derivative (prior behaviour).
+  config_.derivative_filter_tau = declare_double("derivative_filter_tau", 0.0);
 
   // Robot limits
   config_.max_cmd_vel_speed = declare_double("max_cmd_vel_speed", 2.0);
@@ -163,6 +211,9 @@ void FTCController::declareParameters(const rclcpp_lifecycle::LifecycleNode::Sha
 
   // Options
   config_.forward_only = declare_bool("forward_only", true);
+  // Legacy nearest-point snap in setPlan. OFF by default: on closed headland
+  // rings it could skip the entire ring (see setPlan).
+  config_.snap_to_nearest_on_set_plan = declare_bool("snap_to_nearest_on_set_plan", false);
   config_.debug_pid = declare_bool("debug_pid", false);
   config_.debug_obstacle = declare_bool("debug_obstacle", false);
 
@@ -182,6 +233,8 @@ void FTCController::declareParameters(const rclcpp_lifecycle::LifecycleNode::Sha
   config_.check_obstacles = declare_bool("check_obstacles", true);
   config_.obstacle_lookahead = declare_int("obstacle_lookahead", 5);
   config_.obstacle_footprint = declare_bool("obstacle_footprint", true);
+  config_.obstacle_body_half_width = declare_double("obstacle_body_half_width", 0.20);
+  config_.obstacle_clearance_margin = declare_double("obstacle_clearance_margin", 0.0);
 
   // Obstacle deviation
   config_.enable_obstacle_deviation = declare_bool("enable_obstacle_deviation", true);
@@ -189,7 +242,19 @@ void FTCController::declareParameters(const rclcpp_lifecycle::LifecycleNode::Sha
   config_.deviation_step = declare_double("deviation_step", 0.05);
   config_.deviation_blend_rate = declare_double("deviation_blend_rate", 0.5);
   config_.min_lateral_deviation = declare_double("min_lateral_deviation", 0.30);
-  config_.obstacle_wait_timeout_s = declare_double("obstacle_wait_timeout_s", 5.0);
+  config_.obstacle_wait_timeout_s = declare_double("obstacle_wait_timeout_s", 2.5);
+  config_.obstacle_clear_hold_s = declare_double("obstacle_clear_hold_s", 1.5);
+  config_.confine_deviation_to_zone = declare_bool("confine_deviation_to_zone", true);
+  config_.ignore_obstacles_outside_zone = declare_bool("ignore_obstacles_outside_zone", true);
+
+  // Footprint-polygon clearance + bounded reverse-escape.
+  config_.use_footprint_clearance = declare_bool("use_footprint_clearance", false);
+  config_.obstacle_footprint_front_length_m =
+      declare_double("obstacle_footprint_front_length_m", 0.30);
+  config_.require_clear_exit = declare_bool("require_clear_exit", true);
+  config_.obstacle_reverse_enabled = declare_bool("obstacle_reverse_enabled", false);
+  config_.obstacle_reverse_max_dist_m = declare_double("obstacle_reverse_max_dist_m", 0.30);
+  config_.obstacle_reverse_speed_mps = declare_double("obstacle_reverse_speed_mps", 0.10);
 
   // Register parameter-change callback.
   param_cb_handle_ = node->add_on_set_parameters_callback(
@@ -205,6 +270,19 @@ rcl_interfaces::msg::SetParametersResult FTCController::onParameterChange(
   rcl_interfaces::msg::SetParametersResult result;
   result.successful = true;
 
+  auto reject_invalid =
+      [&result](const std::string& name, double value, double min, double max) -> bool
+  {
+    if (!std::isfinite(value) || value < min || value > max)
+    {
+      result.successful = false;
+      result.reason = name + " must be finite and within [" + std::to_string(min) + ", " +
+                      std::to_string(max) + "]";
+      return true;
+    }
+    return false;
+  };
+
   for (const auto& p : params)
   {
     // Strip the plugin namespace prefix before comparing.
@@ -217,99 +295,183 @@ rcl_interfaces::msg::SetParametersResult FTCController::onParameterChange(
 
     if (key == "speed_fast")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 2.0))
+        break;
       config_.speed_fast = p.as_double();
     }
     else if (key == "speed_fast_threshold")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 10.0))
+        break;
       config_.speed_fast_threshold = p.as_double();
     }
     else if (key == "speed_fast_threshold_angle")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 180.0))
+        break;
       config_.speed_fast_threshold_angle = p.as_double();
     }
     else if (key == "speed_slow")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 2.0))
+        break;
       config_.speed_slow = p.as_double();
     }
     else if (key == "speed_angular")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 180.0))
+        break;
       config_.speed_angular = p.as_double();
     }
     else if (key == "acceleration")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 10.0))
+        break;
       config_.acceleration = p.as_double();
+    }
+    else if (key == "min_speed_mps")
+    {
+      if (reject_invalid(key, p.as_double(), 0.0, 2.0))
+        break;
+      config_.min_speed_mps = p.as_double();
+    }
+    else if (key == "stall_speed_ratio")
+    {
+      if (reject_invalid(key, p.as_double(), 0.0, 1.0))
+        break;
+      config_.stall_speed_ratio = p.as_double();
+    }
+    else if (key == "stall_grace_s")
+    {
+      if (reject_invalid(key, p.as_double(), 0.0, 30.0))
+        break;
+      config_.stall_grace_s = p.as_double();
+    }
+    else if (key == "stall_crawl_speed")
+    {
+      if (reject_invalid(key, p.as_double(), 0.0, 2.0))
+        break;
+      config_.stall_crawl_speed = p.as_double();
     }
     else if (key == "kp_lon")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.kp_lon = p.as_double();
     }
     else if (key == "ki_lon")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.ki_lon = p.as_double();
     }
     else if (key == "ki_lon_max")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.ki_lon_max = p.as_double();
     }
     else if (key == "kd_lon")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.kd_lon = p.as_double();
     }
     else if (key == "kp_lat")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.kp_lat = p.as_double();
     }
     else if (key == "ki_lat")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.ki_lat = p.as_double();
     }
     else if (key == "ki_lat_max")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.ki_lat_max = p.as_double();
     }
     else if (key == "kd_lat")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.kd_lat = p.as_double();
     }
     else if (key == "kp_ang")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.kp_ang = p.as_double();
+    }
+    else if (key == "kp_ang_following")
+    {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
+      config_.kp_ang_following = p.as_double();
     }
     else if (key == "ki_ang")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.ki_ang = p.as_double();
     }
     else if (key == "ki_ang_max")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.ki_ang_max = p.as_double();
     }
     else if (key == "kd_ang")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 100.0))
+        break;
       config_.kd_ang = p.as_double();
+    }
+    else if (key == "derivative_filter_tau")
+    {
+      if (reject_invalid(key, p.as_double(), 0.0, 5.0))
+        break;
+      config_.derivative_filter_tau = p.as_double();
     }
     else if (key == "max_cmd_vel_speed")
     {
+      if (reject_invalid(key, p.as_double(), 0.01, 10.0))
+        break;
       config_.max_cmd_vel_speed = p.as_double();
       base_max_cmd_vel_speed_ = config_.max_cmd_vel_speed;
     }
     else if (key == "max_cmd_vel_ang")
     {
+      if (reject_invalid(key, p.as_double(), 0.01, 10.0))
+        break;
       config_.max_cmd_vel_ang = p.as_double();
     }
     else if (key == "max_goal_distance_error")
     {
+      if (reject_invalid(key, p.as_double(), 0.01, 10.0))
+        break;
       config_.max_goal_distance_error = p.as_double();
     }
     else if (key == "max_goal_angle_error")
     {
+      if (reject_invalid(key, p.as_double(), 0.01, 180.0))
+        break;
       config_.max_goal_angle_error = p.as_double();
     }
     else if (key == "goal_timeout")
     {
+      if (reject_invalid(key, p.as_double(), 0.1, 300.0))
+        break;
       config_.goal_timeout = p.as_double();
     }
     else if (key == "max_follow_distance")
     {
+      if (reject_invalid(key, p.as_double(), 0.01, 50.0))
+        break;
       config_.max_follow_distance = p.as_double();
     }
     else if (key == "forward_only")
@@ -330,14 +492,20 @@ rcl_interfaces::msg::SetParametersResult FTCController::onParameterChange(
     }
     else if (key == "oscillation_v_eps")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 1.0))
+        break;
       config_.oscillation_v_eps = p.as_double();
     }
     else if (key == "oscillation_omega_eps")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 1.0))
+        break;
       config_.oscillation_omega_eps = p.as_double();
     }
     else if (key == "oscillation_recovery_min_duration")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 300.0))
+        break;
       config_.oscillation_recovery_min_duration = p.as_double();
       {
         std::lock_guard<std::mutex> fd_lock(failure_detector_mutex_);
@@ -357,16 +525,32 @@ rcl_interfaces::msg::SetParametersResult FTCController::onParameterChange(
     {
       config_.obstacle_footprint = p.as_bool();
     }
+    else if (key == "obstacle_body_half_width")
+    {
+      if (reject_invalid(key, p.as_double(), 0.0, 2.0))
+        break;
+      config_.obstacle_body_half_width = p.as_double();
+    }
+    else if (key == "obstacle_clearance_margin")
+    {
+      if (reject_invalid(key, p.as_double(), 0.0, 2.0))
+        break;
+      config_.obstacle_clearance_margin = p.as_double();
+    }
     else if (key == "enable_obstacle_deviation")
     {
       config_.enable_obstacle_deviation = p.as_bool();
     }
     else if (key == "max_lateral_deviation")
     {
+      if (reject_invalid(key, p.as_double(), 0.0, 10.0))
+        break;
       config_.max_lateral_deviation = p.as_double();
     }
     else if (key == "deviation_step")
     {
+      if (reject_invalid(key, p.as_double(), 0.001, 1.0))
+        break;
       config_.deviation_step = p.as_double();
     }
     else if (key == "deviation_blend_rate")
@@ -380,6 +564,44 @@ rcl_interfaces::msg::SetParametersResult FTCController::onParameterChange(
     else if (key == "obstacle_wait_timeout_s")
     {
       config_.obstacle_wait_timeout_s = p.as_double();
+    }
+    else if (key == "obstacle_clear_hold_s")
+    {
+      if (reject_invalid(key, p.as_double(), 0.0, 30.0))
+        break;
+      config_.obstacle_clear_hold_s = p.as_double();
+    }
+    else if (key == "confine_deviation_to_zone")
+    {
+      config_.confine_deviation_to_zone = p.as_bool();
+    }
+    else if (key == "ignore_obstacles_outside_zone")
+    {
+      config_.ignore_obstacles_outside_zone = p.as_bool();
+    }
+    else if (key == "use_footprint_clearance")
+    {
+      config_.use_footprint_clearance = p.as_bool();
+    }
+    else if (key == "obstacle_footprint_front_length_m")
+    {
+      config_.obstacle_footprint_front_length_m = std::max(0.0, p.as_double());
+    }
+    else if (key == "require_clear_exit")
+    {
+      config_.require_clear_exit = p.as_bool();
+    }
+    else if (key == "obstacle_reverse_enabled")
+    {
+      config_.obstacle_reverse_enabled = p.as_bool();
+    }
+    else if (key == "obstacle_reverse_max_dist_m")
+    {
+      config_.obstacle_reverse_max_dist_m = std::clamp(p.as_double(), 0.0, 2.0);
+    }
+    else if (key == "obstacle_reverse_speed_mps")
+    {
+      config_.obstacle_reverse_speed_mps = std::clamp(p.as_double(), 0.0, 1.0);
     }
   }
 
@@ -403,6 +625,11 @@ void FTCController::setPlan(const nav_msgs::msg::Path& path)
   target_lateral_deviation_ = 0.0;
   lateral_deviation_ = 0.0;
 
+  // Reset reverse-escape sub-state — a new strip must never inherit a
+  // mid-reverse budget from the previous one.
+  reverse_escape_active_ = false;
+  reverse_distance_done_ = 0.0;
+
   // Reset angle unwrapping state — the new path's first pose orientation
   // is the new reference; nothing prior to setPlan informs continuity.
   angle_error_raw_prev_ = std::numeric_limits<double>::quiet_NaN();
@@ -411,48 +638,90 @@ void FTCController::setPlan(const nav_msgs::msg::Path& path)
   current_index_ = 0;
   current_progress_ = 0.0;
 
-  // Find the nearest path point to the robot's current position so we don't
-  // start from index 0 when the robot is far from the path start.
-  try
+  // Start at the BEGINNING of a freshly dispatched plan.
+  //
+  // This used to run an UNBOUNDED nearest-point search over the whole plan and
+  // begin tracking wherever that landed. On coverage headland rings — which are
+  // CLOSED, start == end to the millimetre — index 0 and index N-1 are the SAME
+  // POINT, so the search is genuinely ambiguous and floating-point noise decides
+  // which end wins. When the last index won, FTC drove three poses, reported the
+  // goal reached, and FollowStrip recorded the ring as MOWED. Observed on the
+  // robot on both 2026-08-24 runs:
+  //
+  //     new path with 436 poses, start=(1.95,9.50), end=(1.95,9.50)
+  //     setPlan with 436 points, starting at idx=432   -> 99 % of the ring skipped
+  //     setPlan with 805 points, starting at idx=372   -> 46 % skipped
+  //
+  // and both were then logged "reached 99-100 % of path - treating as MOWED".
+  // Un-mowed ground marked done, with skipped_swaths still reading 0.
+  //
+  // Resume is not this function's job and never was: FollowStrip already owns it
+  // by trimming the path at its resume cursor BEFORE dispatch, and it decides
+  // whether to transit blade-off first by measuring to poses.front() — index 0.
+  // Snapping to a different index here silently disagreed with that decision.
+  // Starting at 0 makes the two consistent again.
+  //
+  // snap_to_nearest_on_set_plan restores the old behaviour if a site needs it.
+  //
+  // NOTE: this block chooses the START INDEX ONLY. Everything after it —
+  // PID/derivative/stall reset, the tail-duplication the state machine's
+  // `size() - 2` arithmetic depends on, the latched plan publish, and the
+  // <3-pose termination guard — is SHARED and must run on BOTH paths. An
+  // earlier revision returned early from the default branch and skipped all of
+  // it, which leaked integrator windup from an aborted strip into the next
+  // strip's first tick and transitioned the state machine one segment early.
+  // Do not reintroduce an early return here.
+  if (!config_.snap_to_nearest_on_set_plan)
   {
-    const auto base_to_map = tf_buffer_->lookupTransform("map",
-                                                         "base_link",
-                                                         tf2::TimePointZero,
-                                                         tf2::durationFromSec(0.5));
-    const double rx = base_to_map.transform.translation.x;
-    const double ry = base_to_map.transform.translation.y;
-    double best_dist = std::numeric_limits<double>::max();
-    for (uint32_t i = 0; i < global_plan_.size(); ++i)
-    {
-      const double dx = global_plan_[i].pose.position.x - rx;
-      const double dy = global_plan_[i].pose.position.y - ry;
-      const double d = dx * dx + dy * dy;
-      if (d < best_dist)
-      {
-        best_dist = d;
-        current_index_ = i;
-      }
-    }
-    best_dist = std::sqrt(best_dist);
+    // current_index_ is already 0 from the reset above.
     RCLCPP_INFO(logger_,
-                "FTCController: setPlan with %zu points, starting at idx=%u (%.2fm from robot at "
-                "%.2f,%.2f).",
-                global_plan_.size(),
-                current_index_,
-                best_dist,
-                rx,
-                ry);
+                "FTCController: setPlan with %zu points, starting at idx=0.",
+                global_plan_.size());
   }
-  catch (const tf2::TransformException& ex)
+  else
   {
-    RCLCPP_WARN(logger_,
-                "FTCController: TF lookup in setPlan failed (%s), starting from idx=0.",
-                ex.what());
-    current_index_ = 0;
+    try
+    {
+      const auto base_to_map = tf_buffer_->lookupTransform("map",
+                                                           "base_link",
+                                                           tf2::TimePointZero,
+                                                           tf2::durationFromSec(0.5));
+      const double rx = base_to_map.transform.translation.x;
+      const double ry = base_to_map.transform.translation.y;
+
+      std::vector<std::pair<double, double>> xy;
+      xy.reserve(global_plan_.size());
+      for (const auto& p : global_plan_)
+      {
+        xy.emplace_back(p.pose.position.x, p.pose.position.y);
+      }
+      current_index_ = static_cast<uint32_t>(ChooseStartIndex(true, xy, rx, ry));
+
+      const double bdx = global_plan_[current_index_].pose.position.x - rx;
+      const double bdy = global_plan_[current_index_].pose.position.y - ry;
+      const double best_dist = std::hypot(bdx, bdy);
+      RCLCPP_INFO(logger_,
+                  "FTCController: setPlan with %zu points, starting at idx=%u (%.2fm from robot "
+                  "at %.2f,%.2f).",
+                  global_plan_.size(),
+                  current_index_,
+                  best_dist,
+                  rx,
+                  ry);
+    }
+    catch (const tf2::TransformException& ex)
+    {
+      RCLCPP_WARN(logger_,
+                  "FTCController: TF lookup in setPlan failed (%s), starting from idx=0.",
+                  ex.what());
+      current_index_ = 0;
+    }
   }
 
   last_time_ = clock_->now();
   current_movement_speed_ = config_.speed_slow;
+  stall_time_ = 0.0;
+  is_stalled_ = false;
 
   lat_error_ = 0.0;
   lon_error_ = 0.0;
@@ -463,6 +732,9 @@ void FTCController::setPlan(const nav_msgs::msg::Path& path)
   last_lat_error_ = 0.0;
   last_lon_error_ = 0.0;
   last_angle_error_ = 0.0;
+  d_lat_filt_ = 0.0;
+  d_lon_filt_ = 0.0;
+  d_angle_filt_ = 0.0;
 
   nav_msgs::msg::Path pub_path;
 
@@ -531,7 +803,7 @@ void FTCController::setSpeedLimit(const double& speed_limit, const bool& percent
 
 geometry_msgs::msg::TwistStamped FTCController::computeVelocityCommands(
     const geometry_msgs::msg::PoseStamped& /*pose*/,
-    const geometry_msgs::msg::Twist& /*velocity*/,
+    const geometry_msgs::msg::Twist& velocity,
     nav2_core::GoalChecker* goal_checker)
 {
   geometry_msgs::msg::TwistStamped cmd_vel;
@@ -553,6 +825,10 @@ geometry_msgs::msg::TwistStamped FTCController::computeVelocityCommands(
   //     and silently drops it — leaving the strip un-driven for the
   //     entire goal_timeout window.
   const double safe_dt = std::clamp(dt, 0.01, 0.5);
+
+  // Cache the measured forward speed (odom feedback) for update_control_point's
+  // anti-wheelspin stall detection.
+  last_measured_fwd_speed_ = velocity.linear.x;
 
   if (is_crashed_)
   {
@@ -617,7 +893,35 @@ geometry_msgs::msg::TwistStamped FTCController::computeVelocityCommands(
   // BT then aborts the strip and requests the next one.
   if (config_.enable_obstacle_deviation)
   {
+    // SAFETY (SAFETY_REVIEW_2026-07-23 F-C1): before anything else, check the
+    // robot's ACTUAL current footprint. The deviation machinery below only
+    // samples path poses AHEAD — during PRE_ROTATE pivots, stall-crawl pushes
+    // and lateral blends nothing ever asked "is my body in a lethal cell right
+    // now?", leaving collision_monitor as the sole guard (and it misses thin /
+    // sub-scan-plane obstacles). A true-lethal cell INSIDE the chassis outline
+    // means actual or imminent contact: hold zero velocity via the standard
+    // wait gate (transient scan noise clears within obstacle_wait_timeout_s;
+    // a real contact throws → the BT aborts the strip and the detour net
+    // routes around). Skipped while reverse-escaping — backing OUT of the
+    // contact is exactly what we want then.
+    if (!reverse_escape_active_ && currentBodyInLethal())
+    {
+      waitOrThrowForObstacle("chassis footprint overlaps a lethal obstacle cell");
+      return cmd_vel;  // zero-velocity hold (waitOrThrow throws after timeout)
+    }
     updateLateralDeviation(safe_dt);
+    // updateLateralDeviation engaged the bounded reverse-escape sub-state
+    // (both sides of an obstacle blocked / skirt over cap, rear footprint
+    // clear). Emit a PURE STRAIGHT reverse (no rotation, distance hard-capped
+    // in updateLateralDeviation) bypassing the PID, then return. This is the
+    // ONLY place FTC drives backwards and it is a distinct escape sub-state —
+    // normal following stays forward_only.
+    if (reverse_escape_active_)
+    {
+      cmd_vel.twist.linear.x = -config_.obstacle_reverse_speed_mps;
+      cmd_vel.twist.angular.z = 0.0;
+      return cmd_vel;
+    }
     // updateLateralDeviation flipped on the wait-before-abort gate (the
     // costmap is blocked beyond max_lateral_deviation and we're holding
     // for obstacle_wait_timeout_s). Hold zero velocity until either the
@@ -699,8 +1003,7 @@ FTCController::PlannerState FTCController::update_planner_state()
       // overshoots and oscillates during PRE_ROTATE — staying gated on
       // it would keep PRE_ROTATE alive forever even after the robot is
       // physically aligned with the carrot.
-      const double angle_wrapped =
-          std::atan2(std::sin(angle_error_), std::cos(angle_error_));
+      const double angle_wrapped = std::atan2(std::sin(angle_error_), std::cos(angle_error_));
       if (std::abs(angle_wrapped) * (180.0 / M_PI) < config_.max_goal_angle_error)
       {
         RCLCPP_INFO(logger_, "FTCController: PRE_ROTATE done, starting FOLLOWING.");
@@ -787,11 +1090,11 @@ FTCController::PlannerState FTCController::update_planner_state()
         // → next strip). Without it the FTC would silently sit in FINISHED
         // emitting zero velocity, leaving the action open while the goal
         // checker waits for a tolerance the robot will never meet.
-        RCLCPP_WARN(
-            logger_,
-            "FTCController: timeout in WAITING_FOR_GOAL_APPROACH (dist=%.3fm > "
-            "max_goal_distance_error=%.3fm); aborting strip.",
-            distance, config_.max_goal_distance_error);
+        RCLCPP_WARN(logger_,
+                    "FTCController: timeout in WAITING_FOR_GOAL_APPROACH (dist=%.3fm > "
+                    "max_goal_distance_error=%.3fm); aborting strip.",
+                    distance,
+                    config_.max_goal_distance_error);
         is_crashed_ = true;
         return PlannerState::FINISHED;
       }
@@ -892,8 +1195,33 @@ void FTCController::update_control_point(double dt)
 
       // Compute target speed based on how much straight path lies ahead.
       const double straight_dist = distanceLookahead();
-      const double target_speed =
+      double target_speed =
           (straight_dist >= config_.speed_fast_threshold) ? config_.speed_fast : config_.speed_slow;
+
+      // Anti-wheelspin traction control. If the carrot is already commanding a
+      // meaningful forward speed but the robot's ACTUAL forward speed (odom
+      // feedback) stays well below it, the wheels are slipping or the chassis is
+      // blocked. Rather than ramp to speed_fast and floor it — which spins the
+      // wheels and digs holes in soft turf (operator report) — ease the target
+      // down to a slow crawl until traction returns. Easing the carrot's target
+      // speed alone is not enough: the lon PID would still be floored up to
+      // min_speed_mps and push into the obstruction, so while `in_stall` we also
+      // freeze the carrot (below) and cap the commanded velocity at the crawl
+      // speed (calculate_velocity_commands). See ftc_stall.hpp for the pure
+      // decision function + unit tests (test_ftc_stall.cpp).
+      const FtcStallCfg stall_cfg{config_.stall_speed_ratio,
+                                  config_.stall_grace_s,
+                                  config_.stall_crawl_speed};
+      const FtcStallResult stall = StallDecision(target_speed,
+                                                 current_movement_speed_,
+                                                 last_measured_fwd_speed_,
+                                                 dt,
+                                                 stall_cfg,
+                                                 stall_time_);
+      target_speed = stall.target_speed;
+      // calculate_velocity_commands reads this to cap the commanded velocity
+      // at the crawl speed (bypassing the min_speed_mps floor) while blocked.
+      is_stalled_ = stall.in_stall;
 
       // Smooth speed ramp (acceleration / deceleration).
       if (target_speed > current_movement_speed_)
@@ -915,6 +1243,16 @@ void FTCController::update_control_point(double dt)
 
       double distance_to_move = dt * current_movement_speed_;
       double angle_to_move = dt * config_.speed_angular * (M_PI / 180.0);
+
+      // While stalled (blocked or slipping) freeze the carrot in place. The
+      // robot isn't moving, so advancing the carrot would only grow lon_error
+      // ahead of the chassis and make the lon PID push harder into the
+      // obstruction — the runaway that dug holes.
+      if (is_stalled_)
+      {
+        distance_to_move = 0.0;
+        angle_to_move = 0.0;
+      }
 
       // Advance the carrot along path segments.
       Eigen::Affine3d nextPose, currentPose;
@@ -1085,14 +1423,33 @@ void FTCController::calculate_velocity_commands(double dt,
   i_lat_error_ = std::clamp(i_lat_error_, -config_.ki_lat_max, config_.ki_lat_max);
   i_angle_error_ = std::clamp(i_angle_error_, -config_.ki_ang_max, config_.ki_ang_max);
 
-  // Derivative terms.
-  const double d_lat = (lat_error_ - last_lat_error_) / dt;
-  const double d_lon = (lon_error_ - last_lon_error_) / dt;
-  const double d_angle = (angle_error_ - last_angle_error_) / dt;
+  // Derivative terms (raw backward finite difference).
+  double d_lat = (lat_error_ - last_lat_error_) / dt;
+  double d_lon = (lon_error_ - last_lon_error_) / dt;
+  double d_angle = (angle_error_ - last_angle_error_) / dt;
 
   last_lat_error_ = lat_error_;
   last_lon_error_ = lon_error_;
   last_angle_error_ = angle_error_;
+
+  // Optional first-order low-pass on the derivative (derivative-on-measurement
+  // filtering). The raw finite difference amplifies the high-frequency jitter
+  // in the 10 Hz fused-pose feedback; kd_lat then pumps it into the angular
+  // command as a ~1.5 Hz steering limit cycle ("hunting"). Filtering the
+  // derivative lets kd_lat stay high enough for tight cross-track tracking
+  // without the chatter. tau = 0 keeps the raw derivative (prior behaviour);
+  // alpha = dt / (tau + dt) is the standard discrete one-pole coefficient.
+  // From PR #290 (64dce368).
+  if (config_.derivative_filter_tau > 0.0)
+  {
+    const double alpha = dt / (config_.derivative_filter_tau + dt);
+    d_lat_filt_ += alpha * (d_lat - d_lat_filt_);
+    d_lon_filt_ += alpha * (d_lon - d_lon_filt_);
+    d_angle_filt_ += alpha * (d_angle - d_angle_filt_);
+    d_lat = d_lat_filt_;
+    d_lon = d_lon_filt_;
+    d_angle = d_angle_filt_;
+  }
 
   // ── Linear velocity (FOLLOWING only) ──────────────────────────────────────
 
@@ -1110,7 +1467,35 @@ void FTCController::calculate_velocity_commands(double dt,
       lin_speed = std::clamp(lin_speed, -config_.max_cmd_vel_speed, config_.max_cmd_vel_speed);
     }
 
-    cmd_vel.twist.linear.x = lin_speed;
+    if (is_stalled_)
+    {
+      // Blocked or slipping: bound the OUTPUT to the crawl speed and skip the
+      // min_speed_mps floor. The floor keeps normal driving smooth, but here
+      // it would command 0.15-0.30 m/s straight into the obstruction (the lon
+      // PID stays positive because the carrot is ahead), digging holes in soft
+      // turf. A negative lin_speed (reversing away, forward_only off) passes
+      // through unclamped.
+      cmd_vel.twist.linear.x = std::min(lin_speed, config_.stall_crawl_speed);
+    }
+    else
+    {
+      // Cap forward catch-up at the ramped target speed. lin_speed is a pure-P
+      // carrot-follow term (kp_lon·lon_error), and the carrot advances OPEN-LOOP
+      // at current_movement_speed_ (see update_control_point). Whenever the
+      // robot's real motion transiently lags that open-loop carrot — exiting a
+      // turn as the target ramps speed_slow→speed_fast, or a downstream
+      // collision_monitor slowdown the controller can't see — lon_error grows and
+      // the raw term surges toward max_cmd_vel_speed (0.30), well above the mowing
+      // speed (~0.20). That is the "slows a little, then accelerates a lot, then
+      // settles" the operator sees. Clamping the forward output to the
+      // acceleration-limited current_movement_speed_ closes the lag at the ramp
+      // rate instead of leaping; max_cmd_vel_speed stays as the absolute cap only.
+      if (lin_speed > current_movement_speed_)
+        lin_speed = current_movement_speed_;
+      if (lin_speed > 0.0 && lin_speed < config_.min_speed_mps)
+        lin_speed = config_.min_speed_mps;
+      cmd_vel.twist.linear.x = lin_speed;
+    }
   }
   else
   {
@@ -1126,8 +1511,13 @@ void FTCController::calculate_velocity_commands(double dt,
 
   if (current_state_ == PlannerState::FOLLOWING)
   {
-    // Combined angle + lateral PID during path following.
-    double ang_speed = angle_error_ * config_.kp_ang + i_angle_error_ * config_.ki_ang +
+    // Combined angle + lateral PID during path following. NOTE: the heading
+    // gain here is kp_ang_following, NOT kp_ang. On a straight swath the full
+    // kp_ang=1.5 (needed to clear the deadband during a PRE_ROTATE pivot)
+    // makes the kp_ang*angle_error term saturate max_cmd_vel_ang and limit-
+    // cycle at ~0.5 Hz — the left-right swath weave (2026-06-19). A lower
+    // FOLLOWING gain kills the weave; the pivot path below keeps full kp_ang.
+    double ang_speed = angle_error_ * config_.kp_ang_following + i_angle_error_ * config_.ki_ang +
                        d_angle * config_.kd_ang + lat_error_for_steering * config_.kp_lat +
                        i_lat_error_ * config_.ki_lat + d_lat * config_.kd_lat;
 
@@ -1144,8 +1534,7 @@ void FTCController::calculate_velocity_commands(double dt,
     // setPlan exceeds π: kp_ang × (-3π) saturates angular cmd at the
     // wrong sign, so the robot keeps spinning the wrong way and the
     // accumulator drifts further away from zero each tick.
-    const double angle_for_pid =
-        std::atan2(std::sin(angle_error_), std::cos(angle_error_));
+    const double angle_for_pid = std::atan2(std::sin(angle_error_), std::cos(angle_error_));
     double ang_speed =
         angle_for_pid * config_.kp_ang + i_angle_error_ * config_.ki_ang + d_angle * config_.kd_ang;
 
@@ -1229,6 +1618,12 @@ bool FTCController::checkCollision(int max_points)
   }
 
   // Check costmap cells along the lookahead path segments.
+  // NOTE: this loop samples global_plan_ poses (plan/map frame) directly
+  // against costmap_map_ (odom frame) — the same map->odom frame bug fixed in
+  // updateLateralDeviation. It is only exercised when enable_obstacle_deviation
+  // is false (not the deployed coverage config), and the footprint check above
+  // is frame-correct, so it is left as-is; transform the window here too if the
+  // deviation-disabled path is ever used in production.
   for (int i = 0; i < max_points; ++i)
   {
     std::size_t index = current_index_ + static_cast<std::size_t>(i);
@@ -1265,6 +1660,34 @@ bool FTCController::checkCollision(int max_points)
   return false;
 }
 
+bool FTCController::currentBodyInLethal()
+{
+  if (costmap_map_ == nullptr || costmap_ros_ == nullptr)
+  {
+    return false;
+  }
+  const ObstacleDeviation::Footprint footprint = costmap_ros_->getRobotFootprint();
+  if (footprint.size() < 3)
+  {
+    return false;  // no polygon to rasterise — cannot assert
+  }
+  geometry_msgs::msg::PoseStamped robot_pose;
+  if (!costmap_ros_->getRobotPose(robot_pose))
+  {
+    return false;  // pose unavailable this tick
+  }
+  // getRobotPose returns the pose in the costmap's global frame (odom), the
+  // same frame as costmap_map_ — no transform needed. Lock against the costmap
+  // update thread for the rasterised read.
+  std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> lock(*costmap_map_->getMutex());
+  return ObstacleDeviation::footprintBlocked(*costmap_map_,
+                                             robot_pose,
+                                             0.0,
+                                             footprint,
+                                             ObstacleDeviation::BoundaryGuard{},
+                                             ObstacleDeviation::kLethalOnlyThreshold);
+}
+
 // ── Lateral deviation (skirt obstacles) ───────────────────────────────────────
 
 // Decide whether to stall the controller for `obstacle_wait_timeout_s` or
@@ -1284,18 +1707,115 @@ bool FTCController::waitOrThrowForObstacle(const std::string& reason)
     obstacle_wait_start_ = clock_->now();
     RCLCPP_INFO(logger_,
                 "FTCController: %s — holding zero velocity up to %.1fs for the costmap to clear.",
-                reason.c_str(), config_.obstacle_wait_timeout_s);
+                reason.c_str(),
+                config_.obstacle_wait_timeout_s);
   }
   const double elapsed = (clock_->now() - obstacle_wait_start_.value()).seconds();
   if (elapsed > config_.obstacle_wait_timeout_s)
   {
     is_crashed_ = true;
-    throw nav2_core::ControllerException(
-        std::string("FTCController: ") + reason + ", aborting strip after " +
-        std::to_string(static_cast<int>(elapsed)) + "s wait.");
+    throw nav2_core::ControllerException(std::string("FTCController: ") + reason +
+                                         ", aborting strip after " +
+                                         std::to_string(static_cast<int>(elapsed)) + "s wait.");
   }
   obstacle_waiting_ = true;
   return true;
+}
+
+// Bounded straight reverse-escape for the WEDGED case. SAFETY-CRITICAL: this is
+// the only code path that drives the (bladed) robot backwards. It runs ONLY
+// when the deviation search found no skirt this tick, and it fails safe — any
+// missing precondition (feature off, no footprint, budget spent, rear obstacle)
+// falls straight through to the existing waitOrThrowForObstacle behaviour.
+bool FTCController::reverseEscapeOrWait(const std::string& reason,
+                                        const ObstacleDeviation::Footprint& footprint,
+                                        double dt)
+{
+  ReverseEscapeCfg cfg;
+  cfg.enabled = config_.obstacle_reverse_enabled;
+  cfg.max_dist_m = config_.obstacle_reverse_max_dist_m;
+  cfg.speed_mps = config_.obstacle_reverse_speed_mps;
+
+  // The rear-clear safety check needs an explicit footprint AND the ACTUAL robot
+  // pose in the costmap frame — NOT a path pose. On a laterally-deviated
+  // approach the path pose differs from the real robot pose by the deviation, so
+  // probing there could check the wrong spot. getRobotPose() is the same source
+  // getOrientedFootprint uses for the current-pose collision check; it returns
+  // the pose in the costmap's global frame (odom), matching costmap_map_. If
+  // either the footprint or the pose is missing, refuse to reverse (fail safe →
+  // wait/abort).
+  const bool have_footprint = footprint.size() >= 3;
+  geometry_msgs::msg::PoseStamped robot_pose;
+  const bool have_pose = have_footprint && costmap_ros_->getRobotPose(robot_pose);
+
+  // Integrate any reverse motion since the previous tick (odom-based, hard
+  // capped), so the budget reflects real travel, not commanded travel.
+  if (reverse_escape_active_)
+  {
+    reverse_distance_done_ =
+        ReverseEscapeAdvance(cfg, reverse_distance_done_, last_measured_fwd_speed_, dt);
+  }
+
+  bool rear_clear = false;
+  if (have_pose)
+  {
+    // Probe the footprint at the pose we would occupy after backing the REAL
+    // robot pose up a short look-behind distance (the remaining budget, capped
+    // to a probe horizon). Re-checked every tick as we creep back, so a clear
+    // probe here guarantees the ~1 cm of travel this tick stays clear.
+    // True-lethal threshold only — we must not reverse into a real obstacle, but
+    // inflation halos behind us (which the robot legitimately hugs) must not
+    // veto the escape.
+    constexpr double kRearProbeHorizon = 0.20;  // m
+    const double remaining = std::max(0.0, cfg.max_dist_m - reverse_distance_done_);
+    const double back_probe = std::min(kRearProbeHorizon, remaining);
+    const double yaw = tf2::getYaw(robot_pose.pose.orientation);
+    geometry_msgs::msg::PoseStamped rear = robot_pose;
+    rear.pose.position.x -= back_probe * std::cos(yaw);
+    rear.pose.position.y -= back_probe * std::sin(yaw);
+    rear_clear = !ObstacleDeviation::footprintBlocked(*costmap_map_,
+                                                      rear,
+                                                      0.0,
+                                                      footprint,
+                                                      ObstacleDeviation::BoundaryGuard{},
+                                                      ObstacleDeviation::kLethalOnlyThreshold);
+  }
+
+  const ReverseEscapeAction action =
+      have_pose ? ReverseEscapeDecide(cfg, reverse_distance_done_, rear_clear)
+                : ReverseEscapeAction::kExhausted;
+
+  if (action == ReverseEscapeAction::kReverse)
+  {
+    if (!reverse_escape_active_)
+    {
+      RCLCPP_WARN(logger_,
+                  "FTCController: WEDGED (%s) — bounded straight reverse-escape (<= %.2fm at "
+                  "%.2f m/s), rear footprint clear.",
+                  reason.c_str(),
+                  cfg.max_dist_m,
+                  cfg.speed_mps);
+    }
+    reverse_escape_active_ = true;
+    // A reverse-escape is an ACTIVE maneuver, not a passive hold — drop any
+    // wait state so the two states never fight over cmd_vel.
+    obstacle_waiting_ = false;
+    obstacle_wait_start_.reset();
+    return true;  // caller returns; computeVelocityCommands emits the reverse.
+  }
+
+  // kNone (disabled) or kExhausted (budget spent / rear blocked / no footprint
+  // or robot pose): give up on reversing and fall through to the wait-before-
+  // abort behaviour.
+  if (reverse_escape_active_)
+  {
+    RCLCPP_WARN(logger_,
+                "FTCController: reverse-escape exhausted after %.2fm (%s) — holding/aborting.",
+                reverse_distance_done_,
+                reason.c_str());
+  }
+  reverse_escape_active_ = false;
+  return waitOrThrowForObstacle(reason);
 }
 
 void FTCController::updateLateralDeviation(double dt)
@@ -1311,8 +1831,150 @@ void FTCController::updateLateralDeviation(double dt)
   // all read costmap cells and would otherwise race the costmap update thread.
   std::lock_guard<nav2_costmap_2d::Costmap2D::mutex_t> costmap_lock(*costmap_map_->getMutex());
 
-  const std::size_t start_idx = std::min(static_cast<std::size_t>(current_index_),
-                                         global_plan_.size() - 1);
+  const std::size_t start_idx =
+      std::min(static_cast<std::size_t>(current_index_), global_plan_.size() - 1);
+
+  // Sample obstacles in the COSTMAP frame, not the path frame. global_plan_ is
+  // in the plan frame (map); costmap_map_ is the local costmap in its own
+  // global frame (odom). map->odom is NOT identity here — fusion_graph_node
+  // publishes it and it absorbs all GPS corrections — so feeding raw map-frame
+  // path coords into worldToMap() samples the WRONG cells (almost always free /
+  // off-window) and the obstacle is never detected: the robot drives the
+  // nominal line straight into it, while collision_monitor (which reads
+  // /scan_costmap in the robot frame) is the only thing that reacts. Transform
+  // the lookahead window into the costmap frame BEFORE sampling, then index it
+  // from 0 (the ObstacleDeviation helpers clamp to the window size).
+  std::vector<geometry_msgs::msg::PoseStamped> window;
+  {
+    const std::size_t win_end =
+        std::min(global_plan_.size(),
+                 start_idx + static_cast<std::size_t>(std::max(0, config_.obstacle_lookahead)));
+    const std::string costmap_frame = costmap_ros_->getGlobalFrameID();
+    const std::string plan_frame = global_plan_[start_idx].header.frame_id;
+    window.reserve(win_end - start_idx);
+    if (plan_frame.empty() || plan_frame == costmap_frame)
+    {
+      window.assign(global_plan_.begin() + static_cast<std::ptrdiff_t>(start_idx),
+                    global_plan_.begin() + static_cast<std::ptrdiff_t>(win_end));
+    }
+    else
+    {
+      geometry_msgs::msg::TransformStamped plan_to_costmap;
+      try
+      {
+        plan_to_costmap =
+            tf_buffer_->lookupTransform(costmap_frame, plan_frame, tf2::TimePointZero);
+      }
+      catch (const tf2::TransformException& ex)
+      {
+        // Without the transform we cannot sample obstacles correctly. Skip
+        // avoidance this tick (next tick retries) rather than act on garbage
+        // cells — never silently fall back to the broken raw-coord sampling.
+        RCLCPP_WARN_THROTTLE(logger_,
+                             *clock_,
+                             2000,
+                             "FTCController: obstacle-deviation TF %s->%s failed (%s) — "
+                             "skipping avoidance this tick",
+                             plan_frame.c_str(),
+                             costmap_frame.c_str(),
+                             ex.what());
+        return;
+      }
+      for (std::size_t i = start_idx; i < win_end; ++i)
+      {
+        geometry_msgs::msg::PoseStamped p;
+        tf2::doTransform(global_plan_[i], p, plan_to_costmap);
+        window.push_back(p);
+      }
+    }
+  }
+
+  // Build the zone-boundary guard for the lateral-OFFSET checks only. The
+  // offset sample points are the window poses, which were transformed into the
+  // local-costmap (odom) frame above; the boundary costmap lives in the global-
+  // costmap (map) frame. So the guard's affine maps boundary_frame <- odom
+  // (map <- odom). An offset that would skirt the robot out of the mowing zone
+  // (lethal in the boundary costmap) is then rejected; if the only obstacle-
+  // clear side exits the zone, growDeviationUntilClear exceeds the cap and the
+  // existing wait-or-abort path stops the robot instead of leaving. The mutex
+  // is held for the rest of the function so the helpers can read boundary_costmap_.
+  std::unique_lock<std::mutex> boundary_lock(boundary_mutex_, std::defer_lock);
+  ObstacleDeviation::BoundaryGuard guard{};
+  if (config_.confine_deviation_to_zone)
+  {
+    boundary_lock.lock();
+    if (boundary_costmap_ == nullptr)
+    {
+      // Fail-safe: global costmap not received yet — we cannot know where the
+      // zone boundary is, so refuse to deviate blind (skip this tick, same
+      // posture as the TF-missing path).
+      RCLCPP_WARN_THROTTLE(logger_,
+                           *clock_,
+                           5000,
+                           "FTCController: confine_deviation_to_zone but no global costmap "
+                           "received yet — skipping obstacle deviation this tick.");
+      return;
+    }
+    const std::string costmap_frame = costmap_ros_->getGlobalFrameID();
+    try
+    {
+      const auto tf =
+          tf_buffer_->lookupTransform(boundary_frame_, costmap_frame, tf2::TimePointZero);
+      const double yaw = tf2::getYaw(tf.transform.rotation);
+      guard.costmap = boundary_costmap_.get();
+      guard.tx = tf.transform.translation.x;
+      guard.ty = tf.transform.translation.y;
+      guard.cos_yaw = std::cos(yaw);
+      guard.sin_yaw = std::sin(yaw);
+    }
+    catch (const tf2::TransformException& ex)
+    {
+      RCLCPP_WARN_THROTTLE(logger_,
+                           *clock_,
+                           5000,
+                           "FTCController: no transform %s <- %s for boundary guard (%s) — "
+                           "skipping obstacle deviation this tick.",
+                           boundary_frame_.c_str(),
+                           costmap_frame.c_str(),
+                           ex.what());
+      return;
+    }
+  }
+
+  // Zone MASK for the obstacle-DETECTION checks (issue #517) — the same guard,
+  // used in the opposite direction: a lethal LOCAL cell that is ALSO lethal in
+  // the boundary costmap (out-of-zone / keepout hole) is NOT an obstacle. The
+  // path ends chassis_safety_inset inside the boundary and U-turns there, so at
+  // every row end the lookahead footprints reach the hedge the boundary was
+  // recorded along — a real LiDAR return the robot was never going to drive
+  // into. guard.costmap is non-null only when confine_deviation_to_zone is on
+  // AND the global costmap has arrived, so the mask is inert otherwise (old
+  // behaviour). In-zone obstacles are unaffected.
+  const ObstacleDeviation::BoundaryGuard zone_mask =
+      config_.ignore_obstacles_outside_zone ? guard : ObstacleDeviation::BoundaryGuard{};
+
+  // Robot chassis FOOTPRINT (base frame), fetched once per tick when
+  // use_footprint_clearance is on. Passed to the ObstacleDeviation helpers so
+  // they sample the true rectangular body (at true-lethal 254) instead of the
+  // ±half_width swept line (at inscribed 253). Detection uses the raw footprint;
+  // the CLEARANCE search uses a laterally-expanded copy (+obstacle_clearance_
+  // margin) so pass-by room grows without widening detection reach — the exact
+  // split the half-width model expressed via clearanceHalfWidth(). An EMPTY
+  // footprint (feature off, or none published) makes every helper fall back to
+  // the half_width line model, so behaviour is unchanged in that case.
+  ObstacleDeviation::Footprint detect_footprint;
+  ObstacleDeviation::Footprint clearance_footprint;
+  if (config_.use_footprint_clearance)
+  {
+    detect_footprint = costmap_ros_->getRobotFootprint();
+    // Clearance (skirt) search probes only the FRONT of the chassis, then
+    // widens it laterally by the margin — the "less-conservative footprint"
+    // middle ground (spec Part A). Detection keeps the full footprint above.
+    clearance_footprint = ObstacleDeviation::expandFootprintLateral(
+        ObstacleDeviation::clipFootprintFront(detect_footprint,
+                                              config_.obstacle_footprint_front_length_m),
+        std::max(0.0, config_.obstacle_clearance_margin));
+  }
 
   // The decision to STOP avoiding must be gated on whether the NOMINAL path
   // (zero deviation) is clear within the lookahead — i.e. has the robot
@@ -1325,23 +1987,94 @@ void FTCController::updateLateralDeviation(double dt)
   // "entering AVOIDANCE ... at idx=N" / "AVOIDANCE complete" pairs at the
   // same idx). The robot never offset enough to skirt anything; the
   // sub-deadband ±step carrot shift just dithered it left-right in place.
-  const bool clear_at_zero = ObstacleDeviation::isPathClearWithDeviation(
-      *costmap_map_, global_plan_, start_idx, config_.obstacle_lookahead, 0.0);
+  // Body-aware (footprint, else ±obstacle_body_half_width), NOT just the path
+  // centerline — otherwise an obstacle in the lateral band the chassis hits but
+  // the inscribed-inflation radius misses never flips clear_at_zero false, so
+  // avoidance never engages. No zone guard here: this asks "does the body hit an
+  // obstacle on the nominal line", independent of the mowing-zone boundary —
+  // but the zone MASK applies, so an out-of-zone lethal is not "an obstacle".
+  const bool clear_at_zero =
+      ObstacleDeviation::isPathClearWithDeviation(*costmap_map_,
+                                                  window,
+                                                  0,
+                                                  config_.obstacle_lookahead,
+                                                  0.0,
+                                                  ObstacleDeviation::BoundaryGuard{},
+                                                  config_.obstacle_body_half_width,
+                                                  detect_footprint,
+                                                  zone_mask);
 
   if (clear_at_zero)
   {
-    // No obstacle on the nominal path ahead — either we never needed to
-    // avoid, or the robot has physically driven past the obstacle. Blend
-    // the offset back to zero and exit AVOIDANCE once settled.
-    target_lateral_deviation_ = 0.0;
-    if (is_avoiding_ && std::abs(lateral_deviation_) < 0.01)
+    // Nominal path is clear ahead — the wedge (if any) is gone. Cancel any
+    // reverse-escape in progress so it can't leak forward motion into a fresh
+    // block, and hand a full budget to the next genuine wedge.
+    reverse_escape_active_ = false;
+    reverse_distance_done_ = 0.0;
+    if (is_avoiding_)
     {
-      is_avoiding_ = false;
-      RCLCPP_INFO(logger_, "FTCController: AVOIDANCE complete, back on path.");
+      // The nominal path reads clear — but the obstacle sits at the
+      // lookahead-window edge and the observation_persistence:0 costmap
+      // re-marks it each scan, so this test flickers true/false. Blending the
+      // skirt back at the FIRST clear tick (the old behaviour) caused the
+      // ±step left-right flap: complete → re-enter on the other side, never
+      // growing a deviation big enough to actually go around. HOLD the
+      // committed skirt until the path has stayed clear CONTINUOUSLY for
+      // obstacle_clear_hold_s — i.e. the robot has physically passed the
+      // obstacle — then blend back and finish.
+      if (!avoidance_clear_start_.has_value())
+      {
+        avoidance_clear_start_ = clock_->now();
+      }
+      const double clear_for = (clock_->now() - avoidance_clear_start_.value()).seconds();
+      if (clear_for >= config_.obstacle_clear_hold_s)
+      {
+        target_lateral_deviation_ = 0.0;
+        if (std::abs(lateral_deviation_) < 0.01)
+        {
+          is_avoiding_ = false;
+          avoidance_clear_start_.reset();
+          RCLCPP_INFO(logger_,
+                      "FTCController: AVOIDANCE complete (path clear for %.1fs), back on path.",
+                      clear_for);
+        }
+      }
+      // else: keep target_lateral_deviation_ at its committed value — hold the
+      // skirt through the flicker; do NOT zero it yet.
+    }
+    else
+    {
+      // Not avoiding, but possibly WAITING (both-sides-blocked / needs-more-
+      // than-max, set by waitOrThrowForObstacle below). Same window-edge
+      // flicker risk as the is_avoiding_ branch above — the observation_
+      // persistence:0 costmap can transiently miss the obstacle cell for one
+      // tick. Require a sustained clear (obstacle_clear_hold_s, same field as
+      // the avoidance case) before releasing the wait; otherwise a single-
+      // tick flicker falls through to the obstacle_waiting_ clear below and
+      // resets obstacle_wait_start_, deferring the abort indefinitely.
+      if (obstacle_waiting_)
+      {
+        if (!avoidance_clear_start_.has_value())
+        {
+          avoidance_clear_start_ = clock_->now();
+        }
+        const double clear_for = (clock_->now() - avoidance_clear_start_.value()).seconds();
+        if (clear_for < config_.obstacle_clear_hold_s)
+        {
+          return;  // still holding zero velocity via obstacle_waiting_
+        }
+        avoidance_clear_start_.reset();
+      }
+      // Not avoiding and the path is clear: nominal line tracking.
+      target_lateral_deviation_ = 0.0;
     }
   }
   else
   {
+    // Obstacle (re)appeared on the nominal path — still committed. Cancel any
+    // pending clear-hold so a brief clear gap between scans doesn't count
+    // toward completion (the skirt holds until a SUSTAINED clear).
+    avoidance_clear_start_.reset();
     // Obstacle present on the nominal path within the lookahead. Commit to a
     // deviation that keeps the OFFSET path clear and HOLD it until the robot
     // has passed the obstacle (clear_at_zero becomes true). The deviation is
@@ -1349,27 +2082,69 @@ void FTCController::updateLateralDeviation(double dt)
     // reduce it toward the path here, which is what stopped the flap.
     if (!is_avoiding_)
     {
-      const int obs_idx = ObstacleDeviation::findFirstObstacleIndex(
-          *costmap_map_, global_plan_, start_idx, config_.obstacle_lookahead);
+      const int obs_idx =
+          ObstacleDeviation::findFirstObstacleIndex(*costmap_map_,
+                                                    window,
+                                                    0,
+                                                    config_.obstacle_lookahead,
+                                                    config_.obstacle_body_half_width,
+                                                    detect_footprint,
+                                                    zone_mask);
       if (obs_idx < 0)
       {
         // Footprint collision but no path-pose hit (e.g. inflated cell next
         // to robot from a transient scan return) — nothing to deviate around.
         return;
       }
-      target_lateral_deviation_ = ObstacleDeviation::chooseDeviationSide(
-          *costmap_map_,
-          global_plan_[static_cast<std::size_t>(obs_idx)],
-          config_.max_lateral_deviation,
-          config_.deviation_step);
+      // Cul-de-sac guard (spec Part A): only skirt an obstacle whose FAR edge is
+      // visible inside the lookahead. If the obstacle stays blocked to the end of
+      // the window (a wall / pocket), skirting sideways boxes the robot in — the
+      // exact wedge this spec targets. Refuse the skirt and hand off to the
+      // bounded reverse-escape / wait-or-abort path; the coverage detour-and-
+      // continue net (decideDetour) then routes a blade-off transit around it.
+      if (config_.require_clear_exit &&
+          !ObstacleDeviation::hasClearExit(*costmap_map_,
+                                           window,
+                                           0,
+                                           config_.obstacle_lookahead,
+                                           config_.obstacle_body_half_width,
+                                           detect_footprint,
+                                           zone_mask))
+      {
+        if (reverseEscapeOrWait("no clear exit past obstacle — refusing to skirt into a pocket",
+                                detect_footprint,
+                                dt))
+        {
+          return;
+        }
+        // Wait window elapsed without the far edge appearing — throw to abort the
+        // strip (waitOrThrowForObstacle throws once past the timeout), letting the
+        // BT escalate to the coverage detour. Returning here would re-enter this
+        // same branch every tick. reverseEscapeOrWait only returns false after it
+        // has thrown, so this line is unreachable, but keep the return for safety.
+        return;
+      }
+      // Side choice is a CLEARANCE question ("which side has room for the
+      // body plus margin to pass"), so it uses the widened footprint (or
+      // half-width) — not the bare detection body used by findFirstObstacleIndex
+      // above.
+      target_lateral_deviation_ =
+          ObstacleDeviation::chooseDeviationSide(*costmap_map_,
+                                                 window[static_cast<std::size_t>(obs_idx)],
+                                                 config_.max_lateral_deviation,
+                                                 config_.deviation_step,
+                                                 guard,
+                                                 clearanceHalfWidth(),
+                                                 clearance_footprint);
       if (target_lateral_deviation_ == 0.0)
       {
-        // Both sides blocked at the obstacle pose. Before bailing, hold a
-        // wait window so transient costmap state (LIDAR noise, a person
-        // crossing the path, inflation around the dock not yet cleared
-        // by post-undock observations) can clear without burning a BT
+        // Both sides blocked at the obstacle pose. Before bailing, try a
+        // bounded straight reverse-escape (rear footprint permitting), then
+        // fall back to holding a wait window so transient costmap state (LIDAR
+        // noise, a person crossing the path, inflation around the dock not yet
+        // cleared by post-undock observations) can clear without burning a BT
         // retry.
-        if (waitOrThrowForObstacle("obstacle blocks both sides, cannot skirt"))
+        if (reverseEscapeOrWait("obstacle blocks both sides, cannot skirt", detect_footprint, dt))
         {
           return;
         }
@@ -1379,24 +2154,33 @@ void FTCController::updateLateralDeviation(double dt)
       // nonzero here (the both-sides-blocked path above either waits and
       // returns or throws, so we never reach this with target == 0).
       avoid_sign_ = (target_lateral_deviation_ >= 0.0) ? 1.0 : -1.0;
-      obstacle_wait_start_.reset();
-      obstacle_waiting_ = false;
+      // Do NOT clear obstacle_wait_start_/obstacle_waiting_ here. Finding a
+      // candidate side only means we skip the both-sides-blocked wait call
+      // below (line ~1659 above) — growDeviationUntilClear (below) can still
+      // reject this same candidate for exceeding max_lateral_deviation and
+      // re-enter waitOrThrowForObstacle. Clearing the clock here first would
+      // hand that second call a fresh 5s window every time chooseDeviationSide
+      // flip-flops between "found a side" and "both sides blocked" near a
+      // marginal gap — silently deferring the abort indefinitely (field:
+      // observed ~40s stall, cmd_vel pinned at zero, vs. the intended 5s cap).
+      // The wait state is cleared once, below, only after a candidate has
+      // genuinely passed the max_lateral_deviation check.
       RCLCPP_INFO(logger_,
                   "FTCController: entering AVOIDANCE (target_dev=%.2fm at idx=%d)",
                   target_lateral_deviation_,
-                  obs_idx);
+                  static_cast<int>(start_idx) + obs_idx);
     }
 
     // Floor the SEARCH START to min_lateral_deviation. growDeviationUntilClear
-    // only samples the single offset point per pose, so a one-step (0.05 m)
-    // offset can "clear" the path centerline while the 0.40 m chassis still
-    // overlaps the lethal cell (the costmap's inscribed-inflation radius here
-    // is only ~0.10 m — the footprint rear edge — far less than the 0.20 m
-    // half-width). Starting the search at min makes grow validate clearance
-    // from a body-width offset upward, and grow still increases past min (or
-    // reports > max) if min itself is blocked — so this never forces the
-    // carrot into an obstacle the way a blind post-grow floor would, since
-    // clearance is not monotonic in the offset.
+    // now samples the full chassis width (±obstacle_body_half_width per pose),
+    // so a one-step offset can no longer "clear" the centerline while the body
+    // still overlaps the obstacle. This floor is retained as a secondary guard:
+    // it makes AVOIDANCE commit to a real, human-visible skirt (≥ a body
+    // half-width + margin) rather than a sub-deadband 5 cm carrot nudge, and it
+    // gives margin beyond the exact body edge. grow still increases past min (or
+    // reports > max) if min itself is blocked — so this never forces the carrot
+    // into an obstacle the way a blind post-grow floor would, since clearance is
+    // not monotonic in the offset.
     double dev_init = target_lateral_deviation_;
     if (config_.min_lateral_deviation > 0.0 && std::abs(dev_init) < config_.min_lateral_deviation)
     {
@@ -1413,33 +2197,41 @@ void FTCController::updateLateralDeviation(double dt)
     // Grow the deviation until the offset path is clear (keeps current side).
     target_lateral_deviation_ =
         ObstacleDeviation::growDeviationUntilClear(*costmap_map_,
-                                                   global_plan_,
-                                                   start_idx,
+                                                   window,
+                                                   0,
                                                    config_.obstacle_lookahead,
                                                    dev_init,
                                                    config_.max_lateral_deviation,
-                                                   config_.deviation_step);
+                                                   config_.deviation_step,
+                                                   guard,
+                                                   clearanceHalfWidth(),
+                                                   clearance_footprint);
 
     if (std::abs(target_lateral_deviation_) > config_.max_lateral_deviation)
     {
-      // Same wait-before-abort as the both-sides-blocked case. If the
+      // Same reverse-escape-then-wait as the both-sides-blocked case. If the
       // obstacle is transient, the next tick will pull target_dev back
       // under the cap and we resume cleanly.
-      if (waitOrThrowForObstacle("lateral deviation needed > max_lateral_deviation"))
+      if (reverseEscapeOrWait("lateral deviation needed > max_lateral_deviation",
+                              detect_footprint,
+                              dt))
       {
         return;
       }
     }
   }
 
-  // Path is now followable inside the deviation cap. Clear any pending
-  // wait state so the next blockage starts its own fresh wait window.
+  // Path is now followable inside the deviation cap — we are not wedged. Clear
+  // any pending wait / reverse-escape state so the next blockage starts its own
+  // fresh wait window and full reverse budget.
   if (obstacle_waiting_)
   {
     RCLCPP_INFO(logger_, "FTCController: obstacle cleared, resuming after wait.");
     obstacle_waiting_ = false;
     obstacle_wait_start_.reset();
   }
+  reverse_escape_active_ = false;
+  reverse_distance_done_ = 0.0;
 
   // Step 2: slew lateral_deviation_ toward target_lateral_deviation_ at the
   // configured blend rate (m/s of lateral shift).

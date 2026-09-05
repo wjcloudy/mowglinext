@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Alert, Button, Card, Input, Space, Table, Typography, Popconfirm } from "antd";
 import { CodeOutlined, DeleteOutlined, PlusOutlined } from "@ant-design/icons";
+import { useTranslation } from "react-i18next";
 
 const { Text } = Typography;
 
@@ -11,6 +12,7 @@ type Props = {
 };
 
 export const AdvancedSection: React.FC<Props> = ({ values, advancedKeys, onChange }) => {
+    const { t } = useTranslation();
     const [newKey, setNewKey] = useState("");
     const [newValue, setNewValue] = useState("");
 
@@ -44,8 +46,11 @@ export const AdvancedSection: React.FC<Props> = ({ values, advancedKeys, onChang
         onChange(key, parsed);
     };
 
+    // Hide keys that are undefined OR marked-for-deletion (null). handleDelete
+    // sets the value to null so the delete reaches the backend on save; the row
+    // must disappear immediately rather than linger showing an empty input.
     const dataSource = advancedKeys
-        .filter((k) => values[k] !== undefined)
+        .filter((k) => values[k] != null)
         .sort()
         .map((key) => ({
             key,
@@ -59,8 +64,8 @@ export const AdvancedSection: React.FC<Props> = ({ values, advancedKeys, onChang
                 type="info"
                 showIcon
                 icon={<CodeOutlined />}
-                message="Advanced parameters"
-                description="These are raw YAML parameters not covered by the sections above. Edit with care — invalid values can break the robot configuration."
+                message={t("settingsAdvanced.advancedParameters")}
+                description={t("settingsAdvanced.advancedParametersDescription")}
                 style={{ marginBottom: 16 }}
             />
 
@@ -69,10 +74,10 @@ export const AdvancedSection: React.FC<Props> = ({ values, advancedKeys, onChang
                     dataSource={dataSource}
                     pagination={false}
                     size="small"
-                    locale={{ emptyText: "No extra parameters defined" }}
+                    locale={{ emptyText: t("settingsAdvanced.noExtraParameters") }}
                     columns={[
                         {
-                            title: "Parameter",
+                            title: t("settingsAdvanced.parameter"),
                             dataIndex: "name",
                             key: "name",
                             width: "40%",
@@ -81,7 +86,7 @@ export const AdvancedSection: React.FC<Props> = ({ values, advancedKeys, onChang
                             ),
                         },
                         {
-                            title: "Value",
+                            title: t("settingsAdvanced.value"),
                             dataIndex: "value",
                             key: "value",
                             render: (val: any, record: any) => (
@@ -99,10 +104,10 @@ export const AdvancedSection: React.FC<Props> = ({ values, advancedKeys, onChang
                             width: 40,
                             render: (_: any, record: any) => (
                                 <Popconfirm
-                                    title="Remove this parameter?"
+                                    title={t("settingsAdvanced.removeThisParameter")}
                                     onConfirm={() => handleDelete(record.name)}
-                                    okText="Remove"
-                                    cancelText="Cancel"
+                                    okText={t("settingsAdvanced.remove")}
+                                    cancelText={t("settingsAdvanced.cancel")}
                                 >
                                     <Button
                                         type="text"
@@ -117,7 +122,7 @@ export const AdvancedSection: React.FC<Props> = ({ values, advancedKeys, onChang
                 />
             </Card>
 
-            <Card size="small" title="Add Parameter" style={{ marginBottom: 16 }}>
+            <Card size="small" title={t("settingsAdvanced.addParameter")} style={{ marginBottom: 16 }}>
                 <Space.Compact style={{ width: "100%" }}>
                     <Input
                         placeholder="parameter_name"
@@ -127,7 +132,7 @@ export const AdvancedSection: React.FC<Props> = ({ values, advancedKeys, onChang
                         onPressEnter={handleAdd}
                     />
                     <Input
-                        placeholder="value"
+                        placeholder={t("settingsAdvanced.valuePlaceholder")}
                         value={newValue}
                         onChange={(e) => setNewValue(e.target.value)}
                         style={{ flex: 1, fontFamily: "monospace", fontSize: 12 }}
@@ -139,7 +144,7 @@ export const AdvancedSection: React.FC<Props> = ({ values, advancedKeys, onChang
                         onClick={handleAdd}
                         disabled={!newKey.trim()}
                     >
-                        Add
+                        {t("settingsAdvanced.add")}
                     </Button>
                 </Space.Compact>
             </Card>

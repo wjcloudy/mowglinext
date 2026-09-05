@@ -1,14 +1,19 @@
 import {motion} from "framer-motion";
-import {Play, Square, Home, AlertTriangle} from "lucide-react";
+import {Play, Pause, Home, AlertTriangle, RotateCcw} from "lucide-react";
+import {useTranslation} from "react-i18next";
 import {pressFeedback, springSnap} from "../motion";
+import {useThemeMode} from "../../theme/ThemeContext.tsx";
 
 /**
  * Primary action cluster -- big Play (lime gradient w/ inner shine), with a
  * Home + emergency-Stop as glass secondaries. State drives the primary:
- * idle shows Play (start mowing); "playing" morphs it to a Square that
- * stops the run and returns to the dock (there is NO true pause — the
- * "playing" primary maps to the same HOME command as the Home secondary, so
- * the glyph + label say "stop & return", not "pause", to match reality).
+ * idle shows Play (start mowing); "playing" morphs it to a Pause glyph that
+ * issues a true stop-in-place (COMMAND_STOP=8 → StopHoldSequence: mower off,
+ * halt in place, Nav2 left up so the mission can resume, no dock drive). The
+ * separate Home secondary still maps to the HOME command (return to dock). In
+ * "alert" (latched emergency) it becomes a Re-arm button that
+ * clears the emergency, otherwise the operator is stuck (Play is inert while
+ * the EmergencyGuard halts the tree).
  */
 
 type Phase = "idle" | "playing" | "returning" | "alert";
@@ -19,10 +24,14 @@ interface ActionClusterProps {
   onPause: () => void;
   onHome: () => void;
   onStop: () => void;
+  onRearm: () => void;
 }
 
-export function ActionCluster({phase, onStart, onPause, onHome, onStop}: ActionClusterProps) {
+export function ActionCluster({phase, onStart, onPause, onHome, onStop, onRearm}: ActionClusterProps) {
+  const {t} = useTranslation();
+  const {displayMode} = useThemeMode();
   const primaryPlaying = phase === "playing";
+  const primaryAlert = phase === "alert";
 
   return (
     <div style={{
@@ -30,18 +39,23 @@ export function ActionCluster({phase, onStart, onPause, onHome, onStop}: ActionC
     }}>
       {/* secondary: stop */}
       <SecondaryButton
-        ariaLabel="Stop d'urgence"
+        ariaLabel={t('actionCluster.emergencyStop')}
         onClick={onStop}
         tone="danger"
+        displayMode={displayMode}
       >
         <AlertTriangle size={20} strokeWidth={2.2}/>
       </SecondaryButton>
 
-      {/* primary: play / pause */}
+      {/* primary: re-arm (latched emergency) / pause-in-place (playing) / play */}
       <motion.button
         {...pressFeedback}
-        onClick={primaryPlaying ? onPause : onStart}
-        aria-label={primaryPlaying ? "Arrêter et rentrer à la base" : "Démarrer la tonte"}
+        onClick={primaryAlert ? onRearm : primaryPlaying ? onPause : onStart}
+        aria-label={primaryAlert
+          ? t('actionCluster.rearm')
+          : primaryPlaying
+            ? t('actionCluster.pause')
+            : t('actionCluster.startMowing')}
         style={{
           position: "relative",
           width: 84, height: 84, borderRadius: "50%",
@@ -53,38 +67,39 @@ export function ActionCluster({phase, onStart, onPause, onHome, onStop}: ActionC
           overflow: "hidden",
         }}
       >
-        {/* inner shine sweep -- clip to the circle by inheriting the parent's
-            border-radius (overflow:hidden on the framer-motion button is
-            unreliable because the press transform creates a new stacking
-            context). */}
+        {/* Visual mode restores the moving sheen; the other modes preserve
+            the same action hierarchy without its continuous compositing. */}
         <span aria-hidden style={{
           position: "absolute", inset: 0,
           borderRadius: "inherit",
           background: "linear-gradient(115deg, transparent 25%, rgba(255,255,255,0.45) 50%, transparent 75%)",
           mixBlendMode: "overlay",
           opacity: 0.55,
-          transform: "translateX(-100%)",
-          animation: "concept-shine 3.6s var(--ease-out) infinite",
+          transform: displayMode === "visual" ? "translateX(-100%)" : undefined,
+          animation: displayMode === "visual" ? "concept-shine 3.6s var(--ease-out) infinite" : undefined,
           pointerEvents: "none",
         }}/>
         <motion.div
-          key={primaryPlaying ? "pause" : "play"}
+          key={primaryAlert ? "rearm" : primaryPlaying ? "pause" : "play"}
           initial={{scale: 0.6, opacity: 0}}
           animate={{scale: 1, opacity: 1}}
           transition={springSnap}
           style={{position: "relative"}}
         >
-          {primaryPlaying
-            ? <Square size={28} strokeWidth={2.4} fill="currentColor"/>
-            : <Play  size={32} strokeWidth={2.4} fill="currentColor" style={{marginLeft: 3}}/>}
+          {primaryAlert
+            ? <RotateCcw size={28} strokeWidth={2.4}/>
+            : primaryPlaying
+              ? <Pause size={28} strokeWidth={2.4} fill="currentColor"/>
+              : <Play size={32} strokeWidth={2.4} fill="currentColor" style={{marginLeft: 3}}/>}
         </motion.div>
       </motion.button>
 
       {/* secondary: home */}
       <SecondaryButton
-        ariaLabel="Retour à la base"
+        ariaLabel={t('actionCluster.returnToBase')}
         onClick={onHome}
         tone={phase === "returning" ? "active" : "default"}
+        displayMode={displayMode}
       >
         <Home size={20} strokeWidth={2.2}/>
       </SecondaryButton>
@@ -97,9 +112,10 @@ interface SecondaryProps {
   ariaLabel: string;
   onClick: () => void;
   tone?: "default" | "active" | "danger";
+  displayMode: "visual" | "balanced" | "efficient";
 }
 
-function SecondaryButton({children, ariaLabel, onClick, tone = "default"}: SecondaryProps) {
+function SecondaryButton({children, ariaLabel, onClick, tone = "default", displayMode}: SecondaryProps) {
   const colors = {
     default: {bg: "var(--bg-elevated)",       border: "var(--border-soft)",  color: "var(--ink)"},
     active:  {bg: "rgba(69,214,232,0.14)",    border: "rgba(69,214,232,0.5)", color: "var(--aurora-cyan)"},
@@ -116,7 +132,7 @@ function SecondaryButton({children, ariaLabel, onClick, tone = "default"}: Secon
         border: `1px solid ${colors.border}`,
         color: colors.color,
         display: "flex", alignItems: "center", justifyContent: "center",
-        backdropFilter: "blur(20px)",
+        backdropFilter: displayMode === "visual" ? "blur(20px)" : undefined,
       }}
     >
       {children}

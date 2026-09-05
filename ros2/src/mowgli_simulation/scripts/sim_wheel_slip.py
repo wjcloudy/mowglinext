@@ -3,10 +3,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """
-sim_wheel_slip.py — SIMULATION ONLY
+sim_wheel_slip.py — SIMULATION ONLY.
 
-Relays /wheel_odom_raw (Gazebo ground-truth) → /wheel_odom (what the EKF
-sees), with periodic short slip events that briefly inflate the reported
+Relays /wheel_odom_raw (the sim's ground-truth wheel odometry) →
+/wheel_odom (what the localizer sees), with periodic short slip events
+that briefly inflate the reported
 longitudinal velocity. Models the encoder-vs-ground-truth divergence a
 real diff-drive robot sees on grass: wheel keeps rotating, encoder keeps
 ticking, but the chassis under-translates — so wheel_odom over-reports.
@@ -16,22 +17,25 @@ Default cycle (tunable via parameters):
   for    slip_duration_s (1.0 s),
   add    slip_vx_bias  (+0.05 m/s)  to twist.linear.x.
 
-Pose is passed through unchanged. The dual EKF only fuses /wheel_odom
-twist (not pose), so the slip surfaces as a transient encoder vs GPS /
-gyro divergence.
+Pose is passed through unchanged. fusion_graph's wheel between-factor
+uses the twist (not the pose), so the slip surfaces as a transient
+encoder-vs-GPS/gyro divergence — which is also what exercises the
+graph's slip veto and the hardware_bridge dig detector.
 
 Wiring
 ------
-  gazebo_bridge.yaml: ros_topic_name=/wheel_odom_raw  (was /wheel_odom)
-  this node:          /wheel_odom_raw -> /wheel_odom
+  wheel_odometry_node (sim): -> /wheel_odom_raw
+  this node:                 /wheel_odom_raw -> /wheel_odom
 
-Safety: read-only consumer of one Gazebo-bridged topic, publishes a
-single sensor topic. No drive commands, no TF, no safety topic.
+Safety: read-only consumer of one sim topic, publishes a single sensor
+topic. No drive commands, no TF, no safety topic.
 """
 
 from __future__ import annotations
 
 from typing import Optional
+
+from nav_msgs.msg import Odometry
 
 import rclpy
 from rclpy.node import Node
@@ -41,33 +45,33 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
-from nav_msgs.msg import Odometry
 
 
 class SimWheelSlip(Node):
+
     def __init__(self) -> None:
-        super().__init__("sim_wheel_slip")
+        super().__init__('sim_wheel_slip')
 
         self._input_topic = str(
-            self.declare_parameter("input_topic", "/wheel_odom_raw").value
+            self.declare_parameter('input_topic', '/wheel_odom_raw').value
         )
         self._output_topic = str(
-            self.declare_parameter("output_topic", "/wheel_odom").value
+            self.declare_parameter('output_topic', '/wheel_odom').value
         )
         self._slip_period = float(
-            self.declare_parameter("slip_period_s", 30.0).value
+            self.declare_parameter('slip_period_s', 30.0).value
         )
         self._slip_duration = float(
-            self.declare_parameter("slip_duration_s", 1.0).value
+            self.declare_parameter('slip_duration_s', 1.0).value
         )
         self._slip_vx_bias = float(
-            self.declare_parameter("slip_vx_bias", 0.05).value
+            self.declare_parameter('slip_vx_bias', 0.05).value
         )
 
         if self._slip_duration >= self._slip_period:
             self.get_logger().warn(
-                "slip_duration_s (%.2f) >= slip_period_s (%.2f) — slip will be "
-                "permanent. Clamping duration to half-period."
+                'slip_duration_s (%.2f) >= slip_period_s (%.2f) — slip will be '
+                'permanent. Clamping duration to half-period.'
                 % (self._slip_duration, self._slip_period)
             )
             self._slip_duration = self._slip_period / 2.0
@@ -96,8 +100,8 @@ class SimWheelSlip(Node):
         self.create_timer(15.0, self._log_stats)
 
         self.get_logger().info(
-            "sim_wheel_slip ready: %s -> %s; slip every %.1fs for %.2fs at "
-            "+%.3f m/s longitudinal"
+            'sim_wheel_slip ready: %s -> %s; slip every %.1fs for %.2fs at '
+            '+%.3f m/s longitudinal'
             % (
                 self._input_topic,
                 self._output_topic,
@@ -121,7 +125,7 @@ class SimWheelSlip(Node):
             out.twist.twist.linear.x += self._slip_vx_bias
             self._slip_count += 1
         # Override covariance to match the real hardware_bridge values
-        # (hardware_bridge_node.cpp ~lines 1196-1212). gz-sim diff-drive
+        # (hardware_bridge_node.cpp ~lines 1196-1212). The sim's diff-drive
         # publishes default covariance which doesn't enforce the
         # non-holonomic constraint on vy. Without cov[7]=1e-4, GPS lateral
         # noise leaks into apparent sideways drift inside the EKF.
@@ -138,7 +142,7 @@ class SimWheelSlip(Node):
 
     def _log_stats(self) -> None:
         self.get_logger().info(
-            "sim_wheel_slip stats: slipped samples in last 15s = %d"
+            'sim_wheel_slip stats: slipped samples in last 15s = %d'
             % self._slip_count
         )
         self._slip_count = 0
@@ -156,5 +160,5 @@ def main(args=None) -> None:
         rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

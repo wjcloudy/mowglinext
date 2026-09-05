@@ -118,6 +118,8 @@ assert_contains "GNSS_BACKEND=universal (public runtime)" "GNSS_BACKEND=universa
 assert_contains "GNSS_STATUS_SOURCE=universal (default)" "GNSS_STATUS_SOURCE=universal" "$ENV_CONTENT"
 assert_contains "TFLUNA_FRONT_ENABLED=false (default)" "TFLUNA_FRONT_ENABLED=false" "$ENV_CONTENT"
 assert_contains "TFLUNA_EDGE_ENABLED=false (default)" "TFLUNA_EDGE_ENABLED=false" "$ENV_CONTENT"
+assert_contains "GNSS fallback comment explains .env role" "# GNSS_* values below are fallback-only first-boot defaults." "$ENV_CONTENT"
+assert_contains "GNSS fallback comment points to YAML/GUI" "# Active operator GNSS settings live in docker/config/mowgli/mowgli_robot.yaml and the GUI." "$ENV_CONTENT"
 legacy_protocol_key="GPS_""PROTOCOL="
 legacy_runtime_mode_key="GPS_""RUNTIME_MODE="
 legacy_port_key="GPS_""PORT="
@@ -146,6 +148,33 @@ else
   assert_not_contains "USB preset does not leak GPS_BY_ID" "$legacy_by_id_key" "$usb_env"
 fi
 
+section "install/.preset keeps GNSS_RECEIVER_FAMILY explicit through docker/.env"
+
+repo_unicore="$SANDBOX/repo_unicore"
+sandbox_repo "$repo_unicore"
+harness_init "$repo_unicore"
+
+cat > "$repo_unicore/install/.preset" <<'EOF'
+GNSS_RECEIVER_FAMILY=unicore
+GNSS_SERIAL_DEVICE=/dev/ttyAMA4
+GNSS_SERIAL_BAUD=921600
+LIDAR_ENABLED=false
+LIDAR_TYPE=none
+TFLUNA_FRONT_ENABLED=false
+TFLUNA_EDGE_ENABLED=false
+EOF
+
+load_preset_file "$repo_unicore/install/.preset"
+PRESET_LOADED=true
+
+if ! harness_run; then
+  fail "harness_run for install/.preset Unicore GNSS preset" "non-zero exit"
+else
+  unicore_env="$(cat "$repo_unicore/docker/.env")"
+  assert_contains "install/.preset writes GNSS_RECEIVER_FAMILY=unicore" "GNSS_RECEIVER_FAMILY=unicore" "$unicore_env"
+  assert_contains "install/.preset keeps GNSS_BACKEND=universal" "GNSS_BACKEND=universal" "$unicore_env"
+fi
+
 section "Custom feature image tags persist into docker/.env"
 
 repo_feature="$SANDBOX/repo_feature"
@@ -159,8 +188,8 @@ if ! harness_run; then
 else
   feature_env="$(cat "$repo_feature/docker/.env")"
   assert_contains "custom IMAGE_TAG written" "IMAGE_TAG=feat-universal-gnss-integration" "$feature_env"
-  assert_contains "custom GPS image tag written" "GPS_IMAGE=ghcr.io/cedbossneo/mowglinext/gps:feat-universal-gnss-integration" "$feature_env"
-  assert_contains "custom mowgli-ros2 image tag written" "MOWGLI_ROS2_IMAGE=ghcr.io/cedbossneo/mowglinext/mowgli-ros2:feat-universal-gnss-integration" "$feature_env"
+  assert_contains "custom GPS image tag written" "GPS_IMAGE=ghcr.io/mowglinext/mowglinext/gps:feat-universal-gnss-integration" "$feature_env"
+  assert_contains "custom mowgli-ros2 image tag written" "MOWGLI_ROS2_IMAGE=ghcr.io/mowglinext/mowglinext/mowgli-ros2:feat-universal-gnss-integration" "$feature_env"
 fi
 
 section "NTRIP env is written without leaking secrets to logs"

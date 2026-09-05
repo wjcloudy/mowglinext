@@ -24,11 +24,73 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <vector>
 
+#include <geometry_msgs/msg/point32.hpp>
 #include <geometry_msgs/msg/polygon.hpp>
 
 namespace mowgli_map
 {
+
+/// Two promoted obstacles whose centroids are within this many metres are
+/// treated as the SAME keepout. Chosen well below the obstacle-tracker's
+/// association_dist (0.5 m) and the default obstacle inflation (~0.15 m) so
+/// two genuinely distinct nearby obstacles are never collapsed, yet a
+/// re-promote or YAML reload of an identical polygon (centroid delta ≈ 0) is
+/// deduped. See apply_promoted_obstacle() and the area-load paths.
+constexpr double kObstacleDedupEpsilonM = 0.10;
+
+/// Default side of the square keepout stamped at a wheel-slip dig [m].
+/// One chassis LENGTH (the Nav2 robot_footprint is 0.60 m x 0.40 m). The
+/// previous default was one tool width (0.18 m) - narrower than the body,
+/// so "route around the dig" still dragged the chassis across it and issue
+/// #500 saw the robot re-latch a dig 3x in 18.4 s inside 0.13 m.
+constexpr double kDefaultDigKeepoutSizeM = 0.60;
+
+/// Hard floor for the dig keepout, whatever dig_obstacle_size is set to.
+/// Below one costmap cell the keepout cannot be represented at all.
+constexpr double kMinDigKeepoutSizeM = 0.05;
+
+/// Centroid (average vertex) of a polygon, in the polygon's own frame.
+inline geometry_msgs::msg::Point32 polygon_centroid(const geometry_msgs::msg::Polygon& poly)
+{
+  geometry_msgs::msg::Point32 c;
+  const auto& pts = poly.points;
+  if (pts.empty())
+  {
+    return c;
+  }
+  double sx = 0.0;
+  double sy = 0.0;
+  for (const auto& p : pts)
+  {
+    sx += static_cast<double>(p.x);
+    sy += static_cast<double>(p.y);
+  }
+  c.x = static_cast<float>(sx / static_cast<double>(pts.size()));
+  c.y = static_cast<float>(sy / static_cast<double>(pts.size()));
+  return c;
+}
+
+/// True when `candidate`'s centroid lies within `eps` metres of any existing
+/// polygon's centroid. Used to make obstacle promotion and YAML loading
+/// idempotent: a re-promote or reload of the same keepout becomes a no-op.
+inline bool has_duplicate_obstacle(const std::vector<geometry_msgs::msg::Polygon>& existing,
+                                   const geometry_msgs::msg::Polygon& candidate,
+                                   double eps)
+{
+  const auto cc = polygon_centroid(candidate);
+  for (const auto& poly : existing)
+  {
+    const auto ec = polygon_centroid(poly);
+    if (std::hypot(static_cast<double>(ec.x) - static_cast<double>(cc.x),
+                   static_cast<double>(ec.y) - static_cast<double>(cc.y)) <= eps)
+    {
+      return true;
+    }
+  }
+  return false;
+}
 
 /// Closest point on the polygon perimeter to (px, py), plus its distance.
 struct ClosestEdge

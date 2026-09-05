@@ -35,19 +35,26 @@ services:
       <<: *ros2-env
       HARDWARE_BACKEND: ${HARDWARE_BACKEND}
       GNSS_STACK: ${GNSS_STACK:-universal}
-      GNSS_RECEIVER_FAMILY: ${GNSS_RECEIVER_FAMILY:-auto}
-      GNSS_TRANSPORT: ${GNSS_TRANSPORT:-serial}
-      GNSS_SERIAL_DEVICE: ${GNSS_SERIAL_DEVICE:-/dev/gps}
-      GNSS_SERIAL_BAUD: ${GNSS_SERIAL_BAUD:-921600}
-      GNSS_FRAME_ID: ${GNSS_FRAME_ID:-gps_link}
-      GNSS_NTRIP_ENABLED: ${GNSS_NTRIP_ENABLED:-true}
-      GNSS_NTRIP_HOST: ${GNSS_NTRIP_HOST:-crtk.net}
-      GNSS_NTRIP_PORT: ${GNSS_NTRIP_PORT:-2101}
-      GNSS_NTRIP_MOUNTPOINT: ${GNSS_NTRIP_MOUNTPOINT:-NEAR}
-      GNSS_NTRIP_USERNAME: ${GNSS_NTRIP_USERNAME:-centipede}
-      GNSS_NTRIP_PASSWORD: ${GNSS_NTRIP_PASSWORD:-centipede}
-      GNSS_NTRIP_GGA_ENABLED: ${GNSS_NTRIP_GGA_ENABLED:-true}
-      GNSS_NTRIP_GGA_INTERVAL_S: ${GNSS_NTRIP_GGA_INTERVAL_S:-10}
+      # Pass these through WITHOUT hard defaults. They are fallback-only:
+      # start_gps.sh resolves runtime GNSS config as YAML explicit value first,
+      # then env fallback, then its own built-in default. An empty env value
+      # therefore means "not set" and must never override the bound
+      # mowgli_robot.yaml. Baking a default here would silently mask an
+      # operator's explicit YAML choice (for example ntrip_enabled:false, a
+      # custom frame_id, or a serial device selected in the GUI).
+      GNSS_RECEIVER_FAMILY: ${GNSS_RECEIVER_FAMILY:-}
+      GNSS_TRANSPORT: ${GNSS_TRANSPORT:-}
+      GNSS_SERIAL_DEVICE: ${GNSS_SERIAL_DEVICE:-}
+      GNSS_SERIAL_BAUD: ${GNSS_SERIAL_BAUD:-}
+      GNSS_FRAME_ID: ${GNSS_FRAME_ID:-}
+      GNSS_NTRIP_ENABLED: ${GNSS_NTRIP_ENABLED:-}
+      GNSS_NTRIP_HOST: ${GNSS_NTRIP_HOST:-}
+      GNSS_NTRIP_PORT: ${GNSS_NTRIP_PORT:-}
+      GNSS_NTRIP_MOUNTPOINT: ${GNSS_NTRIP_MOUNTPOINT:-}
+      GNSS_NTRIP_USERNAME: ${GNSS_NTRIP_USERNAME:-}
+      GNSS_NTRIP_PASSWORD: ${GNSS_NTRIP_PASSWORD:-}
+      GNSS_NTRIP_GGA_ENABLED: ${GNSS_NTRIP_GGA_ENABLED:-}
+      GNSS_NTRIP_GGA_INTERVAL_S: ${GNSS_NTRIP_GGA_INTERVAL_S:-}
     volumes:
       - /dev:/dev
       - ./docker/config/mowgli:/config:ro

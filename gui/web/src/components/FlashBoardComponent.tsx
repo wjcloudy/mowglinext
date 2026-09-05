@@ -14,10 +14,17 @@ import {
 } from "@formily/antd-v5";
 import {StyledTerminal} from "./StyledTerminal.tsx";
 import Terminal, {ColorMode, TerminalOutput} from "react-terminal-ui";
+import {useTranslation} from "react-i18next";
 import {createForm, onFieldValueChange} from "@formily/core";
 import {useApi} from "../hooks/useApi.ts";
 import {useIsMobile} from "../hooks/useIsMobile";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
+import {
+    applyFirmwareModelDefaults,
+    manualOverridesFromProvenance,
+    type FirmwareFieldOrigin,
+    type FirmwareSelection,
+} from "./firmwareModelDefaults.ts";
 
 const SchemaField = createSchemaField({
     components: {
@@ -36,7 +43,10 @@ type Config = {
     version: string,
     boardType: string,
     panelType: string,
-    debugType: string,
+    // "prebuilt" (default) flashes the tested binary; "custom" enables the
+    // expert compile-from-source path. This is the single control that decides.
+    firmwareSource: string,
+    expertBuild: boolean,
     disableEmergency: boolean,
     maxMps: number,
     maxChargeCurrent: number,
@@ -51,25 +61,67 @@ type Config = {
     imuOnboardInclinationThreshold: number,
     externalImuAcceleration: boolean,
     externalImuAngular: boolean,
-    masterJ18: boolean,
     tickPerM: number,
     wheelBase: number
     perimeterWire: boolean
+    boardTypeOrigin?: FirmwareFieldOrigin
+    panelTypeOrigin?: FirmwareFieldOrigin
+    firmwareSelectionModel?: string
 }
 
-export const FlashBoardComponent = (props: { onNext: () => void }) => {
+// Boards that flash WITHOUT compiling: Vermut has its own release-zip path, and
+// the Mowgli STM32 boards have prebuilt binaries in the release manifest (mirrors
+// firmware/scripts/package_release.py's PERMUTATIONS). A board absent here (e.g.
+// LUV1000RI) has no prebuilt yet and must use the Expert compile path — the UI
+// steers the user there instead of letting the flash fail at runtime.
+const PREBUILT_BOARDS = new Set<string>([
+    "BOARD_VERMUT_YARDFORCE500",
+    "BOARD_YARDFORCE500",
+    "BOARD_YARDFORCE500B",
+]);
+
+export const FlashBoardComponent = (props: { onNext: () => void; mowerModel?: string }) => {
     const isMobile = useIsMobile();
     const {colors} = useThemeMode();
+    const {t} = useTranslation();
+    const applyingModelDefaultsRef = useRef(false);
+    const manualOverridesRef = useRef<Partial<Record<keyof FirmwareSelection, boolean>>>({});
+    const initializedModelRef = useRef(false);
+    const mowerModelRef = useRef(props.mowerModel);
+    const [configuredMowerModel, setConfiguredMowerModel] = useState<string | undefined>(props.mowerModel);
+    // Mirror the two fields that gate the default-vs-expert flash affordance into
+    // React state so the button + guidance can react without a Formily observer.
+    const [selectedBoard, setSelectedBoard] = useState("");
+    const [selectedPanel, setSelectedPanel] = useState("");
+    const [isExpert, setIsExpert] = useState(false);
     const form = useMemo(() => createForm({
         validateFirst: true,
         effects: (form) => {
             onFieldValueChange('boardType', (field) => {
-                form.setFieldState('*(panelType,tickPerM,wheelBase,directory,branch,repository,debugType,disableEmergency,maxMps,maxChargeCurrent,limitVoltage150MA,maxChargeVoltage,batChargeCutoffVoltage,oneWheelLiftEmergencyMillis,bothWheelsLiftEmergencyMillis,tiltEmergencyMillis,stopButtonEmergencyMillis,playButtonClearEmergencyMillis,imuOnboardInclinationThreshold,externalImuAcceleration,externalImuAngular,masterJ18,perimeterWire)', (state) => {
+                setSelectedBoard(String(field.value));
+                if (initializedModelRef.current && !applyingModelDefaultsRef.current) {
+                    manualOverridesRef.current.boardType = true;
+                    form.setValues({boardTypeOrigin: 'manual'});
+                }
+                form.setFieldState('*(tickPerM,wheelBase,directory,branch,repository,disableEmergency,maxMps,maxChargeCurrent,limitVoltage150MA,maxChargeVoltage,batChargeCutoffVoltage,oneWheelLiftEmergencyMillis,bothWheelsLiftEmergencyMillis,tiltEmergencyMillis,stopButtonEmergencyMillis,playButtonClearEmergencyMillis,imuOnboardInclinationThreshold,externalImuAcceleration,externalImuAngular,perimeterWire)', (state) => {
                     state.display = field.value !== "BOARD_VERMUT_YARDFORCE500" ? "visible" : "hidden";
                 })
                 form.setFieldState('*(version,file)', (state) => {
                     state.display = field.value === "BOARD_VERMUT_YARDFORCE500" ? "visible" : "hidden";
                 })
+            })
+            onFieldValueChange('panelType', (field) => {
+                setSelectedPanel(String(field.value ?? ""));
+                if (initializedModelRef.current && !applyingModelDefaultsRef.current) {
+                    manualOverridesRef.current.panelType = true;
+                    form.setValues({panelTypeOrigin: 'manual'});
+                }
+            })
+            onFieldValueChange('firmwareSource', (field) => {
+                // The Firmware source dropdown is the single control that enables
+                // the expert compile-and-flash path: "custom" compiles from
+                // source, every other value flashes the prebuilt binary.
+                setIsExpert(field.value === "custom");
             })
         },
     }), [])
@@ -83,28 +135,111 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
     const terminalRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
+        mowerModelRef.current = props.mowerModel;
+    }, [props.mowerModel]);
+
+    useEffect(() => {
+        let disposed = false;
         (async () => {
             try {
-                const config = await guiApi.config.keysGetCreate({
-                    "gui.firmware.config": ""
-                })
-                const jsonConfig = config.data["gui.firmware.config"]
-                if (jsonConfig) {
-                    form.setInitialValues(JSON.parse(jsonConfig))
+                // Keep the existing firmware-config read independent from the
+                // settings read: a settings endpoint failure must not prevent
+                // returning users from restoring their flash configuration.
+                const config = await guiApi.config.keysGetCreate({"gui.firmware.config": ""});
+                let configuredModel: string | undefined;
+                try {
+                    const settings = await guiApi.settings.yamlList();
+                    configuredModel = settings.data?.mower_model;
+                } catch {
+                    // Model inference is best-effort; the normal manual form
+                    // remains available if settings cannot be read.
                 }
+                if (disposed) return;
+                const jsonConfig = config.data["gui.firmware.config"]
+                const model = mowerModelRef.current ?? configuredModel;
+                setConfiguredMowerModel(model);
+                if (jsonConfig) {
+                    const saved = JSON.parse(jsonConfig)
+                    // Back-compat: a config saved before the Firmware source
+                    // dropdown existed only carried `expertBuild`. Map it so a
+                    // returning user's custom-build choice stays preselected.
+                    if (saved.firmwareSource === undefined) {
+                        saved.firmwareSource = saved.expertBuild ? "custom" : "prebuilt"
+                    }
+                    // Provenance is persisted with the config when the flash
+                    // request is submitted (including failed flash attempts).
+                    // Unknown/legacy configs are deliberately conservative:
+                    // preserve both saved fields instead of guessing a board.
+                    manualOverridesRef.current = manualOverridesFromProvenance(saved);
+                    // If the model/settings lookup is unavailable, restoring
+                    // the saved config must still work. In particular, do not
+                    // turn a previously known automatic value into an empty
+                    // value merely because the async settings request failed.
+                    const seeded = (model === undefined
+                        ? {...saved}
+                        : applyFirmwareModelDefaults(model, saved, manualOverridesRef.current)) as FirmwareSelection & Record<string, unknown>;
+                    seeded.firmwareSelectionModel = model;
+                    seeded.boardTypeOrigin = manualOverridesRef.current.boardType ?
+                        (saved.boardTypeOrigin ?? "legacy") : "auto";
+                    seeded.panelTypeOrigin = manualOverridesRef.current.panelType ?
+                        (saved.panelTypeOrigin ?? "legacy") : "auto";
+                    setSelectedBoard(String(seeded.boardType ?? ""));
+                    setSelectedPanel(String(seeded.panelType ?? ""));
+                    setIsExpert(seeded.firmwareSource === "custom");
+                    applyingModelDefaultsRef.current = true;
+                    form.setInitialValues(seeded);
+                    form.setValues(seeded);
+                    applyingModelDefaultsRef.current = false;
+                } else {
+                    const seeded = applyFirmwareModelDefaults<FirmwareSelection>(model, {}, manualOverridesRef.current);
+                    seeded.firmwareSelectionModel = model;
+                    seeded.boardTypeOrigin = "auto";
+                    seeded.panelTypeOrigin = "auto";
+                    setSelectedBoard(String(seeded.boardType ?? ""));
+                    setSelectedPanel(String(seeded.panelType ?? ""));
+                    applyingModelDefaultsRef.current = true;
+                    form.setInitialValues(seeded);
+                    form.setValues(seeded);
+                    applyingModelDefaultsRef.current = false;
+                }
+                initializedModelRef.current = true;
             } catch (e: any) {
                 notification.error({
-                    message: "Error retrieving config",
+                    message: t('flashBoard.errorRetrievingConfig'),
                     description: e.toString(),
                 });
             }
         })()
         return () => {
+            disposed = true;
             if (abortControllerRef.current) {
                 abortControllerRef.current.abort();
             }
         };
     }, []);
+
+    // The onboarding wizard keeps the selected mower model in local state. If
+    // it changes while this step is mounted, update only fields still following
+    // automatic defaults; explicit board/panel overrides remain intact.
+    useEffect(() => {
+        if (!initializedModelRef.current || props.mowerModel === undefined || props.mowerModel === configuredMowerModel) {
+            return;
+        }
+        const seeded = applyFirmwareModelDefaults(
+            props.mowerModel,
+            form.values as FirmwareSelection,
+            manualOverridesRef.current,
+        );
+        seeded.firmwareSelectionModel = props.mowerModel;
+        seeded.boardTypeOrigin = manualOverridesRef.current.boardType ?
+            (form.values as FirmwareSelection).boardTypeOrigin ?? "manual" : "auto";
+        seeded.panelTypeOrigin = manualOverridesRef.current.panelType ?
+            (form.values as FirmwareSelection).panelTypeOrigin ?? "manual" : "auto";
+        applyingModelDefaultsRef.current = true;
+        form.setValues(seeded);
+        applyingModelDefaultsRef.current = false;
+        setConfiguredMowerModel(props.mowerModel);
+    }, [props.mowerModel, configuredMowerModel, form]);
 
     // Auto-scroll terminal to bottom
     useEffect(() => {
@@ -141,11 +276,15 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                 },
                 signal: controller.signal,
                 onopen(res) {
-                    if (res.status >= 400 && res.status < 500 && res.status !== 429) {
+                    if (!res.ok) {
                         notification.error({
-                            message: "Error connecting to flash endpoint",
+                            message: t('flashBoard.errorConnectingFlashEndpoint'),
                             description: res.statusText,
                         });
+                        // Throw so the outer catch records flashError and the
+                        // "Back to config" path appears — returning a resolved
+                        // promise here used to leave isFlashing stuck forever.
+                        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
                     }
                     return Promise.resolve()
                 },
@@ -162,9 +301,12 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                         setData((data) => [...(data ?? []), event.data]);
                     }
                 },
-                onclose() {},
-                onerror(err) {
+                onclose() {
+                    // Server closed the stream (with or without an "end"
+                    // event) — never leave the UI wedged in "flashing".
                     setIsFlashing(false);
+                },
+                onerror(err) {
                     setFlashError(err.toString());
                     // Re-throw to stop fetch-event-source's automatic retry.
                     // Otherwise the library re-POSTs on any stream error and
@@ -175,34 +317,69 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
             });
         } catch (e: any) {
             if (e.name !== 'AbortError') {
-                setIsFlashing(false);
                 setFlashError(e.toString());
             }
+        } finally {
+            // Belt-and-braces: whatever path ended the stream (end event,
+            // close, error, abort), the flashing state must not persist.
+            setIsFlashing(false);
         }
     };
 
     const flashFirmware = (values: Config) => {
+        if (!values.boardType || !values.panelType) {
+            notification.error({
+                message: t('flashBoard.selectionRequiredTitle'),
+                description: t('flashBoard.selectionRequiredDesc'),
+            });
+            return;
+        }
+        const isCustomBuild = values.firmwareSource === "custom";
+        // Derive the backend's expert flag straight from the dropdown so the
+        // payload can never disagree with what the user selected — selecting
+        // "custom" is what routes the backend to compile-from-source.
+        const payload: Config = {
+            ...values,
+            expertBuild: isCustomBuild,
+            // Keep provenance explicit in the persisted payload even if a
+            // Formily version drops values for fields that are not rendered.
+            boardTypeOrigin: values.boardTypeOrigin ??
+                (manualOverridesRef.current.boardType ? "manual" : "auto"),
+            panelTypeOrigin: values.panelTypeOrigin ??
+                (manualOverridesRef.current.panelType ? "manual" : "auto"),
+            firmwareSelectionModel: values.firmwareSelectionModel ??
+                mowerModelRef.current ?? configuredMowerModel,
+        };
+        // The prebuilt (default) path doesn't expose the charge/IMU params, so
+        // its confirmation is a simple "flash the blessed binary" prompt. The
+        // custom compile path keeps the detailed value-verification list.
+        const content = isCustomBuild ? (
+            <div>
+                <p><strong>{t('flashBoard.confirmVerifyParams')}</strong></p>
+                <ul style={{listStyle: "none", padding: 0}}>
+                    <li>{t('flashBoard.maxChargeCurrentLabel')}: <strong>{values.maxChargeCurrent} A</strong></li>
+                    <li>{t('flashBoard.maxChargeVoltageLabel')}: <strong>{values.maxChargeVoltage} V</strong></li>
+                    <li>{t('flashBoard.batChargeCutoffVoltageLabel')}: <strong>{values.batChargeCutoffVoltage} V</strong></li>
+                    <li>{t('flashBoard.limitVoltage150MALabel')}: <strong>{values.limitVoltage150MA} V</strong></li>
+                    <li>{t('flashBoard.imuInclinationThresholdLabel')}: <strong>0x{(values.imuOnboardInclinationThreshold ?? 0x38).toString(16).toUpperCase().padStart(2, "0")}</strong></li>
+                </ul>
+                <p style={{color: colors.danger}}><strong>{t('flashBoard.confirmWrongValuesWarning')}</strong></p>
+            </div>
+        ) : (
+            <div>
+                <p>{t('flashBoard.confirmPrebuiltDesc')}</p>
+                <p style={{color: colors.danger}}><strong>{t('flashBoard.confirmPrebuiltWarning')}</strong></p>
+            </div>
+        );
         const confirmModal = modal.confirm({
-            title: "Confirm firmware flash",
-            content: (
-                <div>
-                    <p><strong>Please verify the following parameters before flashing:</strong></p>
-                    <ul style={{listStyle: "none", padding: 0}}>
-                        <li>Max Charge Current: <strong>{values.maxChargeCurrent} A</strong></li>
-                        <li>Max Charge Voltage: <strong>{values.maxChargeVoltage} V</strong></li>
-                        <li>Bat Charge Cutoff Voltage: <strong>{values.batChargeCutoffVoltage} V</strong></li>
-                        <li>Limit Voltage 150mA: <strong>{values.limitVoltage150MA} V</strong></li>
-                        <li>IMU Inclination Threshold: <strong>0x{(values.imuOnboardInclinationThreshold ?? 0x38).toString(16).toUpperCase().padStart(2, "0")}</strong></li>
-                    </ul>
-                    <p style={{color: colors.danger}}><strong>Wrong voltage or current values can damage your battery or hardware!</strong></p>
-                </div>
-            ),
-            okText: "Flash",
+            title: t('flashBoard.confirmFlashTitle'),
+            content,
+            okText: t('flashBoard.flash'),
             okType: "danger",
-            cancelText: "Cancel",
+            cancelText: t('flashBoard.cancel'),
             onOk: () => {
                 confirmModal.destroy();
-                doFlashFirmware(values);
+                doFlashFirmware(payload);
             },
         });
     };
@@ -213,7 +390,7 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
             <Row gutter={[0, 16]}>
                 <Col span={24}>
                     <Typography.Title level={5} style={{margin: 0}}>
-                        {isFlashing ? "Flashing firmware..." : flashError ? "Flash failed" : "Flash complete"}
+                        {isFlashing ? t('flashBoard.flashingFirmware') : flashError ? t('flashBoard.flashFailed') : t('flashBoard.flashComplete')}
                     </Typography.Title>
                 </Col>
                 <Col span={24}>
@@ -225,12 +402,12 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                                 ))}
                                 {flashDone && (
                                     <TerminalOutput>
-                                        {"\n✅ Firmware flashed successfully!"}
+                                        {`\n✅ ${t('flashBoard.flashedSuccessfully')}`}
                                     </TerminalOutput>
                                 )}
                                 {flashError && (
                                     <TerminalOutput>
-                                        {`\n❌ Error: ${flashError}`}
+                                        {`\n❌ ${t('flashBoard.errorPrefix')}: ${flashError}`}
                                     </TerminalOutput>
                                 )}
                             </Terminal>
@@ -252,14 +429,14 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                             <Button onClick={() => {
                                 setData(undefined);
                                 setFlashError(null);
-                            }}>Back to config</Button>
+                            }}>{t('flashBoard.backToConfig')}</Button>
                         )}
                         <Button
                             type="primary"
                             disabled={isFlashing}
                             onClick={props.onNext}
                         >
-                            {isFlashing ? "Flashing..." : "Next"}
+                            {isFlashing ? t('flashBoard.flashingShort') : t('flashBoard.next')}
                         </Button>
                     </FormButtonGroup>
                 </Col>
@@ -274,8 +451,10 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                 <FormLayout layout="vertical">
                     <SchemaField><SchemaField.String
                         name={"boardType"}
-                        title={"Board Selection"}
-                        default={"BOARD_VERMUT_YARDFORCE500"}
+                        title={t('flashBoard.boardSelectionTitle')}
+                        // No board is safe as a generic fallback: YardForce
+                        // 500 identifies a chassis, not Vermut vs Mowgli.
+                        default={""}
                         enum={[{
                             label: "Vermut - YardForce 500 Classic",
                             value: "BOARD_VERMUT_YARDFORCE500"
@@ -293,8 +472,74 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                         ]} x-component="Select"
                         x-decorator="FormItem"/></SchemaField>
                     <SchemaField><SchemaField.String
+                        name={"panelType"}
+                        title={t('flashBoard.panelSelectionTitle')}
+                        default={""}
+                        enum={[
+                            {label: "YardForce 500 Classic", value: "PANEL_TYPE_YARDFORCE_500_CLASSIC"},
+                            {label: "YardForce LUV1000RI", value: "PANEL_TYPE_YARDFORCE_LUV1000RI"},
+                            {label: "YardForce 500B Classic", value: "PANEL_TYPE_YARDFORCE_500B_CLASSIC"},
+                            {label: "YardForce 900 ECO", value: "PANEL_TYPE_YARDFORCE_900_ECO"},
+                        ]} x-component="Select"
+                        x-decorator="FormItem"/></SchemaField>
+
+                    {/* Firmware source is the ONE control that chooses between
+                        flashing the tested prebuilt binary (default) and the
+                        expert compile-from-source path. Selecting "custom" sets
+                        expertBuild on the payload, which routes the backend to
+                        flashMowgli (git clone + platformio build + upload). */}
+                    <SchemaField><SchemaField.String
+                        name={"firmwareSource"}
+                        title={t('flashBoard.firmwareSourceTitle')}
+                        default={"prebuilt"}
+                        x-decorator-props={{tooltip: t('flashBoard.firmwareSourceTooltip')}}
+                        enum={[{
+                            label: t('flashBoard.firmwareSourcePrebuilt'),
+                            value: "prebuilt"
+                        }, {
+                            label: t('flashBoard.firmwareSourceCustom'),
+                            value: "custom"
+                        }]} x-component="Select"
+                        x-decorator="FormItem"/></SchemaField>
+
+                    <Alert
+                        type="info"
+                        showIcon
+                        style={{marginBottom: 12}}
+                        message={t('flashBoard.prebuiltInfoTitle')}
+                        description={t('flashBoard.prebuiltInfoDesc')}
+                    />
+
+                    {/* Expert disclosure: everything inside flashes a CUSTOM,
+                        compiled-from-source build (expertBuild=true) instead of the
+                        prebuilt binary. The default (collapsed) flow flashes the
+                        matching prebuilt for the board/panel selected above — a new
+                        user never opens this. forceRender keeps the Formily fields
+                        mounted so their `default` values are always registered and
+                        submitted with the payload. */}
+                    <Collapse
+                        ghost
+                        style={{marginBottom: 8}}
+                        items={[{
+                            key: "expert",
+                            forceRender: true,
+                            label: (
+                                <Typography.Text strong style={{color: colors.warning}}>
+                                    {t('flashBoard.expertBuildLabel')}
+                                </Typography.Text>
+                            ),
+                            children: (
+                                <FormLayout layout="vertical">
+                                    <Alert
+                                        type="warning"
+                                        showIcon
+                                        style={{marginBottom: 12}}
+                                        message={t('flashBoard.expertBuildAlertMessage')}
+                                        description={t('flashBoard.expertBuildAlertDescription')}
+                                    />
+                    <SchemaField><SchemaField.String
                         name={"version"}
-                        title={"Version"}
+                        title={t('flashBoard.versionTitle')}
                         default={"0_13_X"}
                         enum={[{
                             label: "V0.13",
@@ -335,63 +580,42 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                         x-decorator="FormItem"/></SchemaField>
                     <SchemaField><SchemaField.String
                         name={"file"}
-                        title={"Archive"}
+                        title={t('flashBoard.archiveTitle')}
                         default={"https://github.com/ClemensElflein/MowgliNext/releases/download/latest/firmware.zip"}
-                        x-decorator-props={{tooltip: "Archive to use for firmware"}}
+                        x-decorator-props={{tooltip: t('flashBoard.archiveTooltip')}}
                         x-component="Input"
                         x-decorator="FormItem"/></SchemaField>
                     <SchemaField><SchemaField.String
                         name={"repository"}
-                        title={"Repository"}
-                        default={"https://github.com/cedbossneo/mowglinext"}
-                        x-decorator-props={{tooltip: "Repository to use for firmware"}}
+                        title={t('flashBoard.repositoryTitle')}
+                        default={"https://github.com/mowglinext/mowglinext"}
+                        x-decorator-props={{tooltip: t('flashBoard.repositoryTooltip')}}
                         x-component="Input"
                         x-decorator="FormItem"/></SchemaField>
                     <SchemaField><SchemaField.String
                         name={"branch"}
-                        title={"Branch"}
+                        title={t('flashBoard.branchTitle')}
                         default={"main"}
-                        x-decorator-props={{tooltip: "Branch to use for firmware"}}
+                        x-decorator-props={{tooltip: t('flashBoard.branchTooltip')}}
                         x-component="Input"
                         x-decorator="FormItem"/></SchemaField>
                     <SchemaField><SchemaField.String
                         name={"directory"}
-                        title={"Firmware Directory"}
+                        title={t('flashBoard.firmwareDirectoryTitle')}
                         default={"firmware"}
-                        x-decorator-props={{tooltip: "Path to the firmware directory inside the cloned repository (containing stm32/ros_usbnode)"}}
+                        x-decorator-props={{tooltip: t('flashBoard.firmwareDirectoryTooltip')}}
                         x-component="Input"
                         x-decorator="FormItem"/></SchemaField>
-                    <SchemaField><SchemaField.String
-                        name={"panelType"}
-                        title={"Panel Selection"}
-                        default={"PANEL_TYPE_YARDFORCE_500_CLASSIC"}
-                        enum={[
-                            {label: "YardForce 500 Classic", value: "PANEL_TYPE_YARDFORCE_500_CLASSIC"},
-                            {label: "YardForce LUV1000RI", value: "PANEL_TYPE_YARDFORCE_LUV1000RI"},
-                            {label: "YardForce 500B Classic", value: "PANEL_TYPE_YARDFORCE_500B_CLASSIC"},
-                            {label: "YardForce 900 ECO", value: "PANEL_TYPE_YARDFORCE_900_ECO"},
-                        ]} x-component="Select"
-                        x-decorator="FormItem"/></SchemaField>
-                    <SchemaField><SchemaField.String
-                        name={"debugType"}
-                        title={"Debug Type"}
-                        default={"DEBUG_TYPE_UART"}
-                        enum={[
-                            {label: "None", value: "DEBUG_TYPE_NONE"},
-                            {label: "Uart", value: "DEBUG_TYPE_UART"},
-                            {label: "Swo", value: "DEBUG_TYPE_SWO"},
-                        ]} x-component="Select"
-                        x-decorator="FormItem"/></SchemaField>
-                    <SchemaField><SchemaField.Number name={"maxMps"} title={"Max MPS"} default={0.5}
-                        x-decorator-props={{tooltip: "Max speed in meters per second"}}
+                                    <SchemaField><SchemaField.Number name={"maxMps"} title={t('flashBoard.maxMpsTitle')} default={0.5}
+                        x-decorator-props={{tooltip: t('flashBoard.maxMpsTooltip')}}
                         x-component-props={{step: 0.1, max: 1.0}}
                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                    <SchemaField><SchemaField.Number name={"tickPerM"} title={"Tick per meter"} default={300.0}
-                        x-decorator-props={{tooltip: "Number of wheel ticks per meter"}}
+                    <SchemaField><SchemaField.Number name={"tickPerM"} title={t('flashBoard.tickPerMTitle')} default={300.0}
+                        x-decorator-props={{tooltip: t('flashBoard.tickPerMTooltip')}}
                         x-component-props={{step: 0.1}}
                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                    <SchemaField><SchemaField.Number name={"wheelBase"} title={"Wheel base"} default={0.325}
-                        x-decorator-props={{tooltip: "Wheel base in meters"}}
+                    <SchemaField><SchemaField.Number name={"wheelBase"} title={t('flashBoard.wheelBaseTitle')} default={0.325}
+                        x-decorator-props={{tooltip: t('flashBoard.wheelBaseTooltip')}}
                         x-component-props={{step: 0.001}}
                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
 
@@ -414,7 +638,7 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                             forceRender: true,
                             label: (
                                 <Typography.Text strong style={{color: colors.warning}}>
-                                    Paramètres firmware avancés (peuvent endommager le matériel)
+                                    {t('flashBoard.advancedParamsLabel')}
                                 </Typography.Text>
                             ),
                             children: (
@@ -423,8 +647,8 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                                         type="warning"
                                         showIcon
                                         style={{marginBottom: 12}}
-                                        message="Ces réglages contrôlent la charge de la batterie et les sécurités physiques"
-                                        description="Des valeurs de tension ou de courant incorrectes peuvent endommager la batterie ou la carte. Ne modifiez ces champs que si vous savez précisément ce que vous faites."
+                                        message={t('flashBoard.advancedAlertMessage')}
+                                        description={t('flashBoard.advancedAlertDescription')}
                                     />
                                     <div style={{
                                         border: `1px solid ${colors.danger}`,
@@ -433,68 +657,71 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                                         padding: "10px 12px",
                                         marginBottom: 12,
                                     }}>
-                                        <SchemaField><SchemaField.Boolean name={"disableEmergency"} title={"Disable Emergency"} default={false}
-                                            x-decorator-props={{tooltip: "Disable emergency stop", style: {marginBottom: 0}}}
+                                        <SchemaField><SchemaField.Boolean name={"disableEmergency"} title={t('flashBoard.disableEmergencyTitle')} default={false}
+                                            x-decorator-props={{tooltip: t('flashBoard.disableEmergencyTooltip'), style: {marginBottom: 0}}}
                                             x-component="Checkbox"
                                             x-component-props={{style: {color: colors.danger, fontWeight: 600}}}
                                             x-decorator="FormItem"/></SchemaField>
                                         <Typography.Text style={{color: colors.danger, fontSize: 12}}>
-                                            ⚠ Désactive l'arrêt d'urgence du firmware (roues levées, inclinaison,
-                                            bouton stop). À n'utiliser qu'en banc de test, jamais sur un robot avec lame.
+                                            {t('flashBoard.disableEmergencyWarning')}
                                         </Typography.Text>
                                     </div>
-                                    <SchemaField><SchemaField.Number name={"maxChargeCurrent"} title={"Max Charge Current"} default={1.0}
+                                    {/* Defaults below mirror firmware board_defaults.h
+                                        (the blessed prebuilt values) — keep them in sync;
+                                        they feed only this expert compile path. */}
+                                    <SchemaField><SchemaField.Number name={"maxChargeCurrent"} title={t('flashBoard.maxChargeCurrentTitle')} default={1.2}
                                         x-component-props={{step: 0.1, max: 5.0}}
-                                        x-decorator-props={{tooltip: "Max charge current in Amps"}}
+                                        x-decorator-props={{tooltip: t('flashBoard.maxChargeCurrentTooltip')}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Number name={"limitVoltage150MA"} title={"Limit Voltage 150mA"} default={28.0}
-                                        x-decorator-props={{tooltip: "Voltage limit during slow charge in Volts"}}
+                                    <SchemaField><SchemaField.Number name={"limitVoltage150MA"} title={t('flashBoard.limitVoltage150MATitle')} default={28.8}
+                                        x-decorator-props={{tooltip: t('flashBoard.limitVoltage150MATooltip')}}
                                         x-component-props={{step: 0.1, max: 30.0}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Number name={"maxChargeVoltage"} title={"Max Charge Voltage"} default={29.0}
-                                        x-decorator-props={{tooltip: "Max charge voltage in Volts"}}
+                                    <SchemaField><SchemaField.Number name={"maxChargeVoltage"} title={t('flashBoard.maxChargeVoltageTitle')} default={29.4}
+                                        x-decorator-props={{tooltip: t('flashBoard.maxChargeVoltageTooltip')}}
                                         x-component-props={{step: 0.1, max: 30.0}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Number name={"batChargeCutoffVoltage"} title={"Bat Charge Cutoff Voltage"} default={28.0}
-                                        x-decorator-props={{tooltip: "Max battery voltage allowed in Volts"}}
+                                    <SchemaField><SchemaField.Number name={"batChargeCutoffVoltage"} title={t('flashBoard.batChargeCutoffVoltageTitle')} default={29.2}
+                                        x-decorator-props={{tooltip: t('flashBoard.batChargeCutoffVoltageTooltip')}}
                                         x-component-props={{step: 0.1, max: 30.0}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Number name={"oneWheelLiftEmergencyMillis"} title={"One Wheel Lift Emergency Millis"} default={10000}
-                                        x-decorator-props={{tooltip: "Time in ms before emergency when one wheel is lifted"}}
+                                    <SchemaField><SchemaField.Number name={"oneWheelLiftEmergencyMillis"} title={t('flashBoard.oneWheelLiftEmergencyMillisTitle')} default={2000}
+                                        x-decorator-props={{tooltip: t('flashBoard.oneWheelLiftEmergencyMillisTooltip')}}
                                         x-component-props={{step: 1}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Number name={"bothWheelsLiftEmergencyMillis"} title={"Both Wheel Lift Emergency Millis"} default={1000}
-                                        x-decorator-props={{tooltip: "Time in ms before emergency when both wheels are lifted"}}
+                                    <SchemaField><SchemaField.Number name={"bothWheelsLiftEmergencyMillis"} title={t('flashBoard.bothWheelsLiftEmergencyMillisTitle')} default={1000}
+                                        x-decorator-props={{tooltip: t('flashBoard.bothWheelsLiftEmergencyMillisTooltip')}}
                                         x-component-props={{step: 1}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Number name={"tiltEmergencyMillis"} title={"Tilt Emergency Millis"} default={500}
-                                        x-decorator-props={{tooltip: "Time in ms before emergency when mower is tilted"}}
+                                    <SchemaField><SchemaField.Number name={"tiltEmergencyMillis"} title={t('flashBoard.tiltEmergencyMillisTitle')} default={500}
+                                        x-decorator-props={{tooltip: t('flashBoard.tiltEmergencyMillisTooltip')}}
                                         x-component-props={{step: 1}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Number name={"stopButtonEmergencyMillis"} title={"Stop Button Emergency Millis"} default={100}
-                                        x-decorator-props={{tooltip: "Time in ms before emergency when stop button is pressed"}}
+                                    <SchemaField><SchemaField.Number name={"stopButtonEmergencyMillis"} title={t('flashBoard.stopButtonEmergencyMillisTitle')} default={100}
+                                        x-decorator-props={{tooltip: t('flashBoard.stopButtonEmergencyMillisTooltip')}}
                                         x-component-props={{step: 1}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Number name={"playButtonClearEmergencyMillis"} title={"Play Button Clear Emergency Millis"} default={2000}
-                                        x-decorator-props={{tooltip: "Time in ms to hold play button to clear emergency"}}
+                                    <SchemaField><SchemaField.Number name={"playButtonClearEmergencyMillis"} title={t('flashBoard.playButtonClearEmergencyMillisTitle')} default={2000}
+                                        x-decorator-props={{tooltip: t('flashBoard.playButtonClearEmergencyMillisTooltip')}}
                                         x-component-props={{step: 1}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Number name={"imuOnboardInclinationThreshold"} title={"IMU Onboard Inclination Threshold"} default={0x38}
-                                        x-decorator-props={{tooltip: "IMU inclination threshold (0x2C=more allowed, 0x38=stock)"}}
+                                    <SchemaField><SchemaField.Number name={"imuOnboardInclinationThreshold"} title={t('flashBoard.imuOnboardInclinationThresholdTitle')} default={0x38}
+                                        x-decorator-props={{tooltip: t('flashBoard.imuOnboardInclinationThresholdTooltip')}}
                                         x-component-props={{step: 1, min: 0, max: 127}}
                                         x-component="NumberPicker" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Boolean name={"externalImuAcceleration"} title={"External IMU Acceleration"} default={true}
-                                        x-decorator-props={{tooltip: "Use external IMU for acceleration"}}
+                                    <SchemaField><SchemaField.Boolean name={"externalImuAcceleration"} title={t('flashBoard.externalImuAccelerationTitle')} default={true}
+                                        x-decorator-props={{tooltip: t('flashBoard.externalImuAccelerationTooltip')}}
                                         x-component="Checkbox" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Boolean name={"externalImuAngular"} title={"External IMU Angular"} default={true}
-                                        x-decorator-props={{tooltip: "Use external IMU for angular"}}
+                                    <SchemaField><SchemaField.Boolean name={"externalImuAngular"} title={t('flashBoard.externalImuAngularTitle')} default={true}
+                                        x-decorator-props={{tooltip: t('flashBoard.externalImuAngularTooltip')}}
                                         x-component="Checkbox" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Boolean name={"masterJ18"} title={"Master J18"} default={true}
-                                        x-decorator-props={{tooltip: "Use J18 as master"}}
+                                    <SchemaField><SchemaField.Boolean name={"perimeterWire"} title={t('flashBoard.perimeterWireTitle')} default={true}
+                                        x-decorator-props={{tooltip: t('flashBoard.perimeterWireTooltip')}}
                                         x-component="Checkbox" x-decorator="FormItem"/></SchemaField>
-                                    <SchemaField><SchemaField.Boolean name={"perimeterWire"} title={"Use Perimeter wire"} default={true}
-                                        x-decorator-props={{tooltip: "Use perimeter wire"}}
-                                        x-component="Checkbox" x-decorator="FormItem"/></SchemaField>
+                                </FormLayout>
+                            ),
+                        }]}
+                    />
                                 </FormLayout>
                             ),
                         }]}
@@ -511,19 +738,42 @@ export const FlashBoardComponent = (props: { onNext: () => void }) => {
                 borderTop: isMobile ? `1px solid ${colors.border}` : undefined,
                 zIndex: 50,
             }}>
-                <FormButtonGroup>
-                    <Button type="primary" onClick={() => {
-                        form.submit(flashFirmware).catch((err: unknown) => {
-                            if (err instanceof Error) {
-                                notification.error({
-                                    message: "Validation failed",
-                                    description: err.message,
+                <div style={{width: "100%"}}>
+                    {(!selectedBoard || !selectedPanel) && (
+                        <Alert
+                            type="warning"
+                            showIcon
+                            style={{marginBottom: 8, textAlign: "left"}}
+                            message={t('flashBoard.selectionRequiredTitle')}
+                            description={t('flashBoard.selectionRequiredDesc')}
+                        />
+                    )}
+                    {selectedBoard && !isExpert && !PREBUILT_BOARDS.has(selectedBoard) && (
+                        <Alert
+                            type="warning"
+                            showIcon
+                            style={{marginBottom: 8, textAlign: "left"}}
+                            message={t('flashBoard.noPrebuiltTitle')}
+                            description={t('flashBoard.noPrebuiltDesc')}
+                        />
+                    )}
+                    <FormButtonGroup>
+                        <Button
+                            type="primary"
+                            disabled={!selectedBoard || !selectedPanel || (!isExpert && !PREBUILT_BOARDS.has(selectedBoard))}
+                            onClick={() => {
+                                form.submit(flashFirmware).catch((err: unknown) => {
+                                    if (err instanceof Error) {
+                                        notification.error({
+                                            message: t('flashBoard.validationFailed'),
+                                            description: err.message,
+                                        });
+                                    }
                                 });
-                            }
-                        });
-                    }}>Flash Firmware</Button>
-                    <Button onClick={props.onNext}>Skip</Button>
-                </FormButtonGroup>
+                            }}>{t('flashBoard.flashFirmware')}</Button>
+                        <Button onClick={props.onNext}>{t('flashBoard.skip')}</Button>
+                    </FormButtonGroup>
+                </div>
             </Col>
         </Row>
     </Form>;

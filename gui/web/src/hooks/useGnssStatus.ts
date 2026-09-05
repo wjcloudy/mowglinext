@@ -2,7 +2,11 @@ import {useEffect, useMemo, useRef, useState} from "react";
 import {GnssStatus} from "../types/ros.ts";
 import {useWS} from "./useWS.ts";
 import {useDiagnostics} from "./useDiagnostics.ts";
-import {deriveGnssStatusFromDiagnostics, hasTypedGnssStatusSample} from "../utils/gpsStatus.ts";
+import {
+    deriveGnssStatusFromDiagnostics,
+    hasTypedGnssStatusSample,
+    mergeGnssStatusDiagnosticProjection,
+} from "../utils/gpsStatus.ts";
 
 export const useGnssStatus = () => {
     const [gnssStatus, setGnssStatus] = useState<GnssStatus>({});
@@ -11,7 +15,7 @@ export const useGnssStatus = () => {
     const ignoreStreamEvent = () => {};
     const gnssStatusStream = useWS<string>(ignoreStreamEvent, ignoreStreamEvent, (payload) => {
         try {
-            setGnssStatus(JSON.parse(payload) as GnssStatus);
+            setGnssStatus(payload as unknown as GnssStatus);
             parseWarningLoggedRef.current = false;
         } catch (error) {
             if (!parseWarningLoggedRef.current) {
@@ -33,6 +37,6 @@ export const useGnssStatus = () => {
     );
 
     return hasTypedGnssStatusSample(gnssStatus)
-        ? gnssStatus
+        ? mergeGnssStatusDiagnosticProjection(gnssStatus, diagnosticFallback)
         : (diagnosticFallback ?? gnssStatus);
 };

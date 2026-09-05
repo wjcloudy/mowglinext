@@ -2,6 +2,7 @@ import {describe, it, expect, vi, beforeEach} from 'vitest';
 import {render, screen} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {MapToolbar} from './MapToolbar.tsx';
+import en from "../../../i18n/locales/en.json";
 
 vi.mock('../../../components/AsyncButton.tsx', () => ({
     default: ({children, onAsyncClick, ...props}: any) => (
@@ -20,6 +21,7 @@ describe('MapToolbar', () => {
         useSatellite: true,
         mowingAreas: [],
         stateName: 'IDLE',
+        highLevelState: 1,
         emergency: false,
         onEditMap: vi.fn(),
         onToggleSatellite: vi.fn(),
@@ -29,6 +31,7 @@ describe('MapToolbar', () => {
         onRestoreMap: vi.fn(),
         onDownloadGeoJSON: vi.fn(),
         onImportOpenMower: vi.fn(),
+        onResetMowingProgress: vi.fn(),
         onMowArea: vi.fn().mockResolvedValue(undefined),
         onStart: vi.fn().mockResolvedValue(undefined),
         onHome: vi.fn().mockResolvedValue(undefined),
@@ -42,82 +45,113 @@ describe('MapToolbar', () => {
 
     it('renders Edit Map button', () => {
         render(<MapToolbar {...defaultProps} />);
-        expect(screen.getByText('Edit Map')).toBeInTheDocument();
+        expect(screen.getByText(en.mapToolbar.editMap)).toBeInTheDocument();
     });
 
-    it('shows Start button when IDLE', () => {
+    it('shows both Start and Home buttons when IDLE', () => {
         render(<MapToolbar {...defaultProps} stateName="IDLE" />);
-        expect(screen.getByText('Start')).toBeInTheDocument();
+        expect(screen.getByText(en.mapToolbar.start)).toBeInTheDocument();
+        expect(screen.getByText(en.mapToolbar.home)).toBeInTheDocument();
     });
 
-    it('shows Home button when not IDLE', () => {
+    it('shows Home but not Start when not IDLE', () => {
         render(<MapToolbar {...defaultProps} stateName="MOWING" />);
-        expect(screen.getByText('Home')).toBeInTheDocument();
+        expect(screen.getByText(en.mapToolbar.home)).toBeInTheDocument();
+        expect(screen.queryByText(en.mapToolbar.start)).not.toBeInTheDocument();
+    });
+
+    it('calls onHome when Home clicked', async () => {
+        const user = userEvent.setup();
+        render(<MapToolbar {...defaultProps} stateName="IDLE" />);
+        await user.click(screen.getByText(en.mapToolbar.home));
+        expect(defaultProps.onHome).toHaveBeenCalled();
     });
 
     it('shows Emergency On when no emergency', () => {
         render(<MapToolbar {...defaultProps} emergency={false} />);
-        expect(screen.getByText('Emergency On')).toBeInTheDocument();
+        expect(screen.getByText(en.mapToolbar.emergencyOn)).toBeInTheDocument();
     });
 
     it('shows Emergency Off when emergency active', () => {
         render(<MapToolbar {...defaultProps} emergency={true} />);
-        expect(screen.getByText('Emergency Off')).toBeInTheDocument();
+        expect(screen.getByText(en.mapToolbar.emergencyOff)).toBeInTheDocument();
     });
 
     it('shows Mow area dropdown', () => {
         render(<MapToolbar {...defaultProps} />);
-        expect(screen.getByText('Mow area')).toBeInTheDocument();
+        expect(screen.getByText(en.mapToolbar.mowArea)).toBeInTheDocument();
     });
 
     it('always shows the More dropdown trigger', () => {
         render(<MapToolbar {...defaultProps} />);
-        expect(screen.getByText('More')).toBeInTheDocument();
+        expect(screen.getByText(en.mapToolbar.more)).toBeInTheDocument();
     });
 
     it('shows Backup Map and Restore Map in More dropdown', async () => {
         const user = userEvent.setup();
         render(<MapToolbar {...defaultProps} />);
-        await user.click(screen.getByText('More'));
-        expect(screen.getByText('Backup Map')).toBeInTheDocument();
-        expect(screen.getByText('Restore Map')).toBeInTheDocument();
+        await user.click(screen.getByText(en.mapToolbar.more));
+        expect(screen.getByText(en.mapToolbar.backupMap)).toBeInTheDocument();
+        expect(screen.getByText(en.mapToolbar.restoreMap)).toBeInTheDocument();
+    });
+
+    it('offers Reset Mowing Progress whenever the mower is not active', async () => {
+        const user = userEvent.setup();
+        render(<MapToolbar {...defaultProps} highLevelState={1} />);
+        await user.click(screen.getByText(en.mapToolbar.more));
+
+        const resetItem = screen.getByText(en.resetMowingProgress.action);
+        expect(resetItem).toBeInTheDocument();
+        await user.click(resetItem);
+        expect(defaultProps.onResetMowingProgress).toHaveBeenCalledOnce();
+    });
+
+    it('disables Reset Mowing Progress while an autonomous mission is active', async () => {
+        const user = userEvent.setup();
+        render(<MapToolbar {...defaultProps} highLevelState={2} stateName="MOWING" />);
+        await user.click(screen.getByText(en.mapToolbar.more));
+
+        const resetItem = screen.getByText(en.resetMowingProgress.action);
+        expect(resetItem.closest('[role="menuitem"]')).toHaveAttribute('aria-disabled', 'true');
+        await user.click(resetItem);
+        expect(defaultProps.onResetMowingProgress).not.toHaveBeenCalled();
     });
 
     it('shows Download GeoJSON in More dropdown', async () => {
         const user = userEvent.setup();
         render(<MapToolbar {...defaultProps} />);
-        await user.click(screen.getByText('More'));
-        expect(screen.getByText('Download GeoJSON')).toBeInTheDocument();
+        await user.click(screen.getByText(en.mapToolbar.more));
+        expect(screen.getByText(en.mapToolbar.downloadGeojson)).toBeInTheDocument();
     });
 
     it('calls onEditMap when Edit Map clicked', async () => {
         const user = userEvent.setup();
         render(<MapToolbar {...defaultProps} />);
-        await user.click(screen.getByText('Edit Map'));
+        await user.click(screen.getByText(en.mapToolbar.editMap));
         expect(defaultProps.onEditMap).toHaveBeenCalled();
     });
 
     it('calls onBackupMap when Backup Map clicked in More dropdown', async () => {
         const user = userEvent.setup();
         render(<MapToolbar {...defaultProps} />);
-        await user.click(screen.getByText('More'));
-        await user.click(screen.getByText('Backup Map'));
+        await user.click(screen.getByText(en.mapToolbar.more));
+        await user.click(screen.getByText(en.mapToolbar.backupMap));
         expect(defaultProps.onBackupMap).toHaveBeenCalled();
     });
 
     it('calls onRestoreMap when Restore Map clicked in More dropdown', async () => {
         const user = userEvent.setup();
         render(<MapToolbar {...defaultProps} />);
-        await user.click(screen.getByText('More'));
-        await user.click(screen.getByText('Restore Map'));
+        await user.click(screen.getByText(en.mapToolbar.more));
+        await user.click(screen.getByText(en.mapToolbar.restoreMap));
         expect(defaultProps.onRestoreMap).toHaveBeenCalled();
     });
 
     it('calls onDownloadGeoJSON when Download GeoJSON clicked in More dropdown', async () => {
         const user = userEvent.setup();
         render(<MapToolbar {...defaultProps} />);
-        await user.click(screen.getByText('More'));
-        await user.click(screen.getByText('Download GeoJSON'));
+        await user.click(screen.getByText(en.mapToolbar.more));
+        await user.click(screen.getByText(en.mapToolbar.downloadGeojson));
         expect(defaultProps.onDownloadGeoJSON).toHaveBeenCalled();
     });
 });
