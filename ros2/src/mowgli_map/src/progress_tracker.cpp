@@ -23,6 +23,7 @@
 
 #include <std_msgs/msg/bool.hpp>
 
+#include "mowgli_map/boundary_classifier.hpp"
 #include "mowgli_map/internal_helpers.hpp"
 #include "mowgli_map/map_server_node.hpp"
 
@@ -99,27 +100,22 @@ void MapServerNode::check_boundary_violation(double x, double y)
   // coverage. Require boundary_debounce_samples_ consecutive bad
   // samples before asserting; reset to 0 on the first inside-polygon
   // sample. The lethal escalation is intentionally NOT debounced —
-  // if we're really 0.5 m outside, the blade has to stop *now*.
-  const bool soft_outside = !inside_any && (min_edge_dist > soft_boundary_margin_m_);
-  if (soft_outside)
-  {
-    if (consecutive_outside_samples_ < std::numeric_limits<int>::max())
-    {
-      ++consecutive_outside_samples_;
-    }
-  }
-  else
-  {
-    consecutive_outside_samples_ = 0;
-  }
+  // if we're really 0.5 m outside, the blade has to stop *now*. See
+  // boundary_classifier.hpp for the pure decision function + unit tests
+  // (test_boundary_classifier.cpp).
+  const BoundaryClassification classification = ClassifyBoundary(inside_any,
+                                                                 min_edge_dist,
+                                                                 soft_boundary_margin_m_,
+                                                                 lethal_boundary_margin_m_,
+                                                                 boundary_debounce_samples_,
+                                                                 consecutive_outside_samples_);
 
   std_msgs::msg::Bool soft_msg;
-  soft_msg.data = soft_outside &&
-                  (consecutive_outside_samples_ >= boundary_debounce_samples_);
+  soft_msg.data = classification.soft;
   boundary_violation_pub_->publish(soft_msg);
 
   std_msgs::msg::Bool lethal_msg;
-  lethal_msg.data = !inside_any && (min_edge_dist > lethal_boundary_margin_m_);
+  lethal_msg.data = classification.lethal;
   lethal_boundary_violation_pub_->publish(lethal_msg);
 
   // Only escalate logging when the blade is actively running. When the blade
@@ -127,7 +123,7 @@ void MapServerNode::check_boundary_violation(double x, double y)
   // both states legitimately place the robot outside any defined polygon, so
   // an ERROR-level log would just spam the rosout. The /boundary_violation
   // topics are still published unconditionally so the BT can react.
-  if (!inside_any && mow_blade_enabled_)
+  if (!inside_any && mow_blade_requested_)
   {
     if (lethal_msg.data)
     {
@@ -274,7 +270,10 @@ void MapServerNode::on_get_recovery_point(
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool MapServerNode::apply_promoted_obstacle(size_t area_index,
-                                            const geometry_msgs::msg::Polygon& polygon)
+                                            const geometry_msgs::msg::Polygon& polygon,
+                                            const std::string& name,
+                                            uint8_t source,
+                                            bool pending)
 {
   // Validate + mutate areas_/obstacle_polygons_ under map_mutex_, then
   // release before calling apply_area_classifications (which locks
@@ -289,7 +288,25 @@ bool MapServerNode::apply_promoted_obstacle(size_t area_index,
     if (polygon.points.size() < 3)
       return false;
 
-    areas_[area_index].obstacles.push_back(polygon);
+    // Idempotent promotion. Promoting an obstacle writes its polygon into the
+    // keepout mask (→ lethal costmap cells); the obstacle_tracker re-clusters
+    // that same costmap and can re-promote the SAME region. Without a dedup
+    // guard every re-promote (and every YAML reload) push_back'd an identical
+    // polygon, stacking unbounded duplicates. Skip when a polygon with a
+    // near-identical centroid already exists — a true no-op (no reclassify, no
+    // replan trigger). One promote → exactly one permanent obstacle.
+    if (has_duplicate_obstacle(obstacle_polygons_, polygon, kObstacleDedupEpsilonM) ||
+        has_duplicate_obstacle_entry(areas_[area_index].obstacles, polygon, kObstacleDedupEpsilonM))
+    {
+      const auto c = polygon_centroid(polygon);
+      RCLCPP_INFO(get_logger(),
+                  "apply_promoted_obstacle: duplicate keepout near (%.2f, %.2f) ignored (no-op)",
+                  static_cast<double>(c.x),
+                  static_cast<double>(c.y));
+      return true;
+    }
+
+    areas_[area_index].obstacles.push_back(make_obstacle_entry(polygon, name, source, pending));
     obstacle_polygons_.push_back(polygon);
     masks_dirty_ = true;
   }

@@ -196,6 +196,31 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// IsCoverageComplete
+// ---------------------------------------------------------------------------
+
+/// Returns SUCCESS when the last GetNextUnmowedArea run ended because every
+/// area is genuinely mowed (ctx->coverage_all_complete), FAILURE otherwise
+/// (transient service error / timeout / no areas defined). Lets the coverage
+/// subtree route a normal finish to MOWING_COMPLETE instead of the
+/// COVERAGE_FAILED_DOCKING path.
+class IsCoverageComplete : public BT::ConditionNode
+{
+public:
+  IsCoverageComplete(const std::string& name, const BT::NodeConfig& config)
+      : BT::ConditionNode(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {};
+  }
+
+  BT::NodeStatus tick() override;
+};
+
+// ---------------------------------------------------------------------------
 // IsGPSFixed
 // ---------------------------------------------------------------------------
 
@@ -261,6 +286,56 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// IsLocalizationDegraded — true while the fused σ_xy is too high to mow
+// (hysteresis latched in the /odometry/filtered_map callback).
+// ---------------------------------------------------------------------------
+
+class IsLocalizationDegraded : public BT::ConditionNode
+{
+public:
+  IsLocalizationDegraded(const std::string& name, const BT::NodeConfig& config)
+      : BT::ConditionNode(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {};
+  }
+
+  BT::NodeStatus tick() override;
+};
+
+// ---------------------------------------------------------------------------
+// IsDigEscalated — the robot has latched the dig detector repeatedly at one
+// spot and cannot free itself there (issue #500).
+// ---------------------------------------------------------------------------
+
+/// Returns SUCCESS while /hardware_bridge/dig_escalated is true, i.e. the
+/// bridge has seen dig_escalate_count latches inside dig_escalate_radius_m
+/// within dig_escalate_window_s. A single dig is handled entirely by the
+/// bridge (hard stop, bounded reverse) and by map_server's pending keepout,
+/// and does NOT set this; repeated latches at one spot mean the next planned
+/// manoeuvre keeps aiming the robot back at the same physical object, which
+/// no amount of reversing or keeping-out can fix. The bridge only raises the
+/// flag — stopping the mission is the tree's job.
+class IsDigEscalated : public BT::ConditionNode
+{
+public:
+  IsDigEscalated(const std::string& name, const BT::NodeConfig& config)
+      : BT::ConditionNode(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {};
+  }
+
+  BT::NodeStatus tick() override;
+};
+
+// ---------------------------------------------------------------------------
 // IsLethalBoundaryViolation
 // ---------------------------------------------------------------------------
 
@@ -275,6 +350,35 @@ class IsLethalBoundaryViolation : public BT::ConditionNode
 public:
   IsLethalBoundaryViolation(const std::string& name, const BT::NodeConfig& config)
       : BT::ConditionNode(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {};
+  }
+
+  BT::NodeStatus tick() override;
+};
+
+// ---------------------------------------------------------------------------
+// IsDocking
+// ---------------------------------------------------------------------------
+
+/// Returns SUCCESS while a DockRobot action is actively running
+/// (ctx->docking_active, maintained by the DockRobot node's onStart/onRunning/
+/// onHalted lifecycle). Pure read — no side effects on the context.
+///
+/// Used by BoundaryGuard to exempt the blade-OFF dock transit under
+/// command 1 from the SoftBoundaryHandler: docking is always preceded by
+/// SetMowerEnabled(false) and can never overlap the blade-on FollowStrip
+/// subtree, so this can never be true during blade-on mowing. See the
+/// docking_active comment in bt_context.hpp and the BoundaryGuard block in
+/// main_tree.xml.
+class IsDocking : public BT::ConditionNode
+{
+public:
+  IsDocking(const std::string& name, const BT::NodeConfig& config) : BT::ConditionNode(name, config)
   {
   }
 
@@ -391,9 +495,19 @@ private:
   bool charger_failed_{false};
   float baseline_battery_{0.0f};
   std::chrono::steady_clock::time_point baseline_time_{};
+  // Session-boundary detection: the node is ticked continuously while the BT is
+  // inside the charging branch. A gap longer than session_gap_sec_ between ticks
+  // means the BT LEFT the charging branch (undocked / mowed / re-docked), i.e. a
+  // NEW charge session — so a previously latched charger_failed_ must be cleared,
+  // or one transient stall would disable auto-charge-resume for the whole process
+  // lifetime (the early `if (charger_failed_) return FAILURE` ran before the only
+  // clear site, making it permanently unreachable).
+  std::chrono::steady_clock::time_point last_tick_time_{};
+  bool last_tick_set_{false};
 
   static constexpr double check_interval_sec_{1800.0};  // 30 minutes
   static constexpr float min_increase_{1.0f};  // 1% minimum
+  static constexpr double session_gap_sec_{60.0};  // tick gap that ends a session
 };
 
 // ---------------------------------------------------------------------------
@@ -538,9 +652,7 @@ public:
                               5.0,
                               "Seconds collision_monitor must be in STOP before tripping"),
         BT::InputPort<int>("max_count", 3, "Per-session cap on obstacle-backoff firings"),
-        BT::InputPort<double>("cooldown_sec",
-                              8.0,
-                              "Minimum gap between obstacle-backoff firings"),
+        BT::InputPort<double>("cooldown_sec", 8.0, "Minimum gap between obstacle-backoff firings"),
     };
   }
 
@@ -587,6 +699,158 @@ public:
                               10.0,
                               "Seconds since last STOP exit to still count as recent"),
     };
+  }
+
+  BT::NodeStatus tick() override;
+};
+
+// ---------------------------------------------------------------------------
+// IsScanStale
+// ---------------------------------------------------------------------------
+
+/// SAFETY (SAFETY_REVIEW_2026-07-23 A-C2). Returns SUCCESS when the LiDAR
+/// scan stream has DIED: at least one /scan_collision message was received
+/// this session AND the most recent one is older than max_age_sec. Returns
+/// FAILURE while the stream is healthy — or when NO scan has ever been
+/// received (a no-LiDAR install publishes nothing; the guard must stay inert
+/// there, which also spares us lidar_enabled plumbing into the BT).
+///
+/// Field problem this solves: when the LiDAR container (or the scan-filter
+/// chain feeding /scan_collision) dies mid-mow, collision_monitor's
+/// source_timeout zeroes cmd_vel but nothing CUTS THE BLADE or tells the
+/// tree — the robot sat blade-on, with zero reactive obstacle detection.
+/// Consumed by the SensorSafetyGuard in main_tree.xml, which halts mowing
+/// (blade off via FollowStrip::onHalted) until the stream returns.
+///
+/// Source signal: ctx->last_scan_time, stamped by the /scan_collision
+/// subscriber in behavior_tree_node. Pure read — no side effects.
+///
+/// Input ports:
+///   max_age_sec (double, default 1.0) — scan age beyond which the stream
+///                                       is declared dead (LD19 ≈ 10 Hz →
+///                                       1 s = ~10 missed scans).
+class IsScanStale : public BT::ConditionNode
+{
+public:
+  IsScanStale(const std::string& name, const BT::NodeConfig& config)
+      : BT::ConditionNode(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {
+        BT::InputPort<double>("max_age_sec",
+                              1.0,
+                              "Scan age (s) beyond which the LiDAR stream is declared dead"),
+    };
+  }
+
+  BT::NodeStatus tick() override;
+};
+
+// ---------------------------------------------------------------------------
+// IsCollisionStopSustained
+// ---------------------------------------------------------------------------
+
+/// SAFETY (SAFETY_REVIEW_2026-07-23 A-H1). Returns SUCCESS when
+/// collision_monitor has been in STOP continuously for at least
+/// min_duration_sec. Unlike IsObstacleStuck (which fires ONCE to trigger a
+/// bounded backoff recovery, with a per-session cap and cooldown), this is a
+/// pure stateless read used by the SensorSafetyGuard: a sustained STOP means
+/// the robot is parked against something the monitor refuses to approach —
+/// and without this guard it sat there with the BLADE STILL SPINNING (the
+/// monitor only zeroes cmd_vel; it raises no firmware emergency, so
+/// FollowStrip::onHalted never ran). The guard threshold must exceed
+/// IsObstacleStuck's min_duration_sec plus its backoff time, so the backoff
+/// recovery gets its chance first.
+///
+/// Source signal: ctx->collision_action_type + ctx->collision_stop_since +
+/// ctx->last_collision_state_time, maintained by the /collision_monitor_state
+/// subscriber. Pure read.
+///
+/// FRESHNESS (field 2026-07-23 deadlock): the monitor only publishes state
+/// while cmd_vel_nav flows, so once this guard halts the tree the latched
+/// action goes stale — the first deployment held the robot forever (268 s
+/// observed) because the STOP could never clear. The guard therefore requires
+/// the state to be FRESH (≤ max_state_age_sec); a stale latch releases it,
+/// and if the obstacle is real the resumed cmd_vel flow re-publishes STOP
+/// within one monitor cycle (the subscriber then re-stamps a fresh episode,
+/// handing the recovery machinery a full new window).
+///
+/// min_duration_sec must exceed IsObstacleStuck's FULL backoff sequence —
+/// 3 attempts × (5 s STOP + backoff + 8 s cooldown) ≈ 45–50 s — or this
+/// guard preempts the recovery machinery before it can free the robot.
+///
+/// Input ports:
+///   min_duration_sec  (double, default 60.0) — continuous STOP duration
+///                                              before the guard trips.
+///   max_state_age_sec (double, default 3.0)  — /collision_monitor_state
+///                                              freshness bound; older = the
+///                                              latch is stale → guard inert.
+class IsCollisionStopSustained : public BT::ConditionNode
+{
+public:
+  IsCollisionStopSustained(const std::string& name, const BT::NodeConfig& config)
+      : BT::ConditionNode(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {
+        BT::InputPort<double>("min_duration_sec",
+                              60.0,
+                              "Continuous STOP duration (s) before the guard trips"),
+        BT::InputPort<double>("max_state_age_sec",
+                              3.0,
+                              "collision_monitor_state freshness bound (s); stale = inert"),
+    };
+  }
+
+  BT::NodeStatus tick() override;
+};
+
+// ---------------------------------------------------------------------------
+// IsCoverageStartBlocked
+// ---------------------------------------------------------------------------
+
+/// Returns SUCCESS when the FollowStrip pass that just failed did so because
+/// the ROBOT'S OWN POSE is a cell nav2 refuses to plan from (every blade-off
+/// sub-path transit came back START_OCCUPIED and zero swaths were mowed).
+/// FAILURE otherwise.
+///
+/// Field problem this solves (issue #487, 2026-08-24): the robot undocked into
+/// the inflated keepout around a 0.25 m obstacle circle. SmacPlanner2D has no
+/// start tolerance, so all 26 plan calls answered "Start occupied", FollowStrip
+/// skipped all four sub-paths in a row, and the whole field was declared
+/// unmowable at 0 % coverage. The area was perfectly mowable — a second attempt
+/// 13 minutes later completed it at 100 %.
+///
+/// CONSUMING condition: it clears ctx->coverage_start_blocked on read, so the
+/// recovery branch fires exactly once per blocked pass and a later, unrelated
+/// FollowStrip failure cannot re-trigger it. (ctx->start_blocked_area is a
+/// SEPARATE field with a separate consumer — GetNextUnmowedArea — so this read
+/// does not disturb the retirement-budget exemption.)
+///
+/// SAFETY: this node also ARMS the bounded escape motion
+/// (ctx->start_blocked_escape_armed, consumed by EscapeStartBlocked). It is the
+/// ONLY place that token is set, which is what makes the escape provably unable
+/// to fire on any other failure. See mowgli_behavior/start_blocked_escape.hpp
+/// for the bounds and the stand-down conditions; arming is not itself a
+/// commitment to move — every stand-down there degrades to the non-motion
+/// recovery this node originally shipped with.
+class IsCoverageStartBlocked : public BT::ConditionNode
+{
+public:
+  IsCoverageStartBlocked(const std::string& name, const BT::NodeConfig& config)
+      : BT::ConditionNode(name, config)
+  {
+  }
+
+  static BT::PortsList providedPorts()
+  {
+    return {};
   }
 
   BT::NodeStatus tick() override;

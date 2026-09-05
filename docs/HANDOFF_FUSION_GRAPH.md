@@ -5,9 +5,10 @@
 > ouvrir [`wiki/Architecture.md`][archi] et la section [`Configuration.md` § fusion_graph][cfg].
 > Cette page reste publiée comme trace de la transition (commits, choix de design,
 > liste des helpers retirés) — utile pour archéologie git, pas pour onboarder.
+> Côté code, la carte à jour du package est [`docs/claude/codemaps/fusion_graph.md`](claude/codemaps/fusion_graph.md).
 >
-> [archi]: https://github.com/cedbossneo/mowglinext/wiki/Architecture#optional-factor-graph-localizer-fusion_graph
-> [cfg]: https://github.com/cedbossneo/mowglinext/wiki/Configuration#7-fusion_graph
+> [archi]: https://github.com/mowglinext/mowglinext/wiki/Architecture#optional-factor-graph-localizer-fusion_graph
+> [cfg]: https://github.com/mowglinext/mowglinext/wiki/Configuration#7-fusion_graph
 
 > Document de passation pour reprise dans une nouvelle session Claude Code.
 > **Branche de départ :** `feat/slam-rtk-fallback` (ou créer `feat/fusion-graph` from `main`).

@@ -111,12 +111,10 @@ static int16_t right_pwm_signed = 0;
 #define WHEEL_PI_KP_PWM_PER_MPS 30.0f /* proportional gain */
 #define WHEEL_PI_KI_PWM_PER_MPS_S                                              \
   5000.0f /* integral gain (50 PWM in ~0.2 s when err=0.05 m/s) */
-#define WHEEL_PI_INT_MAX_PWM 100.0f /* anti-windup clamp on the integral term  \
-                                     */
+#define WHEEL_PI_INT_MAX_PWM                                                   \
+  100.0f /* anti-windup clamp on the integral term                             \
+          */
 #define WHEEL_PI_DT_S (MOTORS_NBT_TIME_MS / 1000.0f)
-#define WHEEL_PI_TICKS_PER_M                                                   \
-  ((float)TICKS_PER_M) /* single source of truth from board.h */
-
 /* Per-wheel velocity PI — battle-tested PX4 PID core (pid.hpp). Gains/limits
  * set once in init_ROS(). The integrator (kept inside the PID object) is what
  * bridges the static-friction deadband; output is the closed-loop PWM trim
@@ -128,12 +126,127 @@ static int32_t prev_right_ticks_signed_pi = 0;
 static float prev_left_target_mps = 0.0f;
 static float prev_right_target_mps = 0.0f;
 
+/* ---------------------------------------------------------------------------
+ * Firmware-level anti-dig (task #46). ALWAYS active, in every mode, and
+ * un-bypassable by any ROS controller: motors_handler drives the wheels for
+ * docking, mowing AND transit alike (opennav_docking's cmd_vel arrives on the
+ * same PKT_ID_CMD_VEL path), so cutting power here catches the "stuck wheels
+ * keep spinning and dig holes in the lawn" failure that the FTC-level
+ * anti-wheelspin (host, coverage-only) never sees. Per wheel: if it is
+ * COMMANDED to move (|target| > MIN_TARGET) and the loop is actually PUSHING
+ * (|PWM| > MIN_ABS_PWM — the PI integrator has wound past the deadband) but the
+ * encoder logs LESS THAN PROGRESS_FRACTION of the travel the COMMANDED speed
+ * implies over WINDOW_MS, latch the wheel OFF (force PWM 0) until the command
+ * clears. Only ever REDUCES output.
+ *
+ * 2026-07-21: the test is now EXPECTED-vs-ACTUAL, not an absolute floor. The
+ * old gate reset the window whenever the wheel travelled >= a fixed 0.03 m
+ * within it, so a robot slowly PLOWING an obstacle (any creep above that floor,
+ * trivially reachable on soft turf) reset forever and never latched -> it dug
+ * continuously. Comparing actual travel to the distance the *commanded* speed
+ * implies closes that loophole: a wheel plowing at a small fraction of its
+ * command never clears PROGRESS_FRACTION and therefore latches, while a wheel
+ * that keeps up with its command (any speed, any load) is left alone. The
+ * fraction (not an absolute distance) is also self-scaling to the command, so a
+ * slow legitimate dock creep at, say, 0.03 m/s is judged against 0.03 m/s of
+ * expected travel — not against a fixed bar it would fail. */
+#define ANTIDIG_WINDOW_MS 1500u          /* sustained plow/stall before cut [ms] (was 2500) */
+#define ANTIDIG_MIN_TARGET_MPS 0.02f     /* below this the wheel isn't "commanded" */
+#define ANTIDIG_MIN_ABS_PWM 60           /* below this it isn't really "pushing" (deadband ~40) */
+#define ANTIDIG_PROGRESS_FRACTION 0.30f  /* latch if actual travel < 30% of commanded travel over the window */
+static uint32_t l_dig_stall_ms = 0u;
+static uint32_t r_dig_stall_ms = 0u;
+static int32_t l_dig_stall_ticks = 0;     /* actual |ticks| accumulated over the window */
+static int32_t r_dig_stall_ticks = 0;
+static float l_dig_exp_ticks = 0.0f;      /* commanded-speed "expected" ticks over the window */
+static float r_dig_exp_ticks = 0.0f;
+static bool l_dig_latched = false;
+static bool r_dig_latched = false;
+
 /* Open-loop feedforward velocity->PWM scale. Runtime-tunable copy of the
  * board.h PWM_PER_MPS default so the ROS 2 host can retune the drive loop via
  * PKT_ID_SET_DRIVE_PID without a reflash. Seeded with the compile-time default,
  * which therefore remains the power-on fallback (this board has no config
  * persistence; the bridge re-sends the gains on every reconnect). */
 static volatile float g_pwm_per_mps = (float)PWM_PER_MPS;
+
+/* Runtime wheel base (centre-to-centre track) used by the differential-drive
+ * inverse kinematics. Seeded with the board.h/template WHEEL_BASE, which remains
+ * the power-on fallback; retunable via PKT_ID_SET_KINEMATICS without a reflash.
+ * The runtime max-speed cap lives in drivemotor.c (g_max_mps / DRIVEMOTOR_*MaxMps)
+ * because it is also consumed there for the anti-dig frame ceiling. */
+static volatile float g_wheel_base = (float)WHEEL_BASE;
+
+/* ---------------------------------------------------------------------------
+ * Gyro-local closed yaw-rate loop (Option C).
+ *
+ * The per-wheel PIs below regulate each wheel's SPEED independently, so the
+ * chassis yaw rate was only their emergent difference — on soft/uneven turf the
+ * actual yaw lagged/overshot the commanded wz (the weave). This loop closes a
+ * real regulator on (commanded wz − measured gyro wz) at the 50 Hz motor
+ * cadence and injects the correction as a SYMMETRIC differential velocity trim
+ * (+right / −left), i.e. it rotates the robot WITHOUT changing mean forward
+ * speed. Consequences of "symmetric": it never fights the host-side
+ * anti-wheelspin forward-speed easing (that only scales vx), and it only shifts
+ * the per-wheel PI setpoints (their deadband-bridging integrators still run).
+ *
+ * SAFETY: firmware stays the sole blade authority; this loop only shapes drive.
+ * Fail-safe by construction — on gyro read failure, hard_stop, or disable, the
+ * trim is 0 and the yaw integrator is reset, degrading to today's open-diff
+ * behaviour. The trim is hard-clamped to ±g_yaw_trim_limit_mps (also the PID
+ * output limit), so even a wrong gyro_sign (positive feedback) can only add a
+ * bounded differential the per-wheel loops still cap at ±MAX_MPS — a bounded
+ * veer, never an unbounded spin. Gains/sign/enable are runtime-tunable via
+ * PKT_ID_SET_YAW_PID. */
+#define YAW_PI_KP_DEFAULT 0.30f          /* m/s trim per rad/s yaw error */
+#define YAW_PI_KI_DEFAULT 0.40f          /* m/s trim per (rad/s·s) */
+#define YAW_TRIM_LIMIT_MPS_DEFAULT 0.15f /* clamp on |differential trim| [m/s] */
+/* Integral term is clamped TIGHTER than the total trim (leaves headroom for the
+ * P term and limits integral-driven overshoot/hunting). */
+#define YAW_INT_LIMIT_FRAC 0.60f
+/* Turn-exit anti-windup (task #37): when |commanded wz| falls from clearly
+ * turning (> HI) to nearly straight (< LO) in one step, dump the integrator so
+ * the wind-up built up through a U-turn doesn't drive a lingering differential
+ * on the straight that follows (the reported post-U-turn wiggle). */
+#define YAW_TURN_EXIT_HI_RADPS 0.40f
+#define YAW_TURN_EXIT_LO_RADPS 0.15f
+/* Low-speed authority scaling (task #37): below REF forward speed the yaw
+ * correction (trim + a per-cycle integral leak) is scaled toward FLOOR so the
+ * loop doesn't hunt on gyro noise when nearly stopped at the dock. The base
+ * rotation still comes from the IK feedforward (snap targets), so an in-place
+ * PRE_ROTATE pivot — commanded vx≈0 — is unaffected; only the closed-loop
+ * correction is de-rated. On straights (vx ≥ REF) the scale is 1.0, so the
+ * working straight-line weave rejection is untouched. */
+#define YAW_LOWSPEED_REF_MPS 0.15f
+#define YAW_LOWSPEED_FLOOR 0.25f
+#define YAW_INT_LEAK_AT_FLOOR 0.90f /* per-cycle integral retain factor at FLOOR authority */
+/* Anti-self-oscillation (task #39): the loop was self-exciting a ~2-4 Hz yaw
+ * limit-cycle against the wheel deadband/stiction while the command was smooth
+ * (~0.15 Hz). Two damping terms, both only REDUCE aggressiveness:
+ *  - 1st-order IIR low-pass on the gyro feedback: alpha = dt / (RC + dt). At the
+ *    50 Hz (dt=20 ms) motor rate, alpha=0.30 → RC≈47 ms → cutoff ≈ 3.4 Hz: it
+ *    attenuates the 2-4 Hz self-oscillation the loop was chasing while adding
+ *    little phase lag at the ~0.15 Hz of a real turn.
+ *  - Slew-rate limit on the injected trim: caps |Δtrim| per 20 ms cycle so the
+ *    output can't snap across the wheel deadband and re-excite the cycle. At
+ *    0.03 m/s/cycle, full-scale (±0.15) takes ~5 cycles (100 ms) — invisible to a
+ *    0.15 Hz command, fatal to a 2-4 Hz one. */
+#define YAW_GYRO_LP_ALPHA 0.30f
+#define YAW_TRIM_SLEW_MPS_PER_CYCLE 0.03f
+static PID yaw_pid;
+static float prev_yaw_trim_mps = 0.0f;
+static float prev_applied_yaw_trim_mps = 0.0f; /* last trim actually injected (slew-limit state) */
+static float yaw_gyro_filt = 0.0f;             /* low-passed gyro yaw rate [rad/s] */
+static uint8_t yaw_gyro_filt_valid = 0u;       /* 0 until the IIR is seeded after a reset */
+static float prev_cmd_wz = 0.0f;
+static volatile float cmd_wz = 0.0f; /* commanded yaw rate [rad/s], set by on_cmd_vel */
+static volatile uint8_t g_yaw_loop_enabled = 1;   /* default on for A/B */
+static volatile float g_yaw_gyro_sign = 1.0f;     /* gyro Z sign vs robot +yaw */
+static volatile float g_yaw_trim_limit_mps = YAW_TRIM_LIMIT_MPS_DEFAULT;
+/* Host-measured mean at-rest gyro-Z bias [rad/s], raw sensor frame. Subtracted
+ * before the sign multiply so open-loop moves (BackUp) hold a true straight line
+ * instead of tracing the bias as an arc. 0 until the host sends SET_YAW_PID. */
+static volatile float g_yaw_gyro_bias = 0.0f;
 
 /* ---------------------------------------------------------------------------
  * Blade motor control state
@@ -159,6 +272,24 @@ static uint8_t hl_gps_quality = 0;
 static volatile uint32_t last_heartbeat_tick = 0;
 #define HEARTBEAT_TIMEOUT_MS 2000u
 
+/* True when the CURRENTLY latched emergency was raised SOLELY by the heartbeat
+ * watchdog (host comms lost), with no physical safety sensor asserted. A pure
+ * comms-loss latch is a fail-safe stop, not a physical hazard, so it is
+ * auto-cleared when heartbeats resume (and no sensor is asserted) instead of
+ * stranding the robot until a manual play-button / GUI reset. A physical
+ * trigger (e-stop button, lift, tilt) clears this flag so its latch still
+ * requires an explicit operator release. The blade stays cut throughout — it
+ * only re-arms on an explicit CMD_BLADE after the emergency clears. */
+static volatile bool heartbeat_only_latch = false;
+
+/* Any physical safety sensor currently asserted? Firmware is the sole safety
+ * authority; this gates every automatic emergency clear. */
+static inline bool any_physical_emergency(void) {
+  return Emergency_StopButtonYellow() || Emergency_StopButtonWhite() ||
+         Emergency_WheelLiftBlue() || Emergency_WheelLiftRed() ||
+         Emergency_Tilt() || Emergency_LowZAccelerometer();
+}
+
 /* ---------------------------------------------------------------------------
  * Reboot flag
  * ---------------------------------------------------------------------------*/
@@ -183,6 +314,42 @@ static uint32_t last_odom_tick = 0;
 static void update_blade_led(void);
 
 /* ---------------------------------------------------------------------------
+ * Broadcast backpressure helpers
+ * ---------------------------------------------------------------------------*/
+static inline bool nbt_due(const nbt_t *nbt, const uint32_t now_tick) {
+  return (now_tick - nbt->previousMillis) > nbt->timeout;
+}
+
+static inline void nbt_consume(nbt_t *nbt, const uint32_t now_tick) {
+  nbt->previousMillis = now_tick;
+}
+
+static inline uint32_t usb_cdc_framed_packet_size(const size_t raw_packet_size) {
+  /* All current packets are far below 254 bytes, so COBS adds at most one
+   * overhead byte. Framed wire size = leading 0x00 + encoded payload + trailing
+   * 0x00 <= raw + 3. */
+  return (uint32_t)raw_packet_size + 3u;
+}
+
+static inline bool usb_cdc_can_queue_bytes(const uint32_t wire_bytes) {
+  return CDC_TXQueue_GetWriteAvailable() >= wire_bytes;
+}
+
+static inline bool usb_cdc_should_send_telemetry_packet(
+    const uint32_t wire_bytes) {
+  if (!CDC_ShouldSendTelemetry()) {
+    return false;
+  }
+
+  if (!usb_cdc_can_queue_bytes(wire_bytes)) {
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_CDC_TX_QUEUE_FULL);
+    return false;
+  }
+
+  return true;
+}
+
+/* ---------------------------------------------------------------------------
  * COBS packet handlers (Host -> Firmware)
  * ---------------------------------------------------------------------------*/
 
@@ -191,20 +358,37 @@ static void on_heartbeat(const uint8_t *data, size_t len) {
     return;
   }
 
-  const pkt_heartbeat_t *pkt = (const pkt_heartbeat_t *)data;
+  const pkt_heartbeat_t *pkt = reinterpret_cast<const pkt_heartbeat_t *>(data);
 
   last_heartbeat_tick = HAL_GetTick();
 
+  /* Comms restored. If the active emergency was a PURE comms-loss watchdog latch
+   * (no physical trigger) and no sensor is asserted now, auto-clear it so a brief
+   * host/USB stall doesn't strand the robot until a manual reset. A physical
+   * trigger that appeared in the meantime asserts a sensor (handled below) and
+   * clears heartbeat_only_latch, so this never auto-clears a physical e-stop. */
+  if (heartbeat_only_latch && Emergency_State()) {
+    if (!any_physical_emergency()) {
+      Emergency_SetState(0);
+      heartbeat_only_latch = false;
+      debug_printf("heartbeat resumed: comms-loss emergency auto-cleared\r\n");
+    } else {
+      /* A physical sensor is now asserted — this is no longer a pure comms
+       * latch; require an explicit operator release. */
+      heartbeat_only_latch = false;
+    }
+  }
+
   if (pkt->emergency_requested) {
+    heartbeat_only_latch = false;  /* host-commanded e-stop is not comms-loss */
     Emergency_SetState(1);
   }
   if (pkt->emergency_release_requested) {
     /* Only clear emergency if no physical sensor is still asserted.
      * Firmware is the sole safety authority — never bypass hardware. */
-    if (!Emergency_StopButtonYellow() && !Emergency_StopButtonWhite() &&
-        !Emergency_WheelLiftBlue() && !Emergency_WheelLiftRed() &&
-        !Emergency_Tilt() && !Emergency_LowZAccelerometer()) {
+    if (!any_physical_emergency()) {
       Emergency_SetState(0);
+      heartbeat_only_latch = false;
     } else {
       debug_printf(
           "emergency release rejected: physical sensor still active\r\n");
@@ -217,7 +401,7 @@ static void on_cmd_vel(const uint8_t *data, size_t len) {
     return;
   }
 
-  const pkt_cmd_vel_t *pkt = (const pkt_cmd_vel_t *)data;
+  const pkt_cmd_vel_t *pkt = reinterpret_cast<const pkt_cmd_vel_t *>(data);
 
   last_cmd_vel_tick = HAL_GetTick();
 
@@ -228,18 +412,28 @@ static void on_cmd_vel(const uint8_t *data, size_t len) {
   const float vx = pkt->linear_x;
   const float wz = pkt->angular_z;
 
-  /* Differential-drive inverse kinematics — per-wheel linear speed. */
-  float left_mps = vx - wz * WHEEL_BASE * 0.5f;
-  float right_mps = vx + wz * WHEEL_BASE * 0.5f;
+  /* Commanded yaw rate for the firmware yaw-rate loop (Option C), read in the
+   * motor timebase by motors_handler. Stored raw (pre-IK) so the loop tracks
+   * the operator/Nav2 intent, not the clamped per-wheel reconstruction. */
+  cmd_wz = wz;
 
-  if (left_mps > MAX_MPS)
-    left_mps = MAX_MPS;
-  if (left_mps < -MAX_MPS)
-    left_mps = -MAX_MPS;
-  if (right_mps > MAX_MPS)
-    right_mps = MAX_MPS;
-  if (right_mps < -MAX_MPS)
-    right_mps = -MAX_MPS;
+  /* Differential-drive inverse kinematics — per-wheel linear speed. Wheel base
+   * and the ±cap are runtime values (PKT_ID_SET_KINEMATICS); the compile-time
+   * WHEEL_BASE/MAX_MPS remain the power-on fallback. The cap can only be lowered
+   * below the compiled MAX_MPS ceiling (DRIVEMOTOR_GetMaxMps clamps it). */
+  const float wheel_base = g_wheel_base;
+  const float max_mps = DRIVEMOTOR_GetMaxMps();
+  float left_mps = vx - wz * wheel_base * 0.5f;
+  float right_mps = vx + wz * wheel_base * 0.5f;
+
+  if (left_mps > max_mps)
+    left_mps = max_mps;
+  if (left_mps < -max_mps)
+    left_mps = -max_mps;
+  if (right_mps > max_mps)
+    right_mps = max_mps;
+  if (right_mps < -max_mps)
+    right_mps = -max_mps;
 
   /* Hand the target wheel velocities to the PI loop in motors_handler.
    * The mapping to PWM (feedforward + closed-loop correction) lives
@@ -254,20 +448,23 @@ static void on_set_drive_pid(const uint8_t *data, size_t len) {
     return;
   }
 
-  const pkt_set_drive_pid_t *pkt = (const pkt_set_drive_pid_t *)data;
+  const pkt_set_drive_pid_t *pkt =
+      reinterpret_cast<const pkt_set_drive_pid_t *>(data);
 
   /* Drive behaviour is safety-relevant: reject the whole packet if any field
    * is non-finite, then clamp each field to a safe range before applying so a
    * bad host value can never make the wheel loop diverge. Both wheels share
    * the gains; the output limit stays fixed at 255 PWM (motor controller max).
    * pid_constrain() comes from pid.hpp. */
-  if (!std::isfinite(pkt->kp) || !std::isfinite(pkt->ki) ||
-      !std::isfinite(pkt->kd) || !std::isfinite(pkt->integral_limit) ||
-      !std::isfinite(pkt->pwm_per_mps)) {
+  if (!std::isfinite(pkt->ticks_per_meter) || !std::isfinite(pkt->kp) ||
+      !std::isfinite(pkt->ki) || !std::isfinite(pkt->kd) ||
+      !std::isfinite(pkt->integral_limit) || !std::isfinite(pkt->pwm_per_mps)) {
     debug_printf("set_drive_pid rejected: non-finite field\r\n");
     return;
   }
 
+  const float ticks_per_meter =
+      pid_constrain(pkt->ticks_per_meter, 50.0f, 5000.0f);
   const float kp = pid_constrain(pkt->kp, 0.0f, 200.0f);
   const float ki = pid_constrain(pkt->ki, 0.0f, 20000.0f);
   const float kd = pid_constrain(pkt->kd, 0.0f, 500.0f);
@@ -288,11 +485,111 @@ static void on_set_drive_pid(const uint8_t *data, size_t len) {
   right_wheel_pid.setGains(kp, ki, kd);
   right_wheel_pid.setIntegralLimit(ilim);
   right_wheel_pid.setOutputLimit(255.0f);
+  DRIVEMOTOR_SetTicksPerMeter(ticks_per_meter);
   g_pwm_per_mps = ff;
   __enable_irq();
 
-  debug_printf("set_drive_pid: kp=%.3f ki=%.3f kd=%.3f ilim=%.3f ff=%.3f\r\n",
-               kp, ki, kd, ilim, ff);
+  /* Do not log successful drive-PID updates here: this handler runs in the USB
+   * RX path and hardware_bridge intentionally re-sends the packet in bursts
+   * after reconnect. Printing each success over the debug UART can stall long
+   * enough to starve the main loop and re-trigger the watchdog reboot loop. */
+}
+
+static void on_set_yaw_pid(const uint8_t *data, size_t len) {
+  if (len < sizeof(pkt_set_yaw_pid_t) - 2u) {
+    return;
+  }
+
+  const pkt_set_yaw_pid_t *pkt =
+      reinterpret_cast<const pkt_set_yaw_pid_t *>(data);
+
+  /* Yaw regulation is safety-relevant (it steers the chassis): reject the whole
+   * packet if any gain/limit is non-finite, then clamp before applying so a bad
+   * host value can never make the yaw loop diverge. */
+  if (!std::isfinite(pkt->yaw_kp) || !std::isfinite(pkt->yaw_ki) ||
+      !std::isfinite(pkt->trim_limit_mps) ||
+      !std::isfinite(pkt->gyro_bias_radps)) {
+    debug_printf("set_yaw_pid rejected: non-finite field\r\n");
+    return;
+  }
+
+  const float kp = pid_constrain(pkt->yaw_kp, 0.0f, 5.0f);
+  const float ki = pid_constrain(pkt->yaw_ki, 0.0f, 20.0f);
+  const float tl =
+      pid_constrain(pkt->trim_limit_mps, 0.0f, DRIVEMOTOR_GetMaxMps());
+  const uint8_t en = (pkt->enabled != 0) ? 1u : 0u;
+  const float sign = (pkt->gyro_sign < 0) ? -1.0f : 1.0f;
+  /* A physical at-rest gyro bias is small (WT901: a few deg/s). Clamp hard so a
+   * bad host value can only nudge, not steer — and the differential trim clamp
+   * below bounds the yaw correction regardless. */
+  const float bias = pid_constrain(pkt->gyro_bias_radps, -0.5f, 0.5f);
+
+  /* Apply atomically w.r.t. motors_handler() (reads these at 50 Hz); this
+   * handler runs in USB RX interrupt context. The integral limit is pinned to
+   * the trim limit so the integrator alone can never exceed the differential
+   * clamp. Same __disable_irq guard as on_set_drive_pid. */
+  __disable_irq();
+  yaw_pid.setGains(kp, ki, 0.0f);
+  yaw_pid.setIntegralLimit(tl * YAW_INT_LIMIT_FRAC);
+  yaw_pid.setOutputLimit(tl);
+  g_yaw_trim_limit_mps = tl;
+  g_yaw_gyro_sign = sign;
+  g_yaw_gyro_bias = bias;
+  g_yaw_loop_enabled = en;
+  __enable_irq();
+}
+
+static void on_set_kinematics(const uint8_t *data, size_t len) {
+  if (len < sizeof(pkt_set_kinematics_t) - 2u) {
+    return;
+  }
+
+  const pkt_set_kinematics_t *pkt =
+      reinterpret_cast<const pkt_set_kinematics_t *>(data);
+
+  /* Motion caps are safety-relevant: reject the whole packet if any field is
+   * non-finite, then clamp before applying. max_mps is clamped by
+   * DRIVEMOTOR_SetMaxMps to (0, compile-time MAX_MPS] — the wire can only LOWER
+   * the cap, never raise it above the compiled ceiling. wheel_base is clamped to
+   * a sane physical range. Applied atomically w.r.t. motors_handler() (50 Hz);
+   * this handler runs in USB RX interrupt context. */
+  if (!std::isfinite(pkt->max_mps) || !std::isfinite(pkt->wheel_base)) {
+    debug_printf("set_kinematics rejected: non-finite field\r\n");
+    return;
+  }
+
+  const float wb = pid_constrain(pkt->wheel_base, 0.15f, 0.60f);
+
+  __disable_irq();
+  DRIVEMOTOR_SetMaxMps(pkt->max_mps); /* clamps to (0, MAX_MPS] internally */
+  g_wheel_base = wb;
+  __enable_irq();
+}
+
+static void on_set_safety_limits(const uint8_t *data, size_t len) {
+  if (len < sizeof(pkt_set_safety_limits_t) - 2u) {
+    return;
+  }
+
+  const pkt_set_safety_limits_t *pkt =
+      reinterpret_cast<const pkt_set_safety_limits_t *>(data);
+
+  /* Charge/e-stop limits are safety-critical: reject the whole packet if a charge
+   * field is non-finite. charger.c / emergency.c then clamp EVERY field so the
+   * wire can only make protection STRONGER (lower charge ceiling, faster trips,
+   * harder emergency-clear), never weaker; the compile-time board_defaults values
+   * remain the power-on fallback (an unconnected host = full vetted safety).
+   * emergency_set_timeouts self-guards its group apply; the two charge stores are
+   * individually atomic (single 32-bit writes on Cortex-M3). */
+  if (!std::isfinite(pkt->max_charge_voltage) ||
+      !std::isfinite(pkt->max_charge_current)) {
+    debug_printf("set_safety_limits rejected: non-finite charge field\r\n");
+    return;
+  }
+
+  charger_set_charge_limits(pkt->max_charge_voltage, pkt->max_charge_current);
+  emergency_set_timeouts(pkt->one_wheel_lift_ms, pkt->both_wheels_lift_ms,
+                         pkt->tilt_ms, pkt->stop_button_ms, pkt->play_clear_ms);
 }
 
 static void on_hl_state(const uint8_t *data, size_t len) {
@@ -300,7 +597,7 @@ static void on_hl_state(const uint8_t *data, size_t len) {
     return;
   }
 
-  const pkt_hl_state_t *pkt = (const pkt_hl_state_t *)data;
+  const pkt_hl_state_t *pkt = reinterpret_cast<const pkt_hl_state_t *>(data);
 
   hl_current_mode = pkt->current_mode;
   hl_gps_quality = pkt->gps_quality;
@@ -341,6 +638,7 @@ static void on_hl_state(const uint8_t *data, size_t len) {
     PANEL_Set_LED(PANEL_LED_8H, PANEL_LED_OFF);
     main_eOpenmowerStatus = OPENMOWER_STATUS_IDLE;
     left_target_mps = right_target_mps = 0.0f;
+    cmd_wz = 0.0f;
     blade_on_off = target_blade_on_off = 0;
     break;
   }
@@ -353,7 +651,7 @@ static void on_cmd_blade(const uint8_t *data, size_t len) {
     return;
   }
 
-  const pkt_cmd_blade_t *pkt = (const pkt_cmd_blade_t *)data;
+  const pkt_cmd_blade_t *pkt = reinterpret_cast<const pkt_cmd_blade_t *>(data);
   /* Defense-in-depth: never arm the blade target while IDLE/docked. The
    * authoritative gate is in motors_handler (which zeroes blade_on_off in
    * IDLE every tick), but refusing to latch the target here keeps state
@@ -375,11 +673,34 @@ static void on_reboot(const uint8_t *data, size_t len) {
   if (len < sizeof(pkt_reboot_t) - 2u) {
     return;
   }
-  const pkt_reboot_t *pkt = (const pkt_reboot_t *)data;
+  const pkt_reboot_t *pkt = reinterpret_cast<const pkt_reboot_t *>(data);
   if (pkt->magic == PKT_REBOOT_MAGIC) {
     debug_printf("reboot requested by host\r\n");
     reboot_flag = true;
   }
+}
+
+/* Host -> Firmware config/version request. Replies with this firmware's
+ * wire-protocol version (the compatibility key the host checks) and its
+ * human-readable semver, so the ROS 2 image can confirm it is talking to a
+ * compatible firmware and warn the operator to reflash on mismatch. Firmware
+ * older than this handshake never registers this handler, so it simply never
+ * replies — which the host reads as "incompatible firmware". */
+static void on_config_req(const uint8_t *data, size_t len) {
+  if (len < 1u) {
+    return;
+  }
+  const uint8_t flags = (len >= 2u) ? data[1] : 0u;
+  g_firmware_debug_enabled = (flags & CONFIG_FLAG_FIRMWARE_DEBUG) != 0u ? 1u : 0u;
+
+  pkt_config_rsp_t rsp;
+  rsp.type = PKT_ID_CONFIG_RSP;
+  rsp.protocol_version = MOWGLI_PROTOCOL_VERSION;
+  rsp.active_flags = g_firmware_debug_enabled != 0u ? CONFIG_FLAG_FIRMWARE_DEBUG : 0u;
+  rsp.fw_version_major = MOWGLI_FW_VERSION_MAJOR;
+  rsp.fw_version_minor = MOWGLI_FW_VERSION_MINOR;
+  rsp.fw_version_patch = MOWGLI_FW_VERSION_PATCH;
+  mowgli_comms_send(&rsp, sizeof(rsp));
 }
 
 /* on_hl_state blade LED feedback (moved out of on_hl_state for clarity) */
@@ -403,7 +724,9 @@ static void update_blade_led(void) {
  * USB CDC receive callback — feeds COBS layer
  * ---------------------------------------------------------------------------*/
 uint8_t CDC_DataReceivedHandler(const uint8_t *Buf, uint32_t len) {
+  WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_CDC_RX_PROCESS);
   mowgli_comms_process_rx(Buf, (size_t)len);
+  WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_CDC_RX_EXIT);
   return CDC_RX_DATA_HANDLED;
 }
 
@@ -427,6 +750,63 @@ extern "C" void chatter_handler() {
   }
 }
 
+/* Anti-dig per-wheel step (task #46). Returns true when the wheel must be cut
+ * (caller forces PWM 0 + resets that wheel's integrator). Over each window it
+ * accumulates BOTH the actual travel (|dticks|) AND the travel the commanded
+ * speed implies (|target| × ticks_per_meter × dt); at window end it latches iff
+ * the wheel kept less than PROGRESS_FRACTION of that commanded travel while
+ * pushing. Comparing to the *command* (not a fixed distance) means a wheel that
+ * keeps up with its setpoint — fast or slow, light or heavy load — is never
+ * flagged, while a wheel PLOWING at a small fraction of its command latches
+ * even if its absolute creep is non-trivial (the loophole in the old fixed-
+ * 0.03 m floor, which reset forever on any creep above it). Clears the latch
+ * the instant the command drops below MIN_TARGET.
+ *
+ * MANUAL FIELD TEST (supervised, 2026-07-21 — no host test harness for this
+ * TU): 1) On turf, command a straight drive into a fixed obstacle (wall/post)
+ * so both wheels stall while cmd_vel keeps requesting ~0.15 m/s. Expect BOTH
+ * wheels to cut within ~WINDOW_MS (~1.5 s) — verify no continued grinding.
+ * 2) Back off; confirm the latch clears (wheels drive again) once cmd_vel
+ * returns to ~0. 3) Regression: a full normal mow + a slow dock approach must
+ * NOT trip the latch (heavy grass load and slope climbing keep >30% of the
+ * commanded travel). 4) Half-block ONE wheel (e.g. against a low kerb) and
+ * confirm only that wheel latches. */
+static bool antidig_step(uint32_t *stall_ms, int32_t *stall_ticks,
+                         float *exp_ticks, bool *latched, float target,
+                         int16_t pwm, int32_t dticks, float ticks_per_meter) {
+  const bool commanded = fabsf(target) > ANTIDIG_MIN_TARGET_MPS;
+  if (!commanded) {
+    *stall_ms = 0u;
+    *stall_ticks = 0;
+    *exp_ticks = 0.0f;
+    *latched = false;
+    return false;
+  }
+  if (*latched) {
+    return true; /* hold until the command clears (handled above) */
+  }
+  const bool pushing = (pwm > ANTIDIG_MIN_ABS_PWM) || (pwm < -ANTIDIG_MIN_ABS_PWM);
+  if (!pushing) {
+    *stall_ms = 0u;
+    *stall_ticks = 0;
+    *exp_ticks = 0.0f;
+    return false;
+  }
+  *stall_ms += MOTORS_NBT_TIME_MS;
+  *stall_ticks += (dticks < 0) ? -dticks : dticks;
+  *exp_ticks += fabsf(target) * ticks_per_meter * WHEEL_PI_DT_S;
+  if (*stall_ms >= ANTIDIG_WINDOW_MS) {
+    if ((float)(*stall_ticks) < ANTIDIG_PROGRESS_FRACTION * (*exp_ticks)) {
+      *latched = true; /* pushed the whole window, kept <30% of commanded travel → dig */
+    } else {
+      *stall_ms = 0u; /* keeping up with the command — reset the window */
+      *stall_ticks = 0;
+      *exp_ticks = 0.0f;
+    }
+  }
+  return *latched;
+}
+
 /* ---------------------------------------------------------------------------
  * Drive & blade motors handler
  * ---------------------------------------------------------------------------*/
@@ -436,9 +816,11 @@ extern "C" void motors_handler() {
     __disable_irq();
     float snap_left_target = left_target_mps;
     float snap_right_target = right_target_mps;
+    float snap_cmd_wz = cmd_wz;
     uint8_t snap_target_blade = target_blade_on_off;
     uint32_t snap_heartbeat = last_heartbeat_tick;
     uint32_t snap_cmd_vel = last_cmd_vel_tick;
+    float snap_ticks_per_meter = DRIVEMOTOR_GetTicksPerMeter();
     __enable_irq();
 
     blade_on_off = snap_target_blade;
@@ -473,8 +855,133 @@ extern "C" void motors_handler() {
       }
     }
 
-    const float l_target = hard_stop ? 0.0f : snap_left_target;
-    const float r_target = hard_stop ? 0.0f : snap_right_target;
+    /* --- Option C: gyro-local closed yaw-rate loop ---
+     * Regulate (commanded wz − measured gyro wz) and fold the output in as a
+     * symmetric differential velocity trim on the per-wheel setpoints (below).
+     * Runs before the per-wheel PIs so their integrators track the trimmed
+     * setpoint. See the block comment at the yaw-loop globals for rationale and
+     * the bounded-failure argument. */
+    float yaw_trim_mps = 0.0f;
+    const bool yaw_loop_active = (g_yaw_loop_enabled != 0u) && !hard_stop;
+    /* Reset the yaw integrator on stop / yaw-direction reversal (mirrors the
+     * per-wheel resets) AND at turn-exit — a sharp drop in |commanded wz| from
+     * turning to straight (task #37). Dumping the wind-up here is what kills the
+     * reported post-U-turn wiggle: without it the integral accumulated while
+     * holding the turn keeps driving a differential onto the following straight. */
+    const bool yaw_turn_exit = (fabsf(prev_cmd_wz) > YAW_TURN_EXIT_HI_RADPS &&
+                                fabsf(snap_cmd_wz) < YAW_TURN_EXIT_LO_RADPS);
+    const bool yaw_reset = !yaw_loop_active ||
+                           (snap_cmd_wz == 0.0f && prev_cmd_wz != 0.0f) ||
+                           (snap_cmd_wz * prev_cmd_wz < 0.0f) || yaw_turn_exit;
+    if (yaw_reset) {
+      yaw_pid.resetIntegral();
+      yaw_pid.resetDerivative();
+      yaw_gyro_filt_valid = 0u; /* re-seed the gyro low-pass after a reset */
+    }
+    prev_cmd_wz = snap_cmd_wz;
+
+    /* Low-speed authority scale from COMMANDED mean forward speed: 1.0 at/above
+     * REF, ramping down to FLOOR as vx→0. Uses the commanded (not measured)
+     * speed so a momentary stall doesn't collapse authority, and so an in-place
+     * pivot (vx≈0) is de-rated to FLOOR rather than zeroed — the pivot itself
+     * still comes from the IK feedforward. On straights this is 1.0, leaving the
+     * (working) weave rejection untouched. */
+    const float yaw_vx_cmd = 0.5f * (snap_left_target + snap_right_target);
+    float yaw_speed_scale = fabsf(yaw_vx_cmd) / YAW_LOWSPEED_REF_MPS;
+    if (yaw_speed_scale > 1.0f)
+      yaw_speed_scale = 1.0f;
+    yaw_speed_scale =
+        YAW_LOWSPEED_FLOOR + (1.0f - YAW_LOWSPEED_FLOOR) * yaw_speed_scale;
+
+    if (yaw_loop_active) {
+      float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+      /* Fresh gyro read in the motor timebase. On I2C failure hold trim at 0
+       * (degrade to open-diff) rather than injecting a stale/bogus correction.
+       * Both this and the IMU broadcast read run in the cooperative main loop,
+       * so there is no re-entrancy on the software-I2C bus. */
+      if (IMU_TryReadGyro(&gx, &gy, &gz)) {
+        /* Subtract the host-measured at-rest gyro-Z bias BEFORE the sign
+         * multiply — meas = sign*(gz - bias) — so nulling the loop drives the
+         * TRUE yaw rate to the setpoint. Without this, an open-loop BackUp
+         * (wz=0) would hold sign*gz=0, i.e. true_rate=-bias, a constant arc. */
+        const float meas_wz_raw =
+            g_yaw_gyro_sign * (gz - g_yaw_gyro_bias); /* rad/s, robot +yaw = CCW */
+        /* 1st-order IIR low-pass on the gyro feedback (seeded on the first
+         * sample after a reset to avoid a startup transient) so the loop stops
+         * chasing the 2-4 Hz self-oscillation. */
+        if (!yaw_gyro_filt_valid) {
+          yaw_gyro_filt = meas_wz_raw;
+          yaw_gyro_filt_valid = 1u;
+        } else {
+          yaw_gyro_filt += YAW_GYRO_LP_ALPHA * (meas_wz_raw - yaw_gyro_filt);
+        }
+        const float meas_wz = yaw_gyro_filt;
+        const float yaw_err = snap_cmd_wz - meas_wz;
+        /* Conditional-integration anti-windup: freeze the integrator only in
+         * the direction that would push |trim| further past the clamp (same
+         * pattern as the per-wheel loop). Keyed on the RAW (unscaled) trim so
+         * the low-speed scaling below doesn't defeat the saturation test. */
+        const bool yaw_update_integral =
+            !((prev_yaw_trim_mps >= g_yaw_trim_limit_mps && yaw_err > 0.0f) ||
+              (prev_yaw_trim_mps <= -g_yaw_trim_limit_mps && yaw_err < 0.0f));
+        yaw_pid.setSetpoint(snap_cmd_wz);
+        float raw_trim =
+            yaw_pid.update(meas_wz, WHEEL_PI_DT_S, yaw_update_integral);
+        /* Hard clamp (belt-and-suspenders over the PID output limit) — the
+         * differential correction is bounded so a wrong gyro_sign can only veer,
+         * never spin unbounded. */
+        if (raw_trim > g_yaw_trim_limit_mps)
+          raw_trim = g_yaw_trim_limit_mps;
+        if (raw_trim < -g_yaw_trim_limit_mps)
+          raw_trim = -g_yaw_trim_limit_mps;
+        prev_yaw_trim_mps = raw_trim; /* anti-windup uses the unscaled value */
+
+        /* Low-speed integral leak: bleed the integrator toward 0 when authority
+         * is de-rated (retain=1.0 at full speed → no leak; approaches
+         * YAW_INT_LEAK_AT_FLOOR near the dock) so accumulated bias can't sit and
+         * hunt while nearly stopped. */
+        const float yaw_int_retain =
+            YAW_INT_LEAK_AT_FLOOR +
+            (1.0f - YAW_INT_LEAK_AT_FLOOR) * yaw_speed_scale;
+        yaw_pid.setIntegral(yaw_pid.getIntegral() * yaw_int_retain);
+
+        /* Apply the low-speed authority scale to the correction actually
+         * injected (base rotation is unaffected — it rides the IK feedforward). */
+        yaw_trim_mps = raw_trim * yaw_speed_scale;
+      }
+      /* Slew-rate limit the injected trim (runs even on a gyro-read failure,
+       * where yaw_trim_mps is 0, so prev tracks the applied value): the output
+       * can't snap across the wheel deadband in one cycle and re-excite the
+       * limit-cycle. */
+      const float yaw_dtrim = yaw_trim_mps - prev_applied_yaw_trim_mps;
+      if (yaw_dtrim > YAW_TRIM_SLEW_MPS_PER_CYCLE)
+        yaw_trim_mps = prev_applied_yaw_trim_mps + YAW_TRIM_SLEW_MPS_PER_CYCLE;
+      else if (yaw_dtrim < -YAW_TRIM_SLEW_MPS_PER_CYCLE)
+        yaw_trim_mps = prev_applied_yaw_trim_mps - YAW_TRIM_SLEW_MPS_PER_CYCLE;
+      prev_applied_yaw_trim_mps = yaw_trim_mps;
+    } else {
+      prev_yaw_trim_mps = 0.0f;
+      prev_applied_yaw_trim_mps = 0.0f;
+    }
+
+    /* Apply the symmetric differential trim to the per-wheel setpoints
+     * (+right / −left increases yaw rate, matching the IK in on_cmd_vel), then
+     * re-clamp to the physical wheel-speed limit. hard_stop forces 0. */
+    float l_target = snap_left_target - yaw_trim_mps;
+    float r_target = snap_right_target + yaw_trim_mps;
+    if (hard_stop) {
+      l_target = 0.0f;
+      r_target = 0.0f;
+    }
+    const float max_mps = DRIVEMOTOR_GetMaxMps();
+    if (l_target > max_mps)
+      l_target = max_mps;
+    if (l_target < -max_mps)
+      l_target = -max_mps;
+    if (r_target > max_mps)
+      r_target = max_mps;
+    if (r_target < -max_mps)
+      r_target = -max_mps;
 
 #if USE_WHEEL_PI
     /* Wheel-level PI loop.
@@ -501,9 +1008,9 @@ extern "C" void motors_handler() {
     prev_right_ticks_signed_pi = cur_right_ticks;
 
     const float l_actual_mps =
-        ((float)dleft_ticks) / WHEEL_PI_TICKS_PER_M / WHEEL_PI_DT_S;
+        ((float)dleft_ticks) / snap_ticks_per_meter / WHEEL_PI_DT_S;
     const float r_actual_mps =
-        ((float)dright_ticks) / WHEEL_PI_TICKS_PER_M / WHEEL_PI_DT_S;
+        ((float)dright_ticks) / snap_ticks_per_meter / WHEEL_PI_DT_S;
 
     /* Reset the integrator on direction reversal / stop-to-go / hard-stop.
      * Without this the integral built up while decelerating would drive the
@@ -568,6 +1075,23 @@ extern "C" void motors_handler() {
     right_pwm_signed = (r_target == 0.0f && fabsf(r_actual_mps) < 0.02f)
                            ? 0
                            : (int16_t)r_pwm_f;
+
+    /* Anti-dig cutout (always active, all modes). The step compares actual
+     * travel to the travel the commanded speed implies, using the live
+     * ticks_per_meter so both sides of the ratio track calibration.
+     * dleft/dright_ticks and left/right_pwm_signed are this cycle's values. */
+    if (antidig_step(&l_dig_stall_ms, &l_dig_stall_ticks, &l_dig_exp_ticks,
+                     &l_dig_latched, l_target, left_pwm_signed, dleft_ticks,
+                     snap_ticks_per_meter)) {
+      left_pwm_signed = 0;
+      left_wheel_pid.resetIntegral();
+    }
+    if (antidig_step(&r_dig_stall_ms, &r_dig_stall_ticks, &r_dig_exp_ticks,
+                     &r_dig_latched, r_target, right_pwm_signed, dright_ticks,
+                     snap_ticks_per_meter)) {
+      right_pwm_signed = 0;
+      right_wheel_pid.resetIntegral();
+    }
 #else
     /* Open-loop fallback for bring-up / regression A/B. Replicates the
      * pre-PI mapping exactly: PWM = target × PWM_PER_MPS, no encoder
@@ -583,9 +1107,17 @@ extern "C" void motors_handler() {
     }
 
     // Heartbeat watchdog: if no heartbeat for HEARTBEAT_TIMEOUT_MS, emergency
-    // stop
+    // stop. Tag a PURE comms-loss latch (no physical sensor asserted) so it can
+    // be auto-cleared when heartbeats resume (on_heartbeat), instead of
+    // stranding the robot. If a physical sensor is asserted, leave the flag
+    // cleared so the latch needs an explicit operator release.
     if (snap_heartbeat != 0 &&
         (HAL_GetTick() - snap_heartbeat) > HEARTBEAT_TIMEOUT_MS) {
+      if (any_physical_emergency()) {
+        heartbeat_only_latch = false;
+      } else if (!Emergency_State()) {
+        heartbeat_only_latch = true;
+      }
       Emergency_SetState(1);
     }
 
@@ -601,6 +1133,8 @@ extern "C" void panel_handler() {
     PANEL_Tick();
 
     if (buttonupdated == 1 && buttoncleared == 0) {
+      const uint32_t ui_event_wire_bytes =
+          usb_cdc_framed_packet_size(sizeof(pkt_ui_event_t));
       pkt_ui_event_t evt;
       evt.type = PKT_ID_UI_EVENT;
       evt.press_duration = 0; // short press
@@ -608,23 +1142,33 @@ extern "C" void panel_handler() {
       // Map physical buttons to IDs
       if (buttonstate[PANEL_BUTTON_DEF_S1]) {
         evt.button_id = 1;
-        mowgli_comms_send(&evt, sizeof(evt));
+        if (usb_cdc_should_send_telemetry_packet(ui_event_wire_bytes)) {
+          mowgli_comms_send(&evt, sizeof(evt));
+        }
       }
       if (buttonstate[PANEL_BUTTON_DEF_S2]) {
         evt.button_id = 2;
-        mowgli_comms_send(&evt, sizeof(evt));
+        if (usb_cdc_should_send_telemetry_packet(ui_event_wire_bytes)) {
+          mowgli_comms_send(&evt, sizeof(evt));
+        }
       }
       if (buttonstate[PANEL_BUTTON_DEF_LOCK]) {
         evt.button_id = 3;
-        mowgli_comms_send(&evt, sizeof(evt));
+        if (usb_cdc_should_send_telemetry_packet(ui_event_wire_bytes)) {
+          mowgli_comms_send(&evt, sizeof(evt));
+        }
       }
       if (buttonstate[PANEL_BUTTON_DEF_START]) {
         evt.button_id = 4;
-        mowgli_comms_send(&evt, sizeof(evt));
+        if (usb_cdc_should_send_telemetry_packet(ui_event_wire_bytes)) {
+          mowgli_comms_send(&evt, sizeof(evt));
+        }
       }
       if (buttonstate[PANEL_BUTTON_DEF_HOME]) {
         evt.button_id = 5;
-        mowgli_comms_send(&evt, sizeof(evt));
+        if (usb_cdc_should_send_telemetry_packet(ui_event_wire_bytes)) {
+          mowgli_comms_send(&evt, sizeof(evt));
+        }
       }
 
       buttonupdated = 0;
@@ -667,16 +1211,18 @@ wheelTicks_handler(int32_t p_s32LeftTicksSigned, int32_t p_s32RightTicksSigned,
   prev_left_ticks = p_s32LeftTicksSigned;
   prev_right_ticks = p_s32RightTicksSigned;
 
-  /* Velocity: mm/s = (delta_ticks / TICKS_PER_M) * (1000 / dt_ms) * 1000
-   *                = delta_ticks * 1e6 / (TICKS_PER_M * dt_ms).
-   * TICKS_PER_M comes from board.h, so odom + wheel PI share the same
-   * encoder scale. Cast to int64 for the multiply to stay safe.         */
+  /* Velocity: mm/s = (delta_ticks / ticks_per_meter) * (1000 / dt_ms) * 1000
+   *                = delta_ticks * 1e6 / (ticks_per_meter * dt_ms).
+   * ticks_per_meter starts from board.h TICKS_PER_M, then the ROS host can
+   * override it at runtime. Use float math here so fractional tuning values
+   * (e.g. 319.305) survive end-to-end. */
   int16_t left_v_mm_s = 0;
   int16_t right_v_mm_s = 0;
   if (dt_ms > 0) {
-    const int64_t denom = (int64_t)TICKS_PER_M * (int64_t)dt_ms;
-    int64_t v_l = ((int64_t)delta_left * 1000000LL) / denom;
-    int64_t v_r = ((int64_t)delta_right * 1000000LL) / denom;
+    const float ticks_per_meter = DRIVEMOTOR_GetTicksPerMeter();
+    const float scale = 1000000.0f / (ticks_per_meter * (float)dt_ms);
+    int32_t v_l = (int32_t)((float)delta_left * scale);
+    int32_t v_r = (int32_t)((float)delta_right * scale);
     if (v_l > 32767)
       v_l = 32767;
     if (v_l < -32768)
@@ -697,53 +1243,35 @@ wheelTicks_handler(int32_t p_s32LeftTicksSigned, int32_t p_s32RightTicksSigned,
   odom.left_velocity_mm_s = left_v_mm_s;
   odom.right_velocity_mm_s = right_v_mm_s;
 
-  mowgli_comms_send_odometry(&odom);
+  if (usb_cdc_should_send_telemetry_packet(
+          usb_cdc_framed_packet_size(sizeof(pkt_odometry_t)))) {
+    mowgli_comms_send_odometry(&odom);
+  }
 }
 
 /* ---------------------------------------------------------------------------
  * IMU + status broadcast handler
  * ---------------------------------------------------------------------------*/
 extern "C" void broadcast_handler() {
-  if (NBT_handler(&imu_nbt)) {
-    pkt_imu_t imu_pkt;
-    imu_pkt.type = PKT_ID_IMU;
+  WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_ENTER);
+  const uint32_t now_tick = HAL_GetTick();
 
-    static uint32_t last_imu_tick = 0;
-    uint32_t now_tick = HAL_GetTick();
-    imu_pkt.dt_millis = (uint16_t)(now_tick - last_imu_tick);
-    last_imu_tick = now_tick;
+  /* Bound this section to one broadcast group per pass. Without that bound a
+   * delayed loop can emit IMU + reset/status + blade packets back-to-back in
+   * the same WATCHDOG_STAGE_BROADCAST window. The USB CDC enqueue path is
+   * non-blocking, but building and queueing several packets in one pass still
+   * stretches the watchdog window unnecessarily when USB is backpressured. */
+  if (nbt_due(&status_nbt, now_tick)) {
+    const uint32_t status_group_bytes =
+        usb_cdc_framed_packet_size(sizeof(pkt_reset_cause_t)) +
+        usb_cdc_framed_packet_size(sizeof(pkt_status_t));
+    if (!usb_cdc_should_send_telemetry_packet(status_group_bytes)) {
+      WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
+      return;
+    }
 
-#ifdef EXTERNAL_IMU_ACCELERATION
-    float ax, ay, az;
-    IMU_ReadAccelerometer(&ax, &ay, &az);
-    imu_pkt.acceleration_mss[0] = ax;
-    imu_pkt.acceleration_mss[1] = ay;
-    imu_pkt.acceleration_mss[2] = az;
-#else
-    imu_pkt.acceleration_mss[0] = 0.0f;
-    imu_pkt.acceleration_mss[1] = 0.0f;
-    imu_pkt.acceleration_mss[2] = 0.0f;
-#endif
+    nbt_consume(&status_nbt, now_tick);
 
-#ifdef EXTERNAL_IMU_ANGULAR
-    float gx, gy, gz;
-    IMU_ReadGyro(&gx, &gy, &gz);
-    imu_pkt.gyro_rads[0] = gx;
-    imu_pkt.gyro_rads[1] = gy;
-    imu_pkt.gyro_rads[2] = gz;
-#else
-    imu_pkt.gyro_rads[0] = 0.0f;
-    imu_pkt.gyro_rads[1] = 0.0f;
-    imu_pkt.gyro_rads[2] = 0.0f;
-#endif
-
-    // Magnetometer — uses generic IMU_ReadMag (works with any IMU that has mag)
-    IMU_ReadMag(&imu_pkt.mag_uT[0], &imu_pkt.mag_uT[1], &imu_pkt.mag_uT[2]);
-
-    mowgli_comms_send_imu(&imu_pkt);
-  }
-
-  if (NBT_handler(&status_nbt)) {
     pkt_status_t status_pkt;
     status_pkt.type = PKT_ID_STATUS;
 
@@ -789,21 +1317,108 @@ extern "C" void broadcast_handler() {
     status_pkt.charging_current = current;
     status_pkt.batt_percentage = 0; // TODO: compute from voltage curve
 
+    pkt_reset_cause_t reset_pkt;
+    reset_pkt.type = PKT_ID_RESET_CAUSE;
+    reset_pkt.reset_cause = g_boot_reset_cause_code;
+    reset_pkt.last_stage_before_reset = g_boot_last_watchdog_stage_code;
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_RESET_SEND);
+    mowgli_comms_send(&reset_pkt, sizeof(reset_pkt));
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_STATUS_SEND);
     mowgli_comms_send_status(&status_pkt);
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
+    return;
+  }
+
+  if (nbt_due(&imu_nbt, now_tick)) {
+    const uint32_t imu_wire_bytes = usb_cdc_framed_packet_size(sizeof(pkt_imu_t));
+    if (!usb_cdc_should_send_telemetry_packet(imu_wire_bytes)) {
+      WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
+      return;
+    }
+
+    nbt_consume(&imu_nbt, now_tick);
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_IMU_BUILD);
+
+    static uint32_t last_imu_tick = 0;
+    float ax = 0.0f;
+    float ay = 0.0f;
+    float az = 0.0f;
+    float gx = 0.0f;
+    float gy = 0.0f;
+    float gz = 0.0f;
+    float mx = 0.0f;
+    float my = 0.0f;
+    float mz = 0.0f;
+
+#ifdef EXTERNAL_IMU_ACCELERATION
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_IMU_ACCEL);
+    if (!IMU_TryReadAccelerometer(&ax, &ay, &az)) {
+      WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
+      return;
+    }
+#endif
+
+#ifdef EXTERNAL_IMU_ANGULAR
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_IMU_GYRO);
+    if (!IMU_TryReadGyro(&gx, &gy, &gz)) {
+      WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
+      return;
+    }
+#endif
+
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_IMU_MAG);
+    if (!IMU_TryReadMag(&mx, &my, &mz)) {
+      WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
+      return;
+    }
+
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_IMU_PACKET_FILL);
+
+    pkt_imu_t imu_pkt = {};
+    imu_pkt.type = PKT_ID_IMU;
+    imu_pkt.dt_millis = (uint16_t)(now_tick - last_imu_tick);
+    last_imu_tick = now_tick;
+    imu_pkt.acceleration_mss[0] = ax;
+    imu_pkt.acceleration_mss[1] = ay;
+    imu_pkt.acceleration_mss[2] = az;
+    imu_pkt.gyro_rads[0] = gx;
+    imu_pkt.gyro_rads[1] = gy;
+    imu_pkt.gyro_rads[2] = gz;
+    imu_pkt.mag_uT[0] = mx;
+    imu_pkt.mag_uT[1] = my;
+    imu_pkt.mag_uT[2] = mz;
+
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_IMU_SEND);
+    mowgli_comms_send_imu(&imu_pkt);
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
+    return;
   }
 
   // Blade motor status (4 Hz) — only after system has initialized
-  if (NBT_handler(&blade_nbt) && last_heartbeat_tick != 0u) {
-    pkt_blade_status_t blade_pkt;
-    memset(&blade_pkt, 0, sizeof(blade_pkt));
+  if (last_heartbeat_tick != 0u && nbt_due(&blade_nbt, now_tick)) {
+    const uint32_t blade_wire_bytes =
+        usb_cdc_framed_packet_size(sizeof(pkt_blade_status_t));
+    if (!usb_cdc_should_send_telemetry_packet(blade_wire_bytes)) {
+      WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
+      return;
+    }
+
+    nbt_consume(&blade_nbt, now_tick);
+
+    pkt_blade_status_t blade_pkt = {};
     blade_pkt.type = PKT_ID_BLADE_STATUS;
     blade_pkt.is_active = BLADEMOTOR_bActivated ? 1u : 0u;
     blade_pkt.rpm = BLADEMOTOR_u16RPM;
     blade_pkt.power_watts = BLADEMOTOR_u16Power;
     blade_pkt.temperature = blade_temperature;
     blade_pkt.error_count = BLADEMOTOR_u32Error;
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_BLADE_SEND);
     mowgli_comms_send(&blade_pkt, sizeof(blade_pkt));
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
+    return;
   }
+
+  WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_BROADCAST_EXIT);
 }
 
 /* ---------------------------------------------------------------------------
@@ -828,6 +1443,10 @@ extern "C" void init_ROS() {
   mowgli_comms_register_handler(PKT_ID_CMD_BLADE, on_cmd_blade);
   mowgli_comms_register_handler(PKT_ID_REBOOT, on_reboot);
   mowgli_comms_register_handler(PKT_ID_SET_DRIVE_PID, on_set_drive_pid);
+  mowgli_comms_register_handler(PKT_ID_SET_YAW_PID, on_set_yaw_pid);
+  mowgli_comms_register_handler(PKT_ID_SET_KINEMATICS, on_set_kinematics);
+  mowgli_comms_register_handler(PKT_ID_SET_SAFETY_LIMITS, on_set_safety_limits);
+  mowgli_comms_register_handler(PKT_ID_CONFIG_REQ, on_config_req);
 
   // Initialise timers
   NBT_init(&led_nbt, LED_NBT_TIME_MS);
@@ -851,6 +1470,12 @@ extern "C" void init_ROS() {
                            0.0f);
   right_wheel_pid.setIntegralLimit(WHEEL_PI_INT_MAX_PWM);
   right_wheel_pid.setOutputLimit(255.0f);
+
+  /* Gyro yaw-rate loop (Option C). Output/integral both clamped to the trim
+   * limit so the differential correction is bounded regardless of gains. */
+  yaw_pid.setGains(YAW_PI_KP_DEFAULT, YAW_PI_KI_DEFAULT, 0.0f);
+  yaw_pid.setIntegralLimit(YAW_TRIM_LIMIT_MPS_DEFAULT * YAW_INT_LIMIT_FRAC);
+  yaw_pid.setOutputLimit(YAW_TRIM_LIMIT_MPS_DEFAULT);
 #endif
 
   last_odom_tick = HAL_GetTick();

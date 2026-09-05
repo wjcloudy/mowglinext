@@ -1,5 +1,6 @@
 import {StopOutlined, CheckCircleOutlined} from "@ant-design/icons";
 import {App, Button} from "antd";
+import {useTranslation} from "react-i18next";
 import {useThemeMode} from "../../../theme/ThemeContext.tsx";
 import type {TrackedObstacle} from "../../../types/ros.ts";
 import {useApi} from "../../../hooks/useApi.ts";
@@ -13,6 +14,12 @@ interface TrackedObstaclesPanelProps {
     obstacleAreaIndex: Record<number, number | null>;
     /// Human-readable area name per area_index, for the confirm dialog.
     areaNames: Record<number, string>;
+    /// Currently hovered/selected obstacle id (shared with the map layer so the
+    /// matching row + polygon highlight together). null = nothing highlighted.
+    selectedObstacleId: number | null;
+    /// Report a row hover so the map can highlight the matching polygon. Pass
+    /// the obstacle id on enter, null on leave.
+    onHoverObstacle: (id: number | null) => void;
 }
 
 /// Lists tracked obstacles published by /obstacle_tracker/obstacles. Each row
@@ -20,8 +27,9 @@ interface TrackedObstaclesPanelProps {
 /// transient observation becomes a permanent keepout for the containing area.
 /// After the obstacle-tracker decouple (#6), this is the only path that
 /// adds entries to obstacle_polygons_ at runtime — auto-promotion is gone.
-export const TrackedObstaclesPanel = ({obstacles, obstacleAreaIndex, areaNames}: TrackedObstaclesPanelProps) => {
+export const TrackedObstaclesPanel = ({obstacles, obstacleAreaIndex, areaNames, selectedObstacleId, onHoverObstacle}: TrackedObstaclesPanelProps) => {
     const {colors} = useThemeMode();
+    const {t} = useTranslation();
     const {modal, notification} = App.useApp();
     const api = useApi();
 
@@ -32,29 +40,29 @@ export const TrackedObstaclesPanel = ({obstacles, obstacleAreaIndex, areaNames}:
         const areaIdx = obstacleAreaIndex[id];
         if (areaIdx == null) {
             notification.warning({
-                message: "Obstacle is outside every mowing area",
-                description: "Draw a mowing area that covers this obstacle before promoting it.",
+                message: t('mapTrackedObstacles.outsideAreaMessage'),
+                description: t('mapTrackedObstacles.outsideAreaDescription'),
             });
             return;
         }
-        const areaLabel = areaNames[areaIdx] ?? `area ${areaIdx}`;
+        const areaLabel = areaNames[areaIdx] ?? t('mapTrackedObstacles.areaFallback', {index: areaIdx});
 
         modal.confirm({
-            title: "Promote obstacle to permanent keepout?",
+            title: t('mapTrackedObstacles.confirmTitleWithId', {id}),
             content: (
                 <div>
                     <p>
-                        This adds the polygon as a permanent keepout in <strong>{areaLabel}</strong>.
-                        The robot will plan around it from now on (until you remove it).
+                        {t('mapTrackedObstacles.confirmBodyPrefix')} <strong>{areaLabel}</strong>.
+                        {' '}{t('mapTrackedObstacles.confirmBodySuffix')}
                     </p>
                     <p style={{fontSize: 12, color: colors.muted}}>
-                        Tracker id: {id}
-                        {obs.polygon?.points ? ` · ${obs.polygon.points.length} points` : ''}
+                        {t('mapTrackedObstacles.trackerId', {id})}
+                        {obs.polygon?.points ? ` · ${t('mapTrackedObstacles.pointsCount', {count: obs.polygon.points.length})}` : ''}
                     </p>
                 </div>
             ),
-            okText: "Promote",
-            cancelText: "Cancel",
+            okText: t('mapTrackedObstacles.promote'),
+            cancelText: t('mapTrackedObstacles.cancel'),
             onOk: async () => {
                 try {
                     const res = await api.mowglinext.callCreate("promote_obstacle", {
@@ -63,10 +71,10 @@ export const TrackedObstaclesPanel = ({obstacles, obstacleAreaIndex, areaNames}:
                         polygon: obs.polygon ?? {points: []},
                     });
                     if ((res as any).error) throw new Error((res as any).error.error);
-                    notification.success({message: `Obstacle promoted to ${areaLabel}`});
+                    notification.success({message: t('mapTrackedObstacles.promotedSuccess', {area: areaLabel})});
                 } catch (e: any) {
                     notification.error({
-                        message: "Failed to promote obstacle",
+                        message: t('mapTrackedObstacles.promoteFailed'),
                         description: e.message,
                     });
                 }
@@ -85,31 +93,38 @@ export const TrackedObstaclesPanel = ({obstacles, obstacleAreaIndex, areaNames}:
                 letterSpacing: '0.05em',
                 borderBottom: `1px solid ${colors.borderSubtle}`,
             }}>
-                Tracked obstacles ({obstacles.length})
+                {t('mapTrackedObstacles.header', {count: obstacles.length})}
             </div>
             <div style={{overflowY: 'auto', flex: 1}}>
                 {obstacles.map((obs) => {
                     const id = obs.id ?? 0;
                     const areaIdx = obstacleAreaIndex[id];
-                    const areaLabel = areaIdx == null ? 'no area' : (areaNames[areaIdx] ?? `area ${areaIdx}`);
+                    const areaLabel = areaIdx == null ? t('mapTrackedObstacles.noArea') : (areaNames[areaIdx] ?? t('mapTrackedObstacles.areaFallback', {index: areaIdx}));
+                    const isSelected = selectedObstacleId === id;
                     return (
-                        <div key={id} style={{
+                        <div key={id}
+                            onMouseEnter={() => onHoverObstacle(id)}
+                            onMouseLeave={() => onHoverObstacle(null)}
+                            style={{
                             display: 'flex',
                             alignItems: 'center',
                             gap: 10,
                             padding: '10px 12px',
-                            borderLeft: `3px solid #bf0000`,
+                            cursor: 'default',
+                            background: isSelected ? colors.bgElevated : 'transparent',
+                            borderLeft: `3px solid ${isSelected ? '#ff4d4f' : '#bf0000'}`,
+                            transition: 'background 0.12s ease',
                         }}>
                             <span style={{color: '#bf0000', fontSize: 16, flexShrink: 0, width: 20}}>
                                 <StopOutlined />
                             </span>
                             <div style={{flex: 1, minWidth: 0}}>
                                 <div style={{fontWeight: 500, fontSize: 13, color: colors.text}}>
-                                    Obstacle #{id}
+                                    {t('mapTrackedObstacles.obstacleLabel', {id})}
                                 </div>
                                 <div style={{fontSize: 11, color: colors.muted, marginTop: 1}}>
                                     {areaLabel}
-                                    {obs.polygon?.points ? ` · ${obs.polygon.points.length}pt` : ''}
+                                    {obs.polygon?.points ? ` · ${t('mapTrackedObstacles.pointsShort', {count: obs.polygon.points.length})}` : ''}
                                 </div>
                             </div>
                             <Button
@@ -118,9 +133,9 @@ export const TrackedObstaclesPanel = ({obstacles, obstacleAreaIndex, areaNames}:
                                 icon={<CheckCircleOutlined />}
                                 onClick={() => handlePromote(obs)}
                                 disabled={areaIdx == null}
-                                title={areaIdx == null ? "No containing area" : "Promote to permanent keepout"}
+                                title={areaIdx == null ? t('mapTrackedObstacles.noContainingArea') : t('mapTrackedObstacles.promoteTooltip')}
                             >
-                                Promote
+                                {t('mapTrackedObstacles.promote')}
                             </Button>
                         </div>
                     );

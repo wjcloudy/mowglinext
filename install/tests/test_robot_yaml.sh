@@ -52,8 +52,16 @@ assert_match "gnss_serial_device=/dev/ttyAMA4" \
   '^[[:space:]]+gnss_serial_device:[[:space:]]+"?/dev/ttyAMA4"?[[:space:]]*$' "$CONTENT"
 assert_match "gnss_serial_baud=921600" \
   '^[[:space:]]+gnss_serial_baud:[[:space:]]+921600[[:space:]]*$' "$CONTENT"
+assert_match "gnss_transport=serial" \
+  '^[[:space:]]+gnss_transport:[[:space:]]+"?serial"?[[:space:]]*$' "$CONTENT"
+assert_match "gnss_frame_id=gps_link" \
+  '^[[:space:]]+gnss_frame_id:[[:space:]]+"?gps_link"?[[:space:]]*$' "$CONTENT"
 assert_match "ntrip_enabled=true" \
   '^[[:space:]]+ntrip_enabled:[[:space:]]+true[[:space:]]*$' "$CONTENT"
+assert_match "gnss_ntrip_gga_enabled=true" \
+  '^[[:space:]]+gnss_ntrip_gga_enabled:[[:space:]]+true[[:space:]]*$' "$CONTENT"
+assert_match "gnss_ntrip_gga_interval_s=10" \
+  '^[[:space:]]+gnss_ntrip_gga_interval_s:[[:space:]]+10[[:space:]]*$' "$CONTENT"
 
 legacy_yaml_keys=(
   "gps_""protocol:"
@@ -81,7 +89,7 @@ done
 for owned_elsewhere in "two_d_mode" "base_footprint" "publish_tf"; do
   if grep -qE "^[[:space:]]+${owned_elsewhere}:" "$YAML"; then
     fail "no override of $owned_elsewhere in user yaml" \
-      "$owned_elsewhere belongs in robot_localization.yaml, not site config"
+      "$owned_elsewhere is a localizer/TF-ownership param (fusion_graph owns the TF tree), not site config"
   else
     pass "no override of $owned_elsewhere in user yaml"
   fi

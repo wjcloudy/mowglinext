@@ -32,6 +32,7 @@
 #include "mowgli_comms.h"
 #include "cobs.h"
 #include "crc16.h"
+#include "main.h"
 
 #include <string.h>  /* memmove, memcpy */
 
@@ -111,6 +112,19 @@ static void process_frame(const uint8_t *frame, size_t frame_len)
 {
     /* Ignore empty frames (two consecutive delimiters). */
     if (frame_len == 0u) {
+        return;
+    }
+
+    /*
+     * Reject oversized frames BEFORE decoding. cobs_decode() takes no
+     * output-capacity argument and writes up to frame_len bytes into the
+     * 64-byte s_decode_buf; a corrupt or malicious stream of >MAX_ENC_PKT_SIZE
+     * non-zero bytes would otherwise overrun the scratch buffer into adjacent
+     * statics (the handler table). The largest legal packet is 41 bytes raw,
+     * so anything that can't fit a MAX_RAW_PKT_SIZE packet is invalid.
+     */
+    if (frame_len > MAX_ENC_PKT_SIZE) {
+        ++s_crc_error_count;
         return;
     }
 
@@ -213,6 +227,8 @@ void mowgli_comms_send(const void *packet, size_t len)
         return;
     }
 
+    WATCHDOG_SetMainLoopStage(WATCHDOG_STAGE_CDC_TX_ENTER);
+
     /* Copy packet into mutable buffer. */
     memcpy(raw, packet, len);
 
@@ -257,8 +273,20 @@ void mowgli_comms_register_handler(uint8_t packet_id,
         s_handlers[s_handler_count].id      = packet_id;
         s_handlers[s_handler_count].handler = handler;
         ++s_handler_count;
+        return;
     }
-    /* If the table is full, silently discard (caller can check capacity). */
+
+    /* Table full — the packet would go unanswered at runtime with no other
+     * symptom. Do NOT fail silently: this previously cost a long debug session
+     * (MAX_HANDLERS=8 vs 10 registrations dropped SET_SAFETY_LIMITS and
+     * CONFIG_REQ, so the firmware never answered the version handshake and the
+     * GUI showed "incompatible / vunknown" no matter how often it was
+     * reflashed). Bump MOWGLI_COMMS_MAX_HANDLERS in mowgli_comms.h. */
+    debug_printf("mowgli_comms: handler table FULL (%u) — packet id 0x%02X "
+                 "DROPPED, it will never be answered. Raise "
+                 "MOWGLI_COMMS_MAX_HANDLERS.\r\n",
+                 (unsigned)MOWGLI_COMMS_MAX_HANDLERS,
+                 (unsigned)packet_id);
 }
 
 void mowgli_comms_send_status(const pkt_status_t *status)

@@ -16,7 +16,21 @@ type FirmwareConfig struct {
 	Version                        string  `json:"version"`
 	BoardType                      string  `json:"boardType"`
 	PanelType                      string  `json:"panelType"`
-	DebugType                      string  `json:"debugType"`
+	// Firmware selection provenance is written alongside the saved config so
+	// later mower-model changes can update only fields that still follow model
+	// defaults. Empty/unknown values are legacy and are handled conservatively
+	// by the GUI.
+	BoardTypeOrigin                string  `json:"boardTypeOrigin,omitempty"`
+	PanelTypeOrigin                string  `json:"panelTypeOrigin,omitempty"`
+	FirmwareSelectionModel         string  `json:"firmwareSelectionModel,omitempty"`
+	// FirmwareSource is the GUI dropdown selector: "custom" compiles from
+	// source (the expert path), "prebuilt" (or empty, for older payloads)
+	// flashes the tested prebuilt binary.
+	FirmwareSource                 string  `json:"firmwareSource"`
+	// ExpertBuild routes the flash to the compile-from-source path
+	// (flashMowgli); the default (false) flashes a prebuilt binary. Kept for
+	// backward compatibility — FirmwareSource == "custom" implies it.
+	ExpertBuild                    bool    `json:"expertBuild"`
 	DisableEmergency               bool    `json:"disableEmergency"`
 	MaxMps                         float32 `json:"maxMps"`
 	MaxChargeCurrent               float32 `json:"maxChargeCurrent"`

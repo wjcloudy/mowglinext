@@ -68,7 +68,7 @@ const uint8_t panel_pcu8PreAmbule[5]  = {0x55,0xAA,0x0A,0x50,0x3C};
 static uint8_t panel_u8OldStateButtonStart = 0;
 static uint8_t panel_u8OldStateButtonHome = 0;
 
-void PANEL_Send_Message(uint8_t *data, uint8_t dataLength, uint16_t command);
+void PANEL_Send_Message(const uint8_t *data, uint8_t dataLength, uint16_t command);
 
 /*
  * Initialize HW, USART and send init sequence to panel
@@ -184,7 +184,7 @@ void PANEL_Init(void)
     HAL_Delay(100);
     PANEL_Send_Message(NULL, 0, 0xfffe);
     HAL_Delay(100);    
-    PANEL_Send_Message((uint8_t*)KEY_INIT_MSG, sizeof(KEY_INIT_MSG), 0xfffd);
+    PANEL_Send_Message(KEY_INIT_MSG, sizeof(KEY_INIT_MSG), 0xfffd);
     HAL_Delay(100);
     PANEL_Send_Message(NULL, 0, 0xfffb);
     HAL_Delay(100);
@@ -221,7 +221,7 @@ void PANEL_Init(void)
 
 void PANEL_Set_LED(uint8_t led, PANEL_LED_STATE state)
 {
-    if (led >= 0 && led < LED_STATE_SIZE)
+    if (led < LED_STATE_SIZE)
     {
         switch (state)
         {
@@ -279,13 +279,22 @@ void PANEL_Tick(void)
     /* add Start and Home at the end the tab*/
     buttonstate[PANEL_BUTTON_DEF_START] = !HAL_GPIO_ReadPin(PLAY_BUTTON_PORT, PLAY_BUTTON_PIN); // pullup, active low    
     buttonstate[PANEL_BUTTON_DEF_HOME]  = !HAL_GPIO_ReadPin(HOME_BUTTON_PORT, HOME_BUTTON_PIN); // pullup, active low    
-    /* Click detected */
+    /* Click detected.
+     * START/HOME are dedicated GPIO buttons, not part of the UART panel frame.
+     * The consumer (panel_handler) only forwards an update when buttoncleared==0
+     * (i.e. the update is a fresh PRESS, not the UART "first release" clear).
+     * buttoncleared is a latch driven ONLY by the UART buttons and sits at 1 in
+     * the idle steady state, so without clearing it here a GPIO rising edge sets
+     * buttonupdated=1 but stays gated out — START/HOME presses never emit a UI
+     * event. Mark the edge as a fresh press so it is delivered. */
     if( (buttonstate[PANEL_BUTTON_DEF_START] != panel_u8OldStateButtonStart) && buttonstate[PANEL_BUTTON_DEF_START]){
         buttonupdated = 1;
+        buttoncleared = 0;
     }
 
     if( (buttonstate[PANEL_BUTTON_DEF_HOME] != panel_u8OldStateButtonHome) && buttonstate[PANEL_BUTTON_DEF_HOME]){
         buttonupdated = 1;
+        buttoncleared = 0;
     }
 
     panel_u8OldStateButtonStart = buttonstate[PANEL_BUTTON_DEF_START];
@@ -296,10 +305,29 @@ void PANEL_Tick(void)
 #endif
 }
 
+static uint8_t PANEL_WaitTxComplete(uint32_t timeout_ms)
+    {
+        uint32_t start = HAL_GetTick();
+
+        while (__HAL_UART_GET_FLAG(&PANEL_USART_Handler, USART_FLAG_TC) != 1)
+        {
+            if ((HAL_GetTick() - start) >= timeout_ms)
+            {
+                return 0;
+            }
+        }
+
+        return 1;
+    }
+
 void PANEL_SendLEDMessage(void){
     uint8_t ptr = 0;
     uint8_t ptr_beginScndMsg = 0;
-    while( __HAL_UART_GET_FLAG(&PANEL_USART_Handler, USART_FLAG_TC) != 1);
+
+    if (!PANEL_WaitTxComplete(3))
+    {
+        return;
+    }
 
     panel_pu8RqstMessage[ptr++] = 0x55;
     panel_pu8RqstMessage[ptr++] = 0xaa;
@@ -329,11 +357,14 @@ void PANEL_SendLEDMessage(void){
 
 }
 
-void PANEL_Send_Message(uint8_t *data, uint8_t dataLength, uint16_t command)
+void PANEL_Send_Message(const uint8_t *data, uint8_t dataLength, uint16_t command)
 {
     uint8_t ptr = 0;
 
-    while( __HAL_UART_GET_FLAG(&PANEL_USART_Handler, USART_FLAG_TC) != 1);
+    if (!PANEL_WaitTxComplete(3))
+    {
+        return;
+    }
 
     panel_pu8RqstMessage[ptr++] = 0x55;
     panel_pu8RqstMessage[ptr++] = 0xaa;

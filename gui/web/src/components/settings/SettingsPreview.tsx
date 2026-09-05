@@ -1,3 +1,4 @@
+import {useTranslation} from "react-i18next";
 import {useThemeMode} from "../../theme/ThemeContext.tsx";
 
 /**
@@ -25,6 +26,7 @@ const m = (v: unknown, fallback = 0): number => {
 };
 
 function ChassisPreview({values}: {values: Record<string, unknown>}) {
+  const {t} = useTranslation();
   const {colors} = useThemeMode();
   const length = m(values.chassis_length, 0.62);
   const width = m(values.chassis_width, 0.46);
@@ -32,6 +34,9 @@ function ChassisPreview({values}: {values: Record<string, unknown>}) {
   const toolWidth = m(values.tool_width, 0.18);
   const bladeRadius = m(values.blade_radius, 0.09);
   const wheelRadius = m(values.wheel_radius, 0.045);
+  const wheelWidth = m(values.wheel_width, 0.04);
+  const chassisCenterX = m(values.chassis_center_x, 0.18);
+  const wheelXOffset = m(values.wheel_x_offset, 0);
 
   // Scale so the longest dimension fits the SVG, with padding.
   const longest = Math.max(length, width) || 1;
@@ -45,6 +50,10 @@ function ChassisPreview({values}: {values: Record<string, unknown>}) {
   const svgH = 220;
   const cx = svgW / 2;
   const cy = svgH / 2;
+  // base_link is the rear drive-wheel axle, offset toward the rear (down in
+  // this forward-up view) from the chassis centre by chassis_center_x. The
+  // drive wheels sit there (shifted forward by wheel_x_offset when set).
+  const axleY = cy + px(chassisCenterX - wheelXOffset);
 
   const labelStyle = {fontSize: 9, fill: colors.textDim};
 
@@ -54,7 +63,7 @@ function ChassisPreview({values}: {values: Record<string, unknown>}) {
         fontSize: 11, color: colors.textMuted, letterSpacing: '0.08em',
         textTransform: 'uppercase' as const, marginBottom: 8,
       }}>
-        Chassis · top-down (m)
+        {t("settingsPreview.chassisTitle")}
       </div>
       <svg viewBox={`0 0 ${svgW} ${svgH}`} width="100%" style={{display: 'block', maxHeight: svgH}}>
         {/* tool-width footprint (cut area) */}
@@ -62,7 +71,7 @@ function ChassisPreview({values}: {values: Record<string, unknown>}) {
               width={px(toolWidth)} height={cl - 8}
               fill={colors.accentSoft} stroke={colors.accent} strokeWidth={1} strokeDasharray="3 3"/>
         <text x={cx + px(toolWidth) / 2 + 4} y={cy + 3} {...labelStyle}>
-          cut {(toolWidth * 100).toFixed(0)}cm
+          {t("settingsPreview.cutLabel", {cm: (toolWidth * 100).toFixed(0)})}
         </text>
 
         {/* chassis */}
@@ -70,26 +79,33 @@ function ChassisPreview({values}: {values: Record<string, unknown>}) {
               width={cw} height={cl} rx={Math.min(cw, cl) * 0.12}
               fill={colors.bgElevated} stroke={colors.text} strokeWidth={1.5}/>
 
-        {/* wheel track */}
-        <rect x={cx - px(wheelTrack) / 2 - 4} y={cy - 4}
+        {/* wheel track (dashed band across the rear axle) */}
+        <rect x={cx - px(wheelTrack) / 2 - 4} y={axleY - 4}
               width={px(wheelTrack) + 8} height={8}
               fill="none" stroke={colors.amber} strokeWidth={0.8} strokeDasharray="2 2"/>
-        <text x={cx - px(wheelTrack) / 2 - 6} y={cy + 18} textAnchor="end" {...labelStyle}>
-          track {(wheelTrack * 100).toFixed(0)}cm
+        <text x={cx - px(wheelTrack) / 2 - 6} y={axleY + 18} textAnchor="end" {...labelStyle}>
+          {t("settingsPreview.trackLabel", {cm: (wheelTrack * 100).toFixed(0)})}
         </text>
 
-        {/* wheels (left + right at rear axle) */}
-        <rect x={cx - px(wheelTrack) / 2 - px(wheelRadius)} y={cy - px(wheelRadius)}
-              width={px(wheelRadius) * 2} height={px(wheelRadius) * 2}
-              rx={px(wheelRadius) * 0.5}
-              fill={colors.text}/>
-        <rect x={cx + px(wheelTrack) / 2 - px(wheelRadius)} y={cy - px(wheelRadius)}
-              width={px(wheelRadius) * 2} height={px(wheelRadius) * 2}
-              rx={px(wheelRadius) * 0.5}
-              fill={colors.text}/>
+        {/* drive wheels at the rear axle. Seen from above, a wheel's diameter
+            runs along the forward (vertical) axis and the tyre width laterally,
+            so each is a tall rectangle — not a square. */}
+        <rect x={cx - px(wheelTrack) / 2 - px(wheelWidth) / 2} y={axleY - px(wheelRadius)}
+              width={px(wheelWidth)} height={px(wheelRadius) * 2}
+              rx={2} fill={colors.text}/>
+        <rect x={cx + px(wheelTrack) / 2 - px(wheelWidth) / 2} y={axleY - px(wheelRadius)}
+              width={px(wheelWidth)} height={px(wheelRadius) * 2}
+              rx={2} fill={colors.text}/>
 
-        {/* blade */}
-        <circle cx={cx} cy={cy + cl * 0.18} r={px(bladeRadius)}
+        {/* base_link marker at the rear axle */}
+        <circle cx={cx} cy={axleY} r={2} fill={colors.textDim}/>
+        <text x={cx} y={axleY + px(wheelRadius) + 9} textAnchor="middle"
+              fontSize={7} fill={colors.textDim} fontFamily="monospace">
+          base_link
+        </text>
+
+        {/* blade (centred under the chassis, per the URDF) */}
+        <circle cx={cx} cy={cy} r={px(bladeRadius)}
                 fill={colors.amberSoft} stroke={colors.amber}/>
 
         {/* length / width labels */}
@@ -103,13 +119,14 @@ function ChassisPreview({values}: {values: Record<string, unknown>}) {
       <div style={{
         marginTop: 8, fontSize: 11, color: colors.textDim, lineHeight: 1.5,
       }}>
-        Tool width also drives F2C swath spacing -- thinner means more passes.
+        {t("settingsPreview.toolWidthNote")}
       </div>
     </div>
   );
 }
 
 function SwathsPreview({values}: {values: Record<string, unknown>}) {
+  const {t} = useTranslation();
   const {colors} = useThemeMode();
   const toolWidth = m(values.tool_width, 0.18);
   const safetyInset = m(values.chassis_safety_inset, 0.05);
@@ -136,7 +153,7 @@ function SwathsPreview({values}: {values: Record<string, unknown>}) {
         fontSize: 11, color: colors.textMuted, letterSpacing: '0.08em',
         textTransform: 'uppercase' as const, marginBottom: 8,
       }}>
-        Swath layout · 4×2.5m field
+        {t("settingsPreview.swathLayoutTitle")}
       </div>
       <svg viewBox={`0 0 ${svgW} ${svgH}`} width="100%" style={{display: 'block', maxHeight: svgH}}>
         {/* field outline */}
@@ -154,7 +171,7 @@ function SwathsPreview({values}: {values: Record<string, unknown>}) {
                 stroke={colors.accent} strokeWidth={0.4}/>
         ))}
         <text x={svgW / 2} y={16} textAnchor="middle" fontSize={10} fill={colors.textDim}>
-          {swathCount} swaths · spacing {(toolWidth * 100).toFixed(0)}cm
+          {t("settingsPreview.swathCountLabel", {count: swathCount, cm: (toolWidth * 100).toFixed(0)})}
         </text>
       </svg>
     </div>
@@ -162,13 +179,15 @@ function SwathsPreview({values}: {values: Record<string, unknown>}) {
 }
 
 function BatteryPreview({values}: {values: Record<string, unknown>}) {
+  const {t} = useTranslation();
   const {colors} = useThemeMode();
   const full = m(values.battery_full_voltage, 28.5);
   const empty = m(values.battery_empty_voltage, 24.0);
-  const fullPct = m(values.battery_full_percent, 100);
-  const emptyPct = m(values.battery_empty_percent, 0);
-  const lowReturn = m(values.battery_low_return, 20);
-  const criticalReturn = m(values.battery_critical_return, 10);
+  const fullPct = m(values.battery_full_percent, 95);
+  // Real thresholds from mowgli_robot.yaml: battery_low_percent starts docking,
+  // battery_critical_percent forces an emergency dock.
+  const lowReturn = m(values.battery_low_percent, 20);
+  const criticalReturn = m(values.battery_critical_percent, 10);
 
   const trackW = 200;
   return (
@@ -177,7 +196,7 @@ function BatteryPreview({values}: {values: Record<string, unknown>}) {
         fontSize: 11, color: colors.textMuted, letterSpacing: '0.08em',
         textTransform: 'uppercase' as const, marginBottom: 8,
       }}>
-        Battery thresholds
+        {t("settingsPreview.batteryThresholds")}
       </div>
       <div style={{position: 'relative', width: trackW, height: 28}}>
         <div style={{
@@ -205,14 +224,17 @@ function BatteryPreview({values}: {values: Record<string, unknown>}) {
         </div>
       </div>
       <div style={{fontSize: 11, color: colors.textDim, marginTop: 22, lineHeight: 1.5}}>
-        Empty {empty.toFixed(2)} V ({emptyPct}%) · Full {full.toFixed(2)} V ({fullPct}%).
-        Robot returns home at {lowReturn}% and stops navigating below {criticalReturn}%.
+        {t("settingsPreview.batteryVoltageLine", {
+          empty: empty.toFixed(2), full: full.toFixed(2), fullPct,
+        })}{" "}
+        {t("settingsPreview.batteryReturnLine", {low: lowReturn, critical: criticalReturn})}
       </div>
     </div>
   );
 }
 
 export function SettingsPreview({values, section}: SettingsPreviewProps) {
+  const {t} = useTranslation();
   const {colors} = useThemeMode();
 
   const showChassis = section === 'hardware' || section === 'mowing' || section === 'navigation';
@@ -225,8 +247,7 @@ export function SettingsPreview({values, section}: SettingsPreviewProps) {
         background: colors.bgCard, borderRadius: 12, padding: 16,
         color: colors.textMuted, fontSize: 12,
       }}>
-        Live preview shows up for Hardware, Mowing, Navigation and Battery sections.
-        Pick one of those sections to see your changes take shape.
+        {t("settingsPreview.emptyState")}
       </div>
     );
   }

@@ -1,4 +1,7 @@
 import {Cloud, CloudRain, Sun, CloudSun, Snowflake, CloudFog, CloudLightning} from "lucide-react";
+import {useTranslation} from "react-i18next";
+import i18n from "../../i18n";
+import {useThemeMode} from "../../theme/ThemeContext.tsx";
 
 /**
  * Compact weather pill -- icon + temp + condition. Tone shifts to amber
@@ -24,6 +27,8 @@ interface WeatherChipProps {
 }
 
 export function WeatherChip({condition, tempC, rainSoon}: WeatherChipProps) {
+  const {t} = useTranslation();
+  const {displayMode} = useThemeMode();
   const Icon = ICON[condition];
   const warn = rainSoon || condition === "rain" || condition === "storm";
   return (
@@ -36,13 +41,13 @@ export function WeatherChip({condition, tempC, rainSoon}: WeatherChipProps) {
       border: `1px solid ${warn ? "rgba(243, 168, 92, 0.32)" : "var(--border-soft)"}`,
       borderRadius: "var(--radius-pill)",
       color: warn ? "var(--amber)" : "var(--ink)",
-      backdropFilter: "blur(20px)",
+      backdropFilter: displayMode === "visual" ? "blur(20px)" : undefined,
       fontSize: 13, fontWeight: 600,
     }}>
       <Icon size={16} strokeWidth={2}/>
       <span className="mono">{tempC.toFixed(0)}°C</span>
       <span style={{opacity: 0.6, fontSize: 11, marginLeft: -2}}>
-        {warn ? "pluie en approche" : conditionLabel(condition)}
+        {warn ? t('weatherChip.rainIncoming') : conditionLabel(condition)}
       </span>
     </div>
   );
@@ -50,12 +55,12 @@ export function WeatherChip({condition, tempC, rainSoon}: WeatherChipProps) {
 
 function conditionLabel(c: Condition) {
   switch (c) {
-    case "clear":  return "ciel dégagé";
-    case "partly": return "ensoleillé";
-    case "cloudy": return "nuageux";
-    case "fog":    return "brouillard";
-    case "rain":   return "pluvieux";
-    case "snow":   return "neigeux";
-    case "storm":  return "orageux";
+    case "clear":  return i18n.t('weatherChip.clear');
+    case "partly": return i18n.t('weatherChip.partly');
+    case "cloudy": return i18n.t('weatherChip.cloudy');
+    case "fog":    return i18n.t('weatherChip.fog');
+    case "rain":   return i18n.t('weatherChip.rain');
+    case "snow":   return i18n.t('weatherChip.snow');
+    case "storm":  return i18n.t('weatherChip.storm');
   }
 }

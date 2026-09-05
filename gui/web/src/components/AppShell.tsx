@@ -1,73 +1,87 @@
 import {type ReactNode, useEffect, useMemo, useState} from "react";
-import {Outlet, useMatches, useNavigate} from "react-router-dom";
+import {useMatches, useNavigate, useOutlet} from "react-router-dom";
 import {AnimatePresence, motion, LayoutGroup} from "framer-motion";
 import {
   Home, Map as MapIcon, Calendar, Compass, Settings, Terminal, Rocket, Activity,
   MoreHorizontal, X, SlidersHorizontal,
 } from "lucide-react";
 
+import {useTranslation} from "react-i18next";
+
 import {MowerStatus} from "./MowerStatus.tsx";
 import {NotificationBell} from "./NotificationBell.tsx";
+import {LanguageSwitcher} from "./LanguageSwitcher.tsx";
 import {LiveStatusStrip} from "./LiveStatusStrip.tsx";
+import {IOSInstallBanner} from "./IOSInstallBanner.tsx";
+import {useIOSInstallPrompt} from "../hooks/useIOSInstallPrompt.ts";
 import {useAutoNotifications} from "../hooks/useNotificationCenter.tsx";
 import {useHighLevelStatus} from "../hooks/useHighLevelStatus.ts";
 import {useEmergency} from "../hooks/useEmergency.ts";
 import {useStatus} from "../hooks/useStatus.ts";
 import {useIsMobile} from "../hooks/useIsMobile";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
+import {BRAND_GRADIENT} from "../theme/colors.ts";
+import {httpBase} from "../utils/apiHost.ts";
 import {KEYFRAMES_CSS} from "./dashboard";
 import "../concept/concept.css";
 
 /**
  * Premium tech-garden shell shared by the whole app.
  *
- * Desktop -> 88px fixed glass side-rail on the left + the page content in a
+ * Desktop -> 88px fixed side-rail on the left + the page content in a
  *            comfortable max-width column with a sticky top status strip.
- * Mobile   -> glass bottom-nav with a sliding lime pill + slim top header.
+ * Mobile   -> bottom-nav with a sliding lime pill + slim top header.
  *
  * All surfaces inherit the /concept tokens (data-concept scope on body).
  */
 
 interface NavItem {
-  key: string;          // path
-  label: string;
-  shortLabel?: string;  // for the bottom-nav
+  key: string;            // path
+  labelKey: string;       // i18n key
+  shortLabelKey?: string; // for the bottom-nav
   icon: typeof Home;
   showInBottom?: boolean;
 }
 
 const NAV: NavItem[] = [
-  {key: '/mowglinext',  label: 'Accueil',     shortLabel: 'Accueil',  icon: Home,     showInBottom: true},
-  {key: '/map',         label: 'Carte',                                icon: MapIcon,  showInBottom: true},
-  {key: '/schedule',    label: 'Planning',    shortLabel: 'Planning',  icon: Calendar, showInBottom: true},
-  {key: '/diagnostics', label: 'Diagnostic',  shortLabel: 'Diag',      icon: Activity, showInBottom: true},
-  {key: '/statistics',  label: 'Stats',                                icon: Compass,  showInBottom: false},
-  {key: '/settings',    label: 'Réglages',                             icon: Settings, showInBottom: false},
-  {key: '/parameters',  label: 'Paramètres',                           icon: SlidersHorizontal, showInBottom: false},
-  {key: '/logs',        label: 'Logs',                                 icon: Terminal, showInBottom: false},
-  {key: '/onboarding',  label: 'Onboarding',                           icon: Rocket,   showInBottom: false},
+  {key: '/mowglinext',  labelKey: 'nav.home',        shortLabelKey: 'nav.home',      icon: Home,     showInBottom: true},
+  {key: '/map',         labelKey: 'nav.map',                                          icon: MapIcon,  showInBottom: true},
+  {key: '/schedule',    labelKey: 'nav.schedule',    shortLabelKey: 'nav.schedule',  icon: Calendar, showInBottom: true},
+  {key: '/diagnostics', labelKey: 'nav.diagnostics', shortLabelKey: 'nav.diagShort', icon: Activity, showInBottom: true},
+  {key: '/statistics',  labelKey: 'nav.stats',                                        icon: Compass,  showInBottom: false},
+  {key: '/settings',    labelKey: 'nav.settings',                                     icon: Settings, showInBottom: false},
+  {key: '/parameters',  labelKey: 'nav.parameters',                                   icon: SlidersHorizontal, showInBottom: false},
+  {key: '/logs',        labelKey: 'nav.logs',                                         icon: Terminal, showInBottom: false},
+  {key: '/onboarding',  labelKey: 'nav.onboarding',                                   icon: Rocket,   showInBottom: false},
 ];
 
-const PAGE_META: Record<string, {title: string; subtitle?: string}> = {
-  '/mowglinext':  {title: 'Accueil',        subtitle: 'Vue en direct'},
-  '/map':         {title: 'Carte',          subtitle: 'Zones et trajectoire'},
-  '/schedule':    {title: 'Planning',       subtitle: 'Semaine type'},
-  '/diagnostics': {title: 'Diagnostic',     subtitle: 'Capteurs et état système'},
-  '/statistics':  {title: 'Statistiques',   subtitle: 'Historique long terme'},
-  '/settings':    {title: 'Réglages',       subtitle: 'Configuration robot'},
-  '/parameters':  {title: 'Paramètres',     subtitle: 'Réglage ROS2 en direct'},
-  '/logs':        {title: 'Logs',           subtitle: 'Sortie des conteneurs'},
-  '/onboarding':  {title: 'Onboarding'},
+// Title falls back to the nav label key where they coincide; statistics has a
+// fuller title than its short nav label.
+const PAGE_META: Record<string, {titleKey: string; subtitleKey?: string}> = {
+  '/mowglinext':  {titleKey: 'nav.home',                 subtitleKey: 'pageMeta.home.subtitle'},
+  '/map':         {titleKey: 'nav.map',                  subtitleKey: 'pageMeta.map.subtitle'},
+  '/schedule':    {titleKey: 'nav.schedule',             subtitleKey: 'pageMeta.schedule.subtitle'},
+  '/diagnostics': {titleKey: 'nav.diagnostics',          subtitleKey: 'pageMeta.diagnostics.subtitle'},
+  '/statistics':  {titleKey: 'pageMeta.statistics.title', subtitleKey: 'pageMeta.statistics.subtitle'},
+  '/settings':    {titleKey: 'nav.settings',             subtitleKey: 'pageMeta.settings.subtitle'},
+  '/parameters':  {titleKey: 'nav.parameters',           subtitleKey: 'pageMeta.parameters.subtitle'},
+  '/logs':        {titleKey: 'nav.logs',                 subtitleKey: 'pageMeta.logs.subtitle'},
+  '/onboarding':  {titleKey: 'nav.onboarding'},
 };
 
 export function AppShell() {
   const {colors} = useThemeMode();
+  const {t} = useTranslation();
   const navigate = useNavigate();
   const route = useMatches();
   const isMobile = useIsMobile();
 
   const currentPath = route.length > 1 ? route[1].pathname : '/mowglinext';
-  const meta = PAGE_META[currentPath] ?? {title: 'MowgliNext'};
+  const metaKeys = PAGE_META[currentPath];
+  const meta = {
+    title: metaKeys ? t(metaKeys.titleKey) : 'MowgliNext',
+    subtitle: metaKeys?.subtitleKey ? t(metaKeys.subtitleKey) : undefined,
+  };
 
   // Empty path -> dashboard. Without this `/` renders the shell with an
   // empty Outlet, which looks broken (the previous Root had this redirect
@@ -84,10 +98,7 @@ export function AppShell() {
     if (configChecked) return;
     (async () => {
       try {
-        const base = import.meta.env.DEV
-          ? `http://${(import.meta.env.VITE_API_HOST as string | undefined) ?? 'localhost:4006'}`
-          : '';
-        const res = await fetch(`${base}/api/settings/status`);
+        const res = await fetch(`${httpBase()}/api/settings/status`);
         const data = await res.json();
         if (!data.onboarding_completed && currentPath !== '/onboarding') {
           navigate({pathname: '/onboarding'});
@@ -114,6 +125,10 @@ export function AppShell() {
   const overflowItems = useMemo(() => NAV.filter(n => !n.showInBottom), []);
   const [moreOpen, setMoreOpen] = useState(false);
 
+  // iOS "Add to Home Screen" hint — only ever shows on iOS Safari outside
+  // standalone mode, and stays dismissed for the session (sessionStorage).
+  const {showPrompt: showInstallBanner, dismiss: dismissInstallBanner} = useIOSInstallPrompt();
+
   if (isMobile) {
     return (
       <div data-concept style={{
@@ -129,8 +144,7 @@ export function AppShell() {
           padding: '0 16px',
           paddingTop: 'max(env(safe-area-inset-top, 0px), 6px)',
           minHeight: 56,
-          background: 'rgba(2, 17, 13, 0.6)',
-          backdropFilter: 'blur(20px) saturate(140%)',
+          background: 'rgba(2, 17, 13, 0.94)',
           borderBottom: `1px solid ${colors.borderSubtle}`,
           flexShrink: 0,
           position: 'relative', zIndex: 10,
@@ -149,6 +163,7 @@ export function AppShell() {
             )}
           </div>
           <div style={{display: 'flex', alignItems: 'center', gap: 6}}>
+            <LanguageSwitcher/>
             <NotificationBell/>
             <MowerStatus/>
           </div>
@@ -161,6 +176,8 @@ export function AppShell() {
         }}>
           <AnimatedOutlet currentPath={currentPath}/>
         </main>
+
+        {showInstallBanner && <IOSInstallBanner onDismiss={dismissInstallBanner}/>}
 
         <MobileMoreSheet
           open={moreOpen}
@@ -208,8 +225,7 @@ export function AppShell() {
         <header style={{
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
           padding: '18px 32px',
-          background: 'rgba(2, 17, 13, 0.45)',
-          backdropFilter: 'blur(20px) saturate(140%)',
+          background: 'rgba(2, 17, 13, 0.94)',
           borderBottom: `1px solid ${colors.borderSubtle}`,
           position: 'sticky', top: 0, zIndex: 30, overflow: 'visible',
         }}>
@@ -227,6 +243,7 @@ export function AppShell() {
             )}
           </div>
           <div style={{display: 'flex', alignItems: 'center', gap: 12}}>
+            <LanguageSwitcher/>
             <NotificationBell/>
             <MowerStatus/>
           </div>
@@ -257,6 +274,14 @@ function AuroraBackdrop() {
 }
 
 function AnimatedOutlet({currentPath}: {currentPath: string}) {
+  // Snapshot the outlet ELEMENT here instead of rendering a live <Outlet/>.
+  // AnimatePresence (mode="wait") keeps the outgoing motion.div mounted while
+  // it fades out; a live <Outlet/> inside it subscribes to router context and
+  // re-renders the exiting div with the NEW route's content — a redirect
+  // during initial load then leaves the page blank or stuck mid-fade. With
+  // useOutlet() the element is captured per render/location, so the cached
+  // exiting div keeps the OLD page and the freshly keyed div gets the new one.
+  const outlet = useOutlet();
   return (
     <AnimatePresence mode="wait">
       <motion.div
@@ -267,7 +292,7 @@ function AnimatedOutlet({currentPath}: {currentPath: string}) {
         transition={{duration: 0.28, ease: [0.2, 0.7, 0.2, 1]}}
         style={{height: '100%'}}
       >
-        <Outlet/>
+        {outlet}
       </motion.div>
     </AnimatePresence>
   );
@@ -283,6 +308,7 @@ interface RailProps {
 }
 
 function DesktopSideRail({items, activePath, onNavigate}: RailProps) {
+  const {t} = useTranslation();
   return (
     <aside style={{
       position: 'fixed', top: 0, bottom: 0, left: 0, width: 88,
@@ -290,7 +316,6 @@ function DesktopSideRail({items, activePath, onNavigate}: RailProps) {
       paddingTop: 24, paddingBottom: 24,
       background: 'linear-gradient(180deg, rgba(2, 17, 13, 0.92), rgba(2, 17, 13, 0.84))',
       borderRight: '1px solid rgba(236, 255, 244, 0.07)',
-      backdropFilter: 'blur(22px) saturate(140%)',
       zIndex: 40,
     }}>
       <div style={{
@@ -299,7 +324,7 @@ function DesktopSideRail({items, activePath, onNavigate}: RailProps) {
       }}>
         <div style={{
           width: 44, height: 44, borderRadius: 14,
-          background: 'linear-gradient(135deg, #7CFFB2 0%, #45D688 50%, #2BAA66 100%)',
+          background: BRAND_GRADIENT,
           color: '#02110D',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           fontFamily: 'Satoshi', fontWeight: 900, fontSize: 22, lineHeight: 1,
@@ -317,13 +342,13 @@ function DesktopSideRail({items, activePath, onNavigate}: RailProps) {
 
       <LayoutGroup>
         <nav style={{display: 'flex', flexDirection: 'column', gap: 4, padding: '0 12px', flex: 1, overflowY: 'auto'}}>
-          {items.map(({key, label, icon: Icon}) => {
+          {items.map(({key, labelKey, icon: Icon}) => {
             const isActive = key === activePath;
             return (
               <button
                 key={key}
                 onClick={() => onNavigate(key)}
-                aria-label={label}
+                aria-label={t(labelKey)}
                 aria-current={isActive ? 'page' : undefined}
                 style={{
                   position: 'relative',
@@ -345,7 +370,7 @@ function DesktopSideRail({items, activePath, onNavigate}: RailProps) {
                     layoutId="app-rail-pill"
                     style={{
                       position: 'absolute', inset: 0,
-                      background: 'linear-gradient(135deg, #7CFFB2 0%, #45D688 50%, #2BAA66 100%)',
+                      background: BRAND_GRADIENT,
                       borderRadius: 14,
                       boxShadow: '0 12px 26px -6px rgba(124, 255, 178, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.32)',
                       zIndex: -1,
@@ -354,7 +379,7 @@ function DesktopSideRail({items, activePath, onNavigate}: RailProps) {
                   />
                 )}
                 <Icon size={18} strokeWidth={isActive ? 2.4 : 2}/>
-                <span>{label}</span>
+                <span>{t(labelKey)}</span>
               </button>
             );
           })}
@@ -384,7 +409,7 @@ const bottomNavPill = (
     layoutId="app-bottom-pill"
     style={{
       position: 'absolute', inset: 0,
-      background: 'linear-gradient(135deg, #7CFFB2 0%, #45D688 50%, #2BAA66 100%)',
+      background: BRAND_GRADIENT,
       borderRadius: 999,
       boxShadow: '0 6px 20px -6px rgba(124, 255, 178, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.3)',
       zIndex: -1,
@@ -394,6 +419,8 @@ const bottomNavPill = (
 );
 
 function MobileBottomNav({items, activePath, onNavigate, onMore, moreActive}: RailProps) {
+  const {t} = useTranslation();
+  const {displayMode} = useThemeMode();
   const columns = items.length + (onMore ? 1 : 0);
   return (
     <nav style={{
@@ -402,7 +429,8 @@ function MobileBottomNav({items, activePath, onNavigate, onMore, moreActive}: Ra
       paddingTop: 10,
       paddingLeft: 14, paddingRight: 14,
       background: 'linear-gradient(180deg, rgba(2, 17, 13, 0) 0%, rgba(2, 17, 13, 0.85) 30%, rgba(2, 17, 13, 0.97) 100%)',
-      backdropFilter: 'blur(22px) saturate(140%)',
+      backdropFilter: displayMode === 'visual' ? 'blur(22px) saturate(140%)' : undefined,
+      WebkitBackdropFilter: displayMode === 'visual' ? 'blur(22px) saturate(140%)' : undefined,
       zIndex: 50,
     }}>
       <LayoutGroup>
@@ -413,23 +441,24 @@ function MobileBottomNav({items, activePath, onNavigate, onMore, moreActive}: Ra
           background: 'rgba(255, 255, 255, 0.04)',
           border: '1px solid rgba(236, 255, 244, 0.08)',
           borderRadius: 999,
-          backdropFilter: 'blur(28px)',
+          backdropFilter: displayMode === 'visual' ? 'blur(28px)' : undefined,
+          WebkitBackdropFilter: displayMode === 'visual' ? 'blur(28px)' : undefined,
         }}>
-          {items.map(({key, label, shortLabel, icon: Icon}) => {
+          {items.map(({key, labelKey, shortLabelKey, icon: Icon}) => {
             const isActive = key === activePath;
             return (
-              <button key={key} onClick={() => onNavigate(key)} aria-label={label} style={bottomNavBtnStyle(isActive)}>
+              <button key={key} onClick={() => onNavigate(key)} aria-label={t(labelKey)} style={bottomNavBtnStyle(isActive)}>
                 {isActive && bottomNavPill}
                 <Icon size={18} strokeWidth={isActive ? 2.4 : 2}/>
-                <span>{shortLabel ?? label}</span>
+                <span>{t(shortLabelKey ?? labelKey)}</span>
               </button>
             );
           })}
           {onMore && (
-            <button onClick={onMore} aria-label="More" style={bottomNavBtnStyle(!!moreActive)}>
+            <button onClick={onMore} aria-label={t('nav.more')} style={bottomNavBtnStyle(!!moreActive)}>
               {moreActive && bottomNavPill}
               <MoreHorizontal size={18} strokeWidth={moreActive ? 2.4 : 2}/>
-              <span>Plus</span>
+              <span>{t('nav.more')}</span>
             </button>
           )}
         </div>
@@ -448,6 +477,19 @@ interface MoreSheetProps {
 }
 
 function MobileMoreSheet({open, items, activePath, onClose, onNavigate}: MoreSheetProps) {
+  const {t} = useTranslation();
+  const {displayMode} = useThemeMode();
+
+  // Escape closes the sheet (keyboard parity with the backdrop tap / X button).
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [open, onClose]);
+
   return (
     <AnimatePresence>
       {open && (
@@ -464,14 +506,15 @@ function MobileMoreSheet({open, items, activePath, onClose, onNavigate}: MoreShe
               position: 'fixed', left: 0, right: 0, bottom: 0, zIndex: 61,
               padding: '14px 14px calc(env(safe-area-inset-bottom, 0px) + 18px)',
               background: 'rgba(6, 24, 18, 0.97)',
-              backdropFilter: 'blur(24px) saturate(140%)',
+              backdropFilter: displayMode === 'visual' ? 'blur(24px) saturate(140%)' : undefined,
+              WebkitBackdropFilter: displayMode === 'visual' ? 'blur(24px) saturate(140%)' : undefined,
               borderTop: '1px solid rgba(236, 255, 244, 0.1)',
               borderRadius: '20px 20px 0 0',
             }}
           >
             <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12}}>
-              <span style={{fontSize: 13, fontWeight: 600, color: 'rgba(236, 255, 244, 0.66)'}}>Plus</span>
-              <button onClick={onClose} aria-label="Fermer" style={{
+              <span style={{fontSize: 13, fontWeight: 600, color: 'rgba(236, 255, 244, 0.66)'}}>{t('nav.more')}</span>
+              <button onClick={onClose} aria-label={t('nav.close')} style={{
                 background: 'transparent', border: 'none', cursor: 'pointer', color: 'rgba(236, 255, 244, 0.66)',
                 display: 'flex', padding: 4,
               }}>
@@ -479,7 +522,7 @@ function MobileMoreSheet({open, items, activePath, onClose, onNavigate}: MoreShe
               </button>
             </div>
             <div style={{display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 10}}>
-              {items.map(({key, label, icon: Icon}) => {
+              {items.map(({key, labelKey, icon: Icon}) => {
                 const isActive = key === activePath;
                 return (
                   <button key={key} onClick={() => onNavigate(key)} style={{
@@ -491,7 +534,7 @@ function MobileMoreSheet({open, items, activePath, onClose, onNavigate}: MoreShe
                     fontSize: 14, fontWeight: 600,
                   }}>
                     <Icon size={20}/>
-                    <span>{label}</span>
+                    <span>{t(labelKey)}</span>
                   </button>
                 );
               })}

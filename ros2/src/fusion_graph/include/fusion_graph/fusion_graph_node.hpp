@@ -35,11 +35,13 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 
+#include "fusion_graph/dr_slip_veto.hpp"
 #include "fusion_graph/graph_manager.hpp"
 #include "fusion_graph/pose_extrapolator.hpp"
 #include "fusion_graph/scan_matcher.hpp"
 #include <Eigen/Core>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <mowgli_interfaces/gnss_observation_freshness.hpp>
 #include <mowgli_interfaces/msg/high_level_status.hpp>
 #include <mowgli_interfaces/msg/status.hpp>
 #include <std_srvs/srv/trigger.hpp>
@@ -97,6 +99,9 @@ private:
 
   // Try to seed X_0. Returns true once initialization succeeded.
   bool TrySeedInitialPose();
+  // RTK freshness is based on receiver-receipt provenance in ROS time.
+  // Negative age (future stamp / clock rewind) is always not fresh.
+  bool RtkFixedReceiptIsFresh(double maximum_age_s) const;
 
   // Publish TF map->odom and /odometry/filtered_map.
   void PublishOutputs(const TickOutput& out);
@@ -106,6 +111,9 @@ private:
   // dead-reckoning state. Called unconditionally from OnTimer so the
   // local frame keeps streaming even before the graph initializes.
   void PublishLocalOdom();
+  // Publishes /fusion_graph/icp_odometry — the LiDAR-only (scan-match
+  // integrated) pose, for GUI comparison against the fused/GPS estimate.
+  void PublishIcpOdom();
 
   // Launch GraphManager::Save on a detached worker. No-op if a
   // previous async save is still running. `reason` is logged.
@@ -182,8 +190,24 @@ private:
   //   dr_slip_wheel_min_rad_per_s: wheel must claim a real yaw rate
   // The disagreement itself is |wheel_wz_ - gz|, gated by the two
   // above so a normal coordinated turn (both agree) is never vetoed.
-  double dr_slip_gyro_max_rad_per_s_ = 0.15;
-  double dr_slip_wheel_min_rad_per_s_ = 0.15;
+  //
+  // dr_slip_wheel_min_rad_per_s MUST stay above the quantization floor of
+  // wheel_wz_ — see dr_slip_veto.hpp for the derivation. /wheel_odom derives
+  // the wheel yaw rate from a tick DIFFERENCE over one 50-67 ms aggregation
+  // window, so one tick of left/right asymmetry already reads 0.166-0.219
+  // rad/s. The original 0.15 sat BELOW that floor: during a slow straight
+  // drive the gyro reads ~0 and a single tick of encoder rounding was
+  // indistinguishable from a skating pivot, so the veto fired on 32-45 % of
+  // windows and zeroed that fraction of the translation. odom→base_footprint
+  // under-reported travel by ~25-30 %, and Nav2's BackUp — which measures
+  // odom-frame displacement — drove 2.1 m for a 1.50 m undock command
+  // (issue #488). 0.44 rad/s clears the 2-LSB floor; the skating pivot this
+  // veto exists for runs 1-3 rad/s, so the margin costs no sensitivity.
+  // Both are ROS parameters (dr_slip_gyro_max_rad_per_s /
+  // dr_slip_wheel_min_rad_per_s) so a robot with a different
+  // ticks_per_meter, wheel_track or aggregation window can re-floor them.
+  double dr_slip_gyro_max_rad_per_s_ = kDrSlipGyroMaxDefaultRadPerS;
+  double dr_slip_wheel_min_rad_per_s_ = kDrSlipWheelMinDefaultRadPerS;
 
   // GPS antenna radial offset from base_link, hypot(lever_arm_x,
   // lever_arm_y). Used by the RTK wrong-fix gate in OnGnss to
@@ -231,6 +255,62 @@ private:
   // map→odom broadcast for one cycle, which is the intent.
   std::atomic<bool> t_map_odom_anchor_valid_{false};
 
+  // ── map→odom slew-rate limiter (continuity restoration) ─────────
+  // t_map_odom_anchor_ above is the RAW target: it steps discontinuously
+  // whenever a new node lands with a graph correction (GPS innovation,
+  // loop closure, scan-match, or the accumulated refinement snapped in at
+  // the end of a stationary_node_period_s window). Publishing it directly
+  // pushes those steps straight into map→base = anchor ⊙ odom→base, and
+  // Nav2's controller tracks a teleporting pose → left/right weave and
+  // in-place hunting. REP-105 requires the map-frame correction to be
+  // applied CONTINUOUSLY. So the TF thread eases a PUBLISHED anchor toward
+  // the raw target at a bounded rate: a few-cm RTK correction becomes a
+  // sub-second ramp instead of a step; a genuine relocalization (target
+  // jumps past anchor_snap_dist_m / anchor_snap_yaw_rad — re-seed, first
+  // fix after a long Float, big loop closure) snaps immediately so we never
+  // lag reality. Set anchor_slew_enabled=false to reproduce the pre-slew
+  // step behaviour exactly (A/B validation).
+  //
+  // t_map_odom_pub_ is written ONLY by the TF broadcast thread (single
+  // writer → no lock for its own state). t_map_odom_pub_shared_ is a copy
+  // published back under tf_state_mu_ so PublishOutputs (executor thread)
+  // serves /odometry/filtered_map + /imu/fg_yaw from the SAME smoothed
+  // anchor as the TF, keeping viz and TF consistent.
+  bool anchor_slew_enabled_ = true;
+  double anchor_max_lin_slew_mps_ = 0.10;
+  double anchor_max_ang_slew_radps_ = 0.20;
+  double anchor_snap_dist_m_ = 0.50;
+  double anchor_snap_yaw_rad_ = 0.35;
+  gtsam::Pose2 t_map_odom_pub_{0.0, 0.0, 0.0};
+  bool t_map_odom_pub_valid_ = false;
+  // Smoothed anchor mirrored under tf_state_mu_ for PublishOutputs
+  // (/odometry/filtered_map + /imu/fg_yaw) to match the TF exactly.
+  gtsam::Pose2 t_map_odom_pub_shared_{0.0, 0.0, 0.0};
+  bool t_map_odom_pub_shared_valid_ = false;
+  // Wall-clock of the last inline map-frame publish, for the slew dt when
+  // the dedicated TF thread is disabled (observer / tf_broadcast_rate<=0).
+  double last_map_pub_s_ = -1.0;
+
+  // ── Odom re-base (lever-arm limiter) ────────────────────────────
+  // map→odom = graph_pose ⊙ dr⁻¹, so a small graph YAW jitter rotates the
+  // odom→base offset and becomes a map→odom POSITION step proportional to
+  // |dr| (distance from the odom origin). As the robot drives away from
+  // that origin the same jitter produces ever-larger position jumps → the
+  // fused pose teleports vs the smooth odom trail and the controller can't
+  // track. When |dr| exceeds odom_rebase_dist_m we reset the odom POSITION
+  // origin onto the robot (dr_x/y→0, heading kept) and shift the anchor so
+  // map→base is unchanged — keeping the lever arm small. 0 = disabled.
+  double odom_rebase_dist_m_ = 0.0;
+  // Set by OnTimer at a re-base; SlewPublishedAnchor snaps the published
+  // anchor to the (coordinated) new target so map→base stays continuous
+  // across the reset instead of the slew ramping it.
+  std::atomic<bool> force_pub_resync_{false};
+
+  // Advance t_map_odom_pub_ toward the raw target anchor by at most
+  // anchor_max_{lin,ang}_slew over dt; snap on relocalization-scale jumps.
+  // Returns the anchor to broadcast. Single-writer per run mode.
+  gtsam::Pose2 SlewPublishedAnchor(const gtsam::Pose2& target, bool anchor_valid, double dt);
+
   // Latched seeds for initialization.
   std::optional<gtsam::Vector2> seed_xy_;  // from latest GPS
   std::optional<double> seed_yaw_;  // from latest COG/mag
@@ -261,6 +341,36 @@ private:
   double cog_flip_min_interval_s_ = 10.0;
   double cog_flip_consistency_rad_ = 0.52;  // ~30°
   std::optional<double> cog_flip_prev_yaw_;
+  // Gate the COG yaw FACTOR (not just the flip recovery) on RTK-Fixed. COG is
+  // the GPS travel direction; under RTK-Float/NO_FIX a few-cm-to-m displacement
+  // error over the ~20 cm inter-fix baseline becomes a huge heading error, so
+  // the COG turns to garbage and corrupts the weakly-observable yaw (map→odom
+  // then balloons and the lever arm amplifies graph jitter into position jumps
+  // → the robot drives out of bounds). Gyro + scan-matching carry yaw through
+  // the Float window. NEVER gate before init — TrySeedInitialPose needs the seed.
+  bool cog_require_rtk_ = true;
+  double cog_rtk_max_age_s_ = 2.0;
+  uint64_t cog_rtk_gated_ = 0;  // diagnostic counter
+  // OpenMower-style heading discipline (Level 1). COG = GPS travel direction,
+  // so it is meaningless/ambiguous below a forward-speed floor (undefined at
+  // rest, noise-dominated when slow, 180°-flipped in reverse). Gate it to
+  // forward motion above cog_min_speed_mps and FLOOR its σ at cog_min_sigma_rad
+  // so it TRENDS the gyro-integrated heading rather than snapping to a noisy
+  // per-fix course — the gyro carries yaw short-term, COG only anchors it long
+  // term. Mirrors xbot_positioning's min_speed gate + cov=1e4 soft update.
+  double cog_min_speed_mps_ = 0.08;
+  double cog_min_sigma_rad_ = 0.15;  // ~8.6° floor
+
+  // ── LiDAR yaw yield (Level 2) ───────────────────────────────────
+  // Scan-matching (and loop closure) between-factors carry BOTH position and
+  // yaw. In feature-poor / symmetric scenery the ICP yaw can converge wrong
+  // with a confident (tight) σ_theta and BAKE a wrong heading into the graph
+  // that later GPS can't undo — reproduced as a stuck, oscillating yaw. Floor
+  // the scan/loop-closure σ_theta so LiDAR's yaw only weakly nudges the graph
+  // (the gyro carries yaw), while σ_xy stays tight so LiDAR still CARRIES
+  // POSITION through RTK-Float windows — its essential role we must keep for
+  // canopy dropout. 0 = disabled (old behaviour, LiDAR yaw fully trusted).
+  double scan_yaw_sigma_floor_rad_ = 0.30;  // ~17°
   std::optional<rclcpp::Time> last_flip_recovery_stamp_;
   // True when seed_xy_ was set from an RTK-Fixed fix (carr_soln=2).
   // Drives the prior sigma at Initialize: tight (sub-cm) when set,
@@ -360,6 +470,24 @@ private:
   // re-enables, so it still carries global consistency through no-fix (tree)
   // windows. Default true.
   bool lc_skip_when_rtk_fixed_ = true;
+  // Loop-closure rate/travel gate + GPS σ floor (issue #513, see
+  // loop_closure_gate.hpp). Without it LC ran at 13.7 accepts/s under RTK-Float
+  // (3816 in 286 s of mowing), each a 5 cm factor to the adjacent swath.
+  // At most ONE accepted LC per node, and none until BOTH lc_min_interval_s_
+  // has elapsed AND lc_min_travel_m_ of wheel travel has accrued since the
+  // last ACCEPTED LC. lc_sigma_xy is floored to lc_gps_sigma_ratio_ ×
+  // last_gps_sigma_ so an LC is never tighter than the last GNSS fix.
+  double lc_min_travel_m_ = 1.0;
+  double lc_min_interval_s_ = 2.0;
+  double lc_gps_sigma_ratio_ = 1.0;
+  // Accumulators for the gate — reset on ACCEPT ONLY (a gate rejection must
+  // leave them alone or the gate never opens; loop_closure_gate.hpp explains
+  // why that is the correct polarity here and the wrong one for the RTK
+  // wrong-fix gate). wheel_dist_since_last_lc_m_ is incremented alongside
+  // wheel_dist_since_last_gps_m_ in OnWheel.
+  double wheel_dist_since_last_lc_m_ = 0.0;
+  std::optional<rclcpp::Time> last_lc_accept_stamp_;
+  uint64_t lc_rate_gated_ = 0;  // diagnostic: nodes where the gate blocked the search
 
   // Publishers.
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_;
@@ -375,6 +503,11 @@ private:
   // by the latest IMU gyro sample. Position is the unmodified last
   // fusion-published value. See PoseExtrapolator for the math.
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_odom_fast_;
+  // LiDAR-only odometry: the scan-match deltas integrated from the graph pose
+  // at the first accepted match. Relative (drifts) — published purely so the
+  // GUI can overlay/compare the ICP heading & pose against the fused/GPS
+  // estimate. NOT consumed by any control loop.
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pub_icp_odom_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
 
   // TF for odom->base_footprint (we publish map->odom; need to compose
@@ -411,6 +544,16 @@ private:
   // the next dock arrival re-seeds.
   bool dock_seeded_this_session_ = false;
 
+  // Boot dock-seed fallback: if the graph is still uninitialized a few
+  // seconds after boot (is_charging never arrived — e.g. degraded DDS
+  // discovery — AND no COG yaw is available while parked), seed from the
+  // calibrated dock pose so a fresh boot on the dock always yields a map
+  // frame. Without this, Nav2's planner_server aborts activation when
+  // map→base_footprint never appears, cascading the whole bringup down.
+  // boot_stamp_s_ is latched on the first uninitialized OnTimer tick.
+  double boot_stamp_s_ = -1.0;
+  bool dock_seed_fallback_done_ = false;
+
   // Dock-arrival pose seed (formerly the dock_yaw_to_set_pose node).
   // On the rising edge of is_charging we anchor the graph at the
   // operator-calibrated dock pose. The two are deduplicated by
@@ -426,6 +569,27 @@ private:
   uint64_t scan_matches_ok_ = 0;
   uint64_t scan_matches_fail_ = 0;
 
+  // ICP-only odometry integration (see pub_icp_odom_). Seeded from the graph
+  // pose at the first node with a scan-between, then advanced ONCE PER NODE by
+  // the scan-between delta the graph consumed. last_scan_between_delta_ caches
+  // the latest accepted match (motion since the previous node); it is composed
+  // only when Tick() creates the next node. Composing per-tick over-integrates
+  // (~19 ticks/node, delta is cumulative-since-node) → the static-robot drift.
+  gtsam::Pose2 icp_pose_{};
+  bool icp_pose_seeded_ = false;
+  gtsam::Pose2 last_scan_between_delta_{};
+  bool last_scan_between_valid_ = false;
+
+  // GPS σ speed inflation: σ_eff = sqrt(σ_msg² + (coeff·v)²). The receiver
+  // covariance ignores motion-induced position error (GPS latency × speed,
+  // lever-arm sweep during motion). 0 = disabled (raw receiver σ). [seconds]
+  double gps_sigma_speed_coeff_ = 0.0;
+
+  // SAFETY: reject a fix whose computed σ_xy exceeds this (m). 0 = disabled.
+  // Guards against fusing a garbage / standalone fix; sized to NOT reject
+  // genuine RTK-Float (the ride-through depends on it). [metres]
+  double gps_max_sigma_reject_m_ = 0.0;
+
   // RTK wrong-fix detection state. F9P can re-solve carrier-phase
   // ambiguity on a different integer set after a brief signal drop,
   // jumping the reported solution by 3-10 cm while still reporting
@@ -436,17 +600,16 @@ private:
   // GraphStats.gps_rejects_wrongfix).
   //
   // wheel_dist_since_last_gps_m_ accumulates |wheel translation|
-  // between consecutive OnGnss calls; reset to 0 in OnGnss after
-  // the check.
+  // between consecutive genuine observations; cached republications return
+  // before this state is touched.
+  mowgli_interfaces::gnss_observation_freshness::ObservationTracker gnss_observation_tracker_;
   std::optional<gtsam::Vector2> last_gps_map_xy_;
   double wheel_dist_since_last_gps_m_ = 0.0;
-  // GPS jump (m) above which the sample is rejected when the wheel
-  // accumulator stayed under rtk_wrongfix_max_wheel_m_. Picked to be
-  // well above the σ ~1 cm noise floor we measured 2026-05-17 (8-12
-  // mm σ on raw /gps/fix stationary), and below the smallest
-  // legitimate motion the robot can produce in one GPS period
-  // (vx_max ≈ 0.30 m/s × 0.1 s = 30 mm). 50 mm leaves headroom for
-  // 1-2σ outliers while still catching ≥0.5σ wrong-fix jumps.
+  // GPS jump (m) above which the sample is rejected as a wrong-fix (motion-
+  // consistent gate: compare jump against actual wheel travel since last fix).
+  // 50 mm sits above the σ~1 cm noise floor (2026-05-17: 8-12 mm σ on raw
+  // /gps/fix stationary) and below vx_max≈0.30 m/s × 0.1 s = 30 mm of
+  // legitimate motion. See rtk_wrongfix_gate.hpp for the decision function.
   double rtk_wrongfix_max_jump_m_ = 0.05;
   // Dock-pose hold while charging: re-assert a firm ForceAnchor at the FULL
   // dock_pose (x,y,yaw) ONCE PER NEW NODE, replacing the weak live-GPS factor
@@ -459,6 +622,22 @@ private:
   // and yaw with no live GPS to drag it off.
   double dock_reanchor_sigma_xy_m_ = 0.03;
   uint64_t last_dock_reanchor_node_ = std::numeric_limits<uint64_t>::max();
+  // Dock-prior vs RTK-Fixed GPS consistency (issue #512, dock_gps_consistency.hpp).
+  // The prior above YIELDS for a node — and that GPS sample is fused instead —
+  // only when a FRESH RTK-Fixed sample with σ ≤ dock_prior_max_gps_sigma_m_ puts
+  // the antenna more than dock_prior_max_gps_disagreement_m_ from where
+  // dock_pose says it is. No fix / Float / large σ (the terrace case) → the
+  // prior keeps pinning exactly as before. Either threshold ≤ 0 disables.
+  double dock_prior_max_gps_disagreement_m_ = 0.50;
+  double dock_prior_max_gps_sigma_m_ = 0.05;
+  // GPS antenna offset from base_link (mirrors GraphParams::lever_arm_x/y) so
+  // the docked antenna position can be predicted as dock_pose ⊕ R(yaw)·lever.
+  double lever_arm_x_m_ = 0.0;
+  double lever_arm_y_m_ = 0.0;
+  // Diagnostics: latest antenna-to-antenna disagreement measured while
+  // charging (0 when not charging), and how many nodes the prior yielded on.
+  double dock_gps_disagreement_m_ = 0.0;
+  uint64_t dock_prior_yielded_ = 0;
   // Dock-approach pose stabilisation. While /cmd_vel_docking is active the
   // graceful dock controller is steering the final approach; the slow reverse
   // motion makes the COG travel-direction yaw unreliable and the RTK fixed↔float
@@ -471,13 +650,6 @@ private:
   bool gate_cog_during_docking_ = true;
   bool gate_float_gps_during_docking_ = true;
   std::optional<rclcpp::Time> last_docking_cmd_stamp_;
-  // Wheel-derived distance (m) traveled since the last GPS sample,
-  // below which a GPS jump > rtk_wrongfix_max_jump_m_ is judged
-  // inconsistent. 20 mm sits just above the per-tick encoder noise
-  // floor — at 0.30 m/s the robot covers 30 mm in 100 ms (one fix
-  // period), so a real motion easily clears 20 mm.
-  double rtk_wrongfix_max_wheel_m_ = 0.02;
-
   // ICP guard-rail thresholds — see GraphParams comments for the
   // physical intuition. Declared as ROS params so we can tighten or
   // loosen them in mowgli_robot.yaml without a rebuild.
@@ -511,9 +683,12 @@ private:
   // + the ICP guard rails). CAPTURE: under stable RTK-Fixed, freeze the
   // GPS-fused node pose + scan as a keyframe (builds the absolute map). APPLY:
   // during RTK-Float, match the live scan to nearby keyframes and queue a
-  // PoseTranslationPrior that pins absolute xy — the mechanism that holds <2 cm
-  // through a Float window where dead-reckoning would otherwise drift. Default
-  // OFF. See graph_manager_keyframe.cpp + the OnScan capture/apply blocks.
+  // PriorFactor<Pose2> that pins absolute xy + yaw — the mechanism that holds
+  // <2 cm through a Float window where dead-reckoning would otherwise drift.
+  // The yaw component is protected by the kf_yaw_sigma_floor (GraphManager)
+  // and the yaw mirror-guard below so LiDAR heading can't override the gyro.
+  // Code default OFF; the in-repo yaml enables it. See graph_manager_keyframe.cpp
+  // + the OnTimer capture/apply blocks.
   bool use_keyframe_map_ = false;
   double kf_capture_sigma_max_m_ = 0.01;  // max GPS σ to allow a capture
   int kf_capture_rtk_debounce_ = 3;  // consecutive RTK-Fixed epochs first
@@ -521,8 +696,36 @@ private:
   double kf_spacing_m_ = 0.5;  // min move between captures
   double kf_match_max_dist_m_ = 3.0;  // apply-side keyframe search radius
   size_t kf_max_candidates_ = 5;
-  double kf_apply_sigma_floor_m_ = 0.02;  // floor on the PoseTranslationPrior σ
+  // Apply-side σ floors. The positional floor is raised to the capture gate
+  // (kf_capture_sigma_max_m_) at apply time so a keyframe frozen up to that far
+  // off its true pose can never be trusted TIGHTER than its own capture error.
+  double kf_apply_sigma_floor_m_ = 0.02;  // ICP-realism floor on the positional σ
+  double kf_apply_sigma_theta_rad_ = 0.05;  // ICP-realism floor on the yaw σ (~3°);
+                                            // GraphManager's kf_yaw_sigma_floor
+                                            // (~0.30 rad) is the effective floor
   double kf_engage_age_s_ = 0.3;  // engage apply when Fixed older than this
+  // Looser inlier floor for cross-viewpoint scan-to-keyframe ICP, passed as a
+  // per-call override to scan_matcher_->Match. The shared scan-to-scan default
+  // (scan_min_inliers=30) assumes near-total overlap and rejected ~99.7% of
+  // keyframe matches at the in-loop min_inliers early-abort; 16 lets the
+  // RTK-Float keyframe anchor actually engage.
+  int kf_min_inliers_ = 16;
+  // Relaxed ICP guard rails for keyframe matching (cross-viewpoint, not
+  // incremental). Overrides min_inliers (kf_min_inliers_ above) plus the
+  // RMSE / divergence thresholds. The icp_max_delta_* checks
+  // (0.30 m / 0.50 rad) are inappropriate here — res.delta is the full
+  // transform between keyframe and live scan (up to kf_match_max_dist_m_).
+  double kf_match_max_rmse_m_ = 0.15;
+  double kf_match_max_divergence_xy_m_ = 0.30;
+  double kf_match_max_divergence_theta_rad_ = 0.50;
+  // Absolute-yaw mirror-guard (KeyframeYawWithinGate): reject a keyframe match
+  // whose implied ABSOLUTE map-frame yaw deviates from the gyro-predicted yaw by
+  // more than this. Catches mirrored / 180°-flipped ICP solutions on symmetric
+  // scenery that the xy mirror-guard and Huber let through — the keyframe prior
+  // engages during RTK-Float where COG is gated off, so this is the only guard
+  // on its heading. Sized to reject gross flips while leaving room for the
+  // keyframe to correct genuine slow gyro drift (< a few ° over a Float window).
+  double kf_match_max_yaw_dev_rad_ = 0.5;
   // Latches updated in OnGnss for the capture gate.
   double last_gps_sigma_ = -1.0;  // most-recent valid GPS σ (m); <0 = none
   int rtk_fixed_streak_ = 0;  // consecutive RTK-Fixed epochs
@@ -539,10 +742,8 @@ private:
   // shared_ptr because a detached worker may outlive the node at
   // shutdown — the worker captures this shared_ptr by value and
   // writes false on completion without touching `this`.
-  std::shared_ptr<std::atomic<bool>> save_in_flight_ =
-      std::make_shared<std::atomic<bool>>(false);
-  std::shared_ptr<std::atomic<bool>> rebase_in_flight_ =
-      std::make_shared<std::atomic<bool>>(false);
+  std::shared_ptr<std::atomic<bool>> save_in_flight_ = std::make_shared<std::atomic<bool>>(false);
+  std::shared_ptr<std::atomic<bool>> rebase_in_flight_ = std::make_shared<std::atomic<bool>>(false);
 };
 
 }  // namespace fusion_graph

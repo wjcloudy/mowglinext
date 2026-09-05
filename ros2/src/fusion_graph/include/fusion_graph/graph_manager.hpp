@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "fusion_graph/graph_params.hpp"
+#include "fusion_graph/slip_window.hpp"
 #include <Eigen/Core>
 #include <gtsam/geometry/Pose2.h>
 #include <gtsam/inference/Symbol.h>
@@ -70,7 +71,7 @@ struct GraphStats
   uint64_t gps_rejects_wrongfix = 0;  // jump in /fix > thresh with stationary wheel
   uint64_t icp_rejects_rmse = 0;
   uint64_t icp_rejects_inliers = 0;  // ScanMatcher returned ok=false (min_inliers)
-  uint64_t icp_rejects_sanity = 0;   // unphysical delta magnitude
+  uint64_t icp_rejects_sanity = 0;  // unphysical delta magnitude
   uint64_t icp_rejects_divergence = 0;  // result far from initial guess
   uint64_t stationary_hand_push = 0;  // wheel stationary but gyro disagrees
   uint64_t slip_veto = 0;  // ticks where wheel translation was vetoed by gyro
@@ -105,8 +106,15 @@ public:
   // at next tick. sigma is per-axis; pass < 0 to use floor. When
   // `robust` is true, the noise model is wrapped in a Huber kernel —
   // appropriate for RTK-Float / single-fix samples where multipath
-  // outliers can lie outside the reported covariance.
-  void QueueGnss(double x, double y, double sigma_xy, bool robust = false);
+  // outliers can lie outside the reported covariance. When `target_node`
+  // is set, the factor is attached to that existing pose instead of the
+  // node created by the next Tick(). Returns false if the requested node
+  // is no longer present in the live graph.
+  bool QueueGnss(double x,
+                 double y,
+                 double sigma_xy,
+                 bool robust = false,
+                 std::optional<uint64_t> target_node = std::nullopt);
 
   // Yaw observation (COG or mag). sigma_yaw is rad. `robust` should be
   // true for magnetometer yaw (uncalibrated / heading-dependent bias),
@@ -119,12 +127,18 @@ public:
   // their respective covariances.
   void QueueScanBetween(const gtsam::Pose2& delta, double sigma_xy, double sigma_theta);
 
-  // Scan-to-keyframe ABSOLUTE xy constraint to apply at next node creation as a
-  // PoseTranslationPrior(X_curr, abs_xy). `abs_xy` is the map-frame position the
-  // current node should have per an ICP match to a frozen keyframe. `robust`
-  // wraps the noise model in Huber (a keyframe match on symmetric scenery can be
-  // a gross outlier, like a wrong-fix GPS sample).
-  void QueueScanToKeyframe(const gtsam::Vector2& abs_xy, double sigma_xy, bool robust = true);
+  // Scan-to-keyframe ABSOLUTE full-pose constraint to apply at next node creation
+  // as a PriorFactor<Pose2>(X_curr, abs_pose). `abs_pose` is the map-frame pose
+  // (xy + yaw) the current node should have per an ICP match to a frozen
+  // keyframe. `robust` wraps the noise model in Huber (a keyframe match on
+  // symmetric scenery can be a gross outlier, like a wrong-fix GPS sample). The
+  // yaw σ is additionally floored at params_.kf_yaw_sigma_floor_rad in
+  // CreateNodeLocked so the LiDAR-derived absolute heading can only weakly
+  // correct gyro drift, never override it.
+  void QueueScanToKeyframe(const gtsam::Pose2& abs_pose,
+                           double sigma_xy,
+                           double sigma_theta,
+                           bool robust = true);
 
   // Initial-pose seed. Required before the first tick if no GPS has
   // arrived yet — sets the prior on X_0. Must be called exactly once
@@ -153,6 +167,13 @@ public:
   std::optional<TickOutput> LatestSnapshot() const;
   GraphStats Stats() const;
 
+  // Newest live pose node whose graph timestamp is at or before
+  // `timestamp_s`. Sensor callbacks use this to associate delayed stamped
+  // observations with the state they measured instead of the state at
+  // callback-delivery time. Returns nullopt before the oldest indexed live
+  // node, for non-finite timestamps, or while uninitialized.
+  std::optional<uint64_t> FindNodeAtOrBefore(double timestamp_s) const;
+
   // Count of pose ('x') variables currently live in the iSAM2 graph.
   // Distinct from GraphStats::total_nodes, which is the monotonic
   // next-index (never decreases). After a windowed RebaseISAM2 the
@@ -167,10 +188,7 @@ public:
   // previous node creates a far better start than Pose2() for ICP's
   // brute-force NN search — especially under fast pivots where the
   // identity-init guess sends ICP looking 30°+ off true rotation.
-  void PeekAccumulator(double& dx,
-                       double& dy,
-                       double& dtheta_gyro,
-                       double& dtheta_wheel) const;
+  void PeekAccumulator(double& dx, double& dy, double& dtheta_gyro, double& dtheta_wheel) const;
 
   // Health counters. fusion_graph_node calls these from its OnGnss
   // (wrong-fix detection) and OnTimer (ICP guard rails) paths. Each
@@ -305,7 +323,8 @@ public:
   // (which is what a Reset() would throw away). The latest node also
   // receives a tighter prior (5 mm / 0.3°) so future GPS factors take
   // longer to drift it back off the dock anchor.
-  void RigidTransformAll(const gtsam::Pose2& correction, double latest_node_sigma_xy = 0.005,
+  void RigidTransformAll(const gtsam::Pose2& correction,
+                         double latest_node_sigma_xy = 0.005,
                          double latest_node_sigma_theta = 0.005);
 
   // Add a loop-closure between-factor between two existing nodes.
@@ -384,6 +403,7 @@ private:
       gtsam::Vector2 xy;
       double sigma;
       bool robust;
+      std::optional<uint64_t> target_node;
     };
     struct Yaw
     {
@@ -402,15 +422,17 @@ private:
       double sigma_theta;
     };
     std::optional<ScanBetween> scan_between;
-    // Scan-to-keyframe ABSOLUTE constraint: the pre-computed map-frame xy the
-    // current node should have, derived from an ICP match to a frozen keyframe
-    // (abs_xy = kf.abs_pose.compose(delta.inverse()).translation()). Applied as
-    // a PoseTranslationPrior on X_curr — xy-only, so yaw stays owned by the
-    // gyro/COG factors. Engaged only during RTK-Float (see fusion_graph_node).
+    // Scan-to-keyframe ABSOLUTE constraint: the pre-computed map-frame full pose
+    // the current node should have, derived from an ICP match to a frozen keyframe
+    // (abs_pose = kf.abs_pose.compose(delta.inverse())). Applied as a
+    // PriorFactor<Pose2> on X_curr — xy + yaw, so the keyframe constrains heading
+    // during RTK-Float windows instead of letting it drift. Engaged only during
+    // RTK-Float (see fusion_graph_node).
     struct ScanToKeyframe
     {
-      gtsam::Vector2 abs_xy;
+      gtsam::Pose2 abs_pose;
       double sigma_xy;
+      double sigma_theta;
       bool robust;
     };
     std::optional<ScanToKeyframe> scan_to_keyframe;
@@ -440,8 +462,15 @@ private:
 
   uint64_t next_index_ = 0;  // index of the next node to create
   double last_node_time_s_ = 0.0;  // wall time of last created node
+  // Creation times for recent live pose nodes, in chronological order.
+  // The deque is capped alongside the graph window; FindNodeAtOrBefore also
+  // skips entries already removed by an asynchronous rebase.
+  std::deque<std::pair<double, uint64_t>> node_time_index_;
 
   Accumulator accum_;
+  // Per-node (dθ_wheel, dθ_gyro) ring the slip veto integrates over
+  // (issue #516) — sized from slip_window_s / node_period_s in the ctor.
+  SlipWindow slip_window_;
   UnaryQueue queue_;
 
   std::optional<TickOutput> latest_;

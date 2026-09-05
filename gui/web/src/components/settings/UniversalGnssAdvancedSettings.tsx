@@ -1,11 +1,14 @@
 import React, { useState } from "react";
 import { Alert, Card, Form, Input, InputNumber, Select, Typography } from "antd";
+import { useTranslation } from "react-i18next";
 import {
     GNSS_ADVANCED_SETTINGS_BY_FAMILY,
     GNSS_CUSTOM_OPTION_VALUE,
     inferPresetTextSelection,
+    normalizeGnssReceiverModel,
     normalizeGnssSignalGroup,
     normalizeGnssString,
+    rawGnssInputString,
 } from "./gnssConfig.ts";
 
 const { Paragraph } = Typography;
@@ -21,6 +24,7 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
     values,
     onChange,
 }) => {
+    const { t } = useTranslation();
     const family = normalizeGnssString(receiverFamily).toLowerCase();
     const definition = GNSS_ADVANCED_SETTINGS_BY_FAMILY[family];
     const [customSelections, setCustomSelections] = useState<Record<string, boolean>>({});
@@ -30,9 +34,9 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
     }
 
     return (
-        <Card size="small" title={definition.title} style={{ marginBottom: 16 }}>
+        <Card size="small" title={t(definition.title)} style={{ marginBottom: 16 }}>
             <Paragraph type="secondary" style={{ marginTop: 0 }}>
-                {definition.description}
+                {t(definition.description)}
             </Paragraph>
 
             <Form layout="vertical" size="small">
@@ -48,7 +52,7 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
 
                         return (
                             <div key={field.key}>
-                                <Form.Item label={field.label} tooltip={field.tooltip}>
+                                <Form.Item label={t(field.label)} tooltip={t(field.tooltip)}>
                                     <Select
                                         value={selectedPreset}
                                         onChange={(preset) => {
@@ -62,17 +66,17 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
                                         options={[
                                             ...field.options.map((option) => ({
                                                 value: option.value,
-                                                label: option.label,
+                                                label: t(option.label),
                                             })),
                                             {
                                                 value: GNSS_CUSTOM_OPTION_VALUE,
-                                                label: field.customOptionLabel,
+                                                label: t(field.customOptionLabel),
                                             },
                                         ]}
                                     />
                                 </Form.Item>
 
-                                <Form.Item label={field.rawLabel ?? `${field.label} Raw Value`}>
+                                <Form.Item label={field.rawLabel ? t(field.rawLabel) : t("settingsGnssAdvanced.rawValueFallback", { label: t(field.label) })}>
                                     <Input
                                         value={rawValue}
                                         onChange={(event) => {
@@ -81,13 +85,13 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
                                                 : normalizeGnssString(event.target.value);
                                             onChange(field.key, nextValue);
                                         }}
-                                        placeholder={field.customPlaceholder}
+                                        placeholder={field.customPlaceholder ? t(field.customPlaceholder) : field.customPlaceholder}
                                     />
                                 </Form.Item>
 
                                 {selectedOption?.description && (
                                     <Paragraph type="secondary" style={{ marginTop: -8, fontSize: 12 }}>
-                                        {selectedOption.description}
+                                        {t(selectedOption.description)}
                                     </Paragraph>
                                 )}
 
@@ -96,7 +100,7 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
                                         type="info"
                                         showIcon
                                         style={{ marginBottom: 12 }}
-                                        message={field.helpText}
+                                        message={t(field.helpText)}
                                     />
                                 )}
                             </div>
@@ -104,13 +108,24 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
                     }
 
                     if (field.kind === "text") {
+                        const isSignalGroupField = field.key === "gnss_signal_group";
                         return (
                             <div key={field.key}>
-                                <Form.Item label={field.label} tooltip={field.tooltip}>
+                                <Form.Item label={t(field.label)} tooltip={t(field.tooltip)}>
                                     <Input
-                                        value={normalizeGnssString(values[field.key])}
-                                        onChange={(event) => onChange(field.key, normalizeGnssString(event.target.value))}
-                                        placeholder={field.placeholder}
+                                        value={isSignalGroupField
+                                            ? rawGnssInputString(values[field.key])
+                                            : normalizeGnssString(values[field.key])}
+                                        onChange={(event) => onChange(
+                                            field.key,
+                                            isSignalGroupField
+                                                ? event.target.value
+                                                : normalizeGnssString(event.target.value),
+                                        )}
+                                        onBlur={isSignalGroupField
+                                            ? (event) => onChange(field.key, normalizeGnssSignalGroup(event.target.value))
+                                            : undefined}
+                                        placeholder={field.placeholder ? t(field.placeholder) : field.placeholder}
                                     />
                                 </Form.Item>
                                 {field.helpText && (
@@ -118,7 +133,7 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
                                         type="info"
                                         showIcon
                                         style={{ marginBottom: 12 }}
-                                        message={field.helpText}
+                                        message={t(field.helpText)}
                                     />
                                 )}
                             </div>
@@ -128,11 +143,11 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
                     if (field.kind === "number") {
                         return (
                             <div key={field.key}>
-                                <Form.Item label={field.label} tooltip={field.tooltip}>
+                                <Form.Item label={t(field.label)} tooltip={t(field.tooltip)}>
                                     <InputNumber
                                         value={values[field.key]}
                                         onChange={(value) => onChange(field.key, value)}
-                                        placeholder={field.placeholder}
+                                        placeholder={field.placeholder ? t(field.placeholder) : field.placeholder}
                                         min={field.min}
                                         step={field.step}
                                         addonAfter={field.addonAfter}
@@ -144,7 +159,7 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
                                         type="info"
                                         showIcon
                                         style={{ marginBottom: 12 }}
-                                        message={field.helpText}
+                                        message={t(field.helpText)}
                                     />
                                 )}
                             </div>
@@ -153,13 +168,15 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
 
                     return (
                         <div key={field.key}>
-                            <Form.Item label={field.label} tooltip={field.tooltip}>
+                            <Form.Item label={t(field.label)} tooltip={t(field.tooltip)}>
                                 <Select
-                                    value={normalizeGnssString(values[field.key])}
+                                    value={field.key === "gnss_receiver_model"
+                                        ? normalizeGnssReceiverModel(values[field.key])
+                                        : normalizeGnssString(values[field.key])}
                                     onChange={(value) => onChange(field.key, value)}
                                     options={field.options.map((option) => ({
                                         value: option.value,
-                                        label: option.label,
+                                        label: t(option.label),
                                     }))}
                                 />
                             </Form.Item>
@@ -168,7 +185,7 @@ export const UniversalGnssAdvancedSettings: React.FC<Props> = ({
                                     type="info"
                                     showIcon
                                     style={{ marginBottom: 12 }}
-                                    message={field.helpText}
+                                    message={t(field.helpText)}
                                 />
                             )}
                         </div>

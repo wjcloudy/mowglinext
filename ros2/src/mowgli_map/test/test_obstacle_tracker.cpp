@@ -13,6 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <cmath>
+#include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -34,16 +36,38 @@ protected:
     {
       rclcpp::init(0, nullptr);
     }
-  }
-
-  void SetUp() override
-  {
+    // ONE node for the whole suite. This fixture used to build and destroy a
+    // full rclcpp::Node in every SetUp/TearDown — 17 create/destroy cycles per
+    // run — and the middleware teardown intermittently deadlocked, hanging the
+    // binary until ctest killed it (`test_obstacle_tracker (Timeout)`, red on
+    // dev and on unrelated PRs). The methods under test are pure algorithms
+    // that only need *a* node for its clock and parameters, not a fresh one,
+    // so the node is built once and the mutable state it carries is reset
+    // between tests instead (see SetUp).
     node_ = std::make_shared<mowgli_map::ObstacleTrackerNode>();
   }
 
-  void TearDown() override
+  static void TearDownTestSuite()
   {
     node_.reset();
+    if (rclcpp::ok())
+    {
+      rclcpp::shutdown();
+    }
+  }
+
+  /// Reset every piece of node state a test can mutate, so sharing one node
+  /// across the suite stays equivalent to the old fresh-node-per-test setup.
+  void SetUp() override
+  {
+    {
+      std::lock_guard<std::mutex> lock(node_->mutex_);
+      node_->tracked_.clear();
+      node_->next_id_ = 1;
+    }
+    std::lock_guard<std::mutex> lock(node_->keepout_mutex_);
+    node_->keepout_mask_ = nav_msgs::msg::OccupancyGrid{};
+    node_->have_keepout_mask_ = false;
   }
 
   // Expose private methods via delegation
@@ -81,6 +105,19 @@ protected:
     return node_->dbscan(points, eps, min_pts);
   }
 
+  void associate_clusters(const std::vector<std::vector<std::pair<double, double>>>& clusters,
+                          const rclcpp::Time& stamp)
+  {
+    node_->associate_clusters(clusters, stamp);
+  }
+
+  void set_keepout_mask(const nav_msgs::msg::OccupancyGrid& mask)
+  {
+    std::lock_guard<std::mutex> lock(node_->keepout_mutex_);
+    node_->keepout_mask_ = mask;
+    node_->have_keepout_mask_ = true;
+  }
+
   // Expose private type for use in test bodies
   using TrackedObstacle = mowgli_map::ObstacleTrackerNode::TrackedObstacle;
 
@@ -113,8 +150,10 @@ protected:
     return obs;
   }
 
-  std::shared_ptr<mowgli_map::ObstacleTrackerNode> node_;
+  static std::shared_ptr<mowgli_map::ObstacleTrackerNode> node_;
 };
+
+std::shared_ptr<mowgli_map::ObstacleTrackerNode> ObstacleTrackerAlgorithmTest::node_;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // boundary_hull tests
@@ -333,4 +372,62 @@ TEST_F(ObstacleTrackerAlgorithmTest, PointInPolygon_Degenerate)
 {
   std::vector<std::pair<double, double>> line = {{0, 0}, {1, 0}};
   EXPECT_FALSE(point_in_polygon(0.5, 0.0, line));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Keepout-mask suppression (FIX A): a cluster whose centroid lands on a lethal
+// keepout cell is a re-detection of an already-promoted obstacle and must be
+// dropped; a cluster in free (mask=0) space is a genuine obstacle and tracked.
+// ─────────────────────────────────────────────────────────────────────────────
+
+TEST_F(ObstacleTrackerAlgorithmTest, ClusterOnKeepoutCellIsDropped)
+{
+  // 100×100 cells @ 0.1 m, origin (-5, -5). Default free (0).
+  nav_msgs::msg::OccupancyGrid mask;
+  mask.info.resolution = 0.1F;
+  mask.info.width = 100;
+  mask.info.height = 100;
+  mask.info.origin.position.x = -5.0;
+  mask.info.origin.position.y = -5.0;
+  mask.data.assign(static_cast<size_t>(100 * 100), 0);
+
+  auto set_cell = [&](double x, double y, int8_t v)
+  {
+    const int col = static_cast<int>(std::floor((x - (-5.0)) / 0.1));
+    const int row = static_cast<int>(std::floor((y - (-5.0)) / 0.1));
+    mask.data[static_cast<size_t>(row) * 100 + col] = v;
+  };
+
+  // Mark a lethal patch (promoted keepout) around (2, 2).
+  for (double x = 1.7; x <= 2.3; x += 0.05)
+  {
+    for (double y = 1.7; y <= 2.3; y += 0.05)
+    {
+      set_cell(x, y, 100);
+    }
+  }
+  set_keepout_mask(mask);
+
+  // Cluster centred on the lethal patch — this is the promoted keepout being
+  // re-detected. It must be suppressed.
+  const std::vector<std::pair<double, double>> promoted_blob = {
+      {1.95, 1.95}, {2.05, 1.95}, {2.05, 2.05}, {1.95, 2.05}, {2.0, 2.0}};
+  associate_clusters({promoted_blob}, node_->now());
+  EXPECT_TRUE(tracked().empty()) << "cluster on a lethal keepout cell must be suppressed";
+
+  // Cluster in free (mask=0) space — a genuine new obstacle. Must be tracked
+  // even though a keepout mask has been received.
+  const std::vector<std::pair<double, double>> fresh_blob = {
+      {-2.05, -2.05}, {-1.95, -2.05}, {-1.95, -1.95}, {-2.05, -1.95}, {-2.0, -2.0}};
+  associate_clusters({fresh_blob}, node_->now());
+  EXPECT_EQ(tracked().size(), 1u) << "genuine obstacle in free (mask=0) area must be tracked";
+}
+
+TEST_F(ObstacleTrackerAlgorithmTest, NoKeepoutMaskFailsOpen)
+{
+  // Without a keepout mask the tracker must not suppress anything.
+  const std::vector<std::pair<double, double>> blob = {
+      {2.0, 2.0}, {2.1, 2.0}, {2.1, 2.1}, {2.0, 2.1}, {2.05, 2.05}};
+  associate_clusters({blob}, node_->now());
+  EXPECT_EQ(tracked().size(), 1u) << "no mask received → must fail open to detection";
 }

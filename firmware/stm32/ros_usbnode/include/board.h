@@ -47,8 +47,8 @@ extern "C"
 #define DEBUG_TYPE DEBUG_TYPE_UART
 
 #define MAX_MPS 0.5		  // Allow maximum speed of 1.0 m/s
-#define PWM_PER_MPS 300.0 // PWM value of 300 means 1 m/s bot speed so we divide by 4 to have correct robot speed but still progressive speed
-#define TICKS_PER_M 399.0 // Field-calibrated motor encoder ticks per meter
+#define PWM_PER_MPS 337.0 // PWM value of 300 means 1 m/s bot speed so we divide by 4 to have correct robot speed but still progressive speed
+#define TICKS_PER_M 339.0 // Power-on fallback encoder ticks per meter; ROS runtime tuning overrides this after host connection
 #define WHEEL_BASE  0.325		// The distance between the center of the wheels in meters
 
 #define OPTION_ULTRASONIC 0
@@ -68,13 +68,18 @@ extern "C"
 #define DEBUG_TYPE DEBUG_TYPE_SWO
 
 #define MAX_MPS 0.5		  // Allow maximum speed of 1.0 m/s
-#define PWM_PER_MPS 300.0 // PWM value of 300 means 1 m/s bot speed so we divide by 4 to have correct robot speed but still progressive speed
-#define TICKS_PER_M 399.0 // Field-calibrated; 500B shares the 500-series drivetrain (was 300)
+#if BOARD_YARDFORCE500B_LFP
+#define PWM_PER_MPS 300.0
+#define TICKS_PER_M 399.0 // custom 500B calibration; runtime config must match
+#else
+#define PWM_PER_MPS 275.0 // PWM value of 300 means 1 m/s bot speed so we divide by 4 to have correct robot speed but still progressive speed
+#define TICKS_PER_M 277.0 // Power-on fallback encoder ticks per meter; ROS runtime tuning overrides this after host connection
+#endif
 #define WHEEL_BASE  0.325		// The distance between the center of the wheels in meters
 
 #define OPTION_ULTRASONIC 0
 #if BOARD_YARDFORCE500B_LFP
-#define OPTION_BUMPER 1 // CLOUDY LFP build: blue wheel-lift remapped as front bump sensor (gated on BOARD_YARDFORCE500B_LFP)
+#define OPTION_BUMPER 1 // blue wheel-lift input is the front bumper
 #else
 #define OPTION_BUMPER 0
 #endif
@@ -91,141 +96,29 @@ extern "C"
 
 #define MAX_MPS 0.5		  // Allow maximum speed of 1.0 m/s
 #define PWM_PER_MPS 300.0 // PWM value of 300 means 1 m/s bot speed so we divide by 4 to have correct robot speed but still progressive speed
-#define TICKS_PER_M 300.0 // Motor Encoder ticks per meter
+#define TICKS_PER_M 300.0 // Power-on fallback encoder ticks per meter; ROS runtime tuning overrides this after host connection
 #define WHEEL_BASE 0.285   // The distance between the center of the wheels in meters
 
 #define BOARD_HAS_MASTER_USART 0
 #endif
 
-#define I_DONT_NEED_MY_FINGERS              1      // disables EmergencyController() (no wheel lift, or tilt sensing and stopping the blade anymore)
+// I_DONT_NEED_MY_FINGERS, when DEFINED (value is irrelevant — the guards use
+// #ifdef/#ifndef), compiles out EmergencyController() so the firmware NEVER
+// polls the physical stop button / wheel-lift / tilt sensors. That contradicts
+// "the STM32 firmware is the sole blade safety authority", so it is left
+// UNDEFINED to keep hardware e-stop sensing active.
+// WARNING: before flashing to a robot, validate per-chassis that the stop-button,
+// wheel-lift and tilt GPIOs are actually wired and not floating/noisy — otherwise
+// EmergencyController() may latch a spurious emergency. Re-#define this only if a
+// given chassis lacks those sensors.
+// #define I_DONT_NEED_MY_FINGERS           1      // disables EmergencyController()
 
-#if BOARD_YARDFORCE500B_LFP
-/* ===========================================================================
- * CLOUDY LFP charging profile (transposed from the ROS1 500B mainboard build)
- * Pack: 8S LiFePO4, ~4.8 Ah  (stock firmware targets 7S Li-ion, ~2.8 Ah).
- * These are hard-coded (not GUI-config) so they survive both a direct
- * platformio build AND a GUI re-render of this file from board.h.template.
- * Keep board.h and board.h.template in sync.
- * =========================================================================== */
-
-/// PWM safety ceiling (TIM1 period is 1400; stock cap was 1350).
-/// An 8S LFP at ~28.5V on the ~29-30V rail has little buck headroom, so it
-/// needs more duty to reach full current ("different charge-current/PWM curve").
-#define MAX_PWM_VALUE 1395
-/// PWM floor kept while still actively regulating (was the magic value 39)
-#define MIN_PWM_VALUE 39
-/// Fixed current-sensor offset [A]. Replaces auto-zeroing at dock, which is wrong
-/// here because the Pi/electronics still draw current at the assumed "zero" point.
-/// NOTE: re-measure on the actual hardware if the current reading looks biased.
-#define CURRENT_OFFSET -0.20f
-/// Usable pack capacity [Ah] for SOC coulomb counting (LFP voltage-based SOC is useless)
-#define BATTERY_CAPACITY 4.8f
-
-/// nominal max charge current [A] (~0.375C on a 4.8 Ah pack)
-#define MAX_CHARGE_CURRENT 1.8f
-/// Max charge-rail voltage allowed [V] (8S * 3.56 V/cell)
-#define MAX_CHARGE_VOLTAGE 28.5f
-/// CC->CV transition threshold [V] - kept for reference; the runtime
-/// charge_end_voltage actually drives the transition (default = cutoff below)
-#define LIMIT_VOLTAGE_150MA 28.5f
-/// Default max battery voltage [V] - initial value of the runtime charge_end_voltage
-#define BAT_CHARGE_CUTOFF_VOLTAGE 28.5f
-/// CV/float battery ceiling [V] (8S * 3.44 V/cell). Effective target = min(this, charge_end_voltage).
-#define MAX_FLOAT_CV_VOLTAGE 27.5f
-/// CV/float current limit [A] - fixed, replaces the stock MAX_CHARGE_CURRENT/10.
-/// CLOUDY raised 0.30 -> 0.40: 300mA couldn't cover the docked standby draw, so the pack
-/// sagged off the 27.5V float until the 26.5V CC fallback re-engaged (slow sawtooth). This is
-/// a cap; in CV the loop targets the float VOLTAGE and only draws what's needed to hold it.
-#define FLOAT_CV_CURRENT 0.40f
-/// We consider the battery full when CV current drops below this [A] (LFP has a flat tail)
-#define CHARGE_END_LIMIT_CURRENT 0.25f
-/// CLOUDY CC<->CV anti-latch. An 8S LFP has a very flat SoC curve and low ESR, so the
-/// terminal voltage under ~1.8 A charge current sits ~1.5 V above the resting/SoC voltage.
-/// Without these guards that loaded voltage trips CC->CV early and the one-way latch
-/// (charger_set_end_voltage is never called) floats the pack at FLOAT_CV_CURRENT forever
-/// while it is only part full (observed: stuck at ~0.3 A with the pack at 26.9 V).
-/// Number of ChargeController cycles (~10 ms each) the CC->CV trip must hold before latching.
-#define CV_ENTRY_DEBOUNCE_CYCLES 50
-/// CV->CC fallback: only drop back to bulk CC if the (smoothed) pack voltage sags this far
-/// below the CV trip - i.e. the pack is genuinely under-charged, NOT just floating. Must sit
-/// well below where a full LFP floats (~27.5-28V), else normal float ripple bounces CV<->CC
-/// and the pack hunts on its steep top-of-charge knee (observed 27.5<->28.7V at ~1Hz). [V]
-#define CV_EXIT_HYSTERESIS 2.0f
-/// CLOUDY CV voltage deadband: don't nudge PWM while within +/- this of the float target, so
-/// the CV loop stops limit-cycling around it (the LFP knee turns a tiny ripple into a big
-/// terminal-voltage swing). [V]
-#define CV_VOLTAGE_DEADBAND 0.2f
-/// CLOUDY ADC IIR smoothing weight on each NEW sample (~10 ms apart) for the voltages the
-/// charge loop acts on. Lower = more smoothing / more lag. The PWM-switched charge rail and
-/// the LFP pack's load-induced voltage swing are noisy, so smooth them hard (stock was
-/// battery 0.2, charge rail 0.8).
-#define V_BATT_SMOOTH_ALPHA   0.05f  /* ~190 ms time constant */
-#define V_CHARGE_SMOOTH_ALPHA 0.1f   /* ~90 ms time constant (rail is the noisiest) */
-// if charger-input voltage is greater than this assume we are docked [V]
-#define MIN_DOCKED_VOLTAGE 22.0f
-/// CLOUDY: ChargeController cycles (~10ms each) the charger input must stay below
-/// MIN_DOCKED_VOLTAGE before we declare "undocked" and drop to IDLE (PWM 0). Debounced so a
-/// transient input sag (e.g. a CC current overshoot, or a noisy reading) can't drop PWM to 0.
-#define UNDOCK_DEBOUNCE_CYCLES 20
-// if voltage is lower this assume battery is disconnected [V]
-#define MIN_BATTERY_VOLTAGE 5.0f
-
-// if current is greater than this assume the battery is charging [A]
-#define MIN_CHARGE_CURRENT 0.1f
-#define LOW_BAT_THRESHOLD 24.0f /* 8S LFP ~3.0 V/cell */
-#define LOW_CRI_THRESHOLD 23.0f /* 8S LFP ~2.88 V/cell */
-#else
-/* ===== Stock 7S Li-ion charging profile (upstream defaults) ===== */
-/// nominal max charge current is 1.0 Amp
-#define MAX_CHARGE_CURRENT 1.2f
-/// Max voltage allowed
-#define MAX_CHARGE_VOLTAGE 29.4f
-/// Voltage threshold for CC to CV transition
-#define LIMIT_VOLTAGE_150MA 28.8f
-/// Default max battery voltage allowed
-#define BAT_CHARGE_CUTOFF_VOLTAGE  29.2f
-/// We consider the battery is full when in CV mode the current below 0.1A
-#define CHARGE_END_LIMIT_CURRENT 0.08f
-// if voltage is greater than this assume we are docked
-#define MIN_DOCKED_VOLTAGE 20.0f
-// if voltage is lower this assume battery is disconnected
-#define MIN_BATTERY_VOLTAGE 5.0f
-
-// if current is greater than this assume the battery is charging
-#define MIN_CHARGE_CURRENT 0.1f
-#define LOW_BAT_THRESHOLD 25.2f /* near 20% SOC */
-#define LOW_CRI_THRESHOLD 23.5f /* near 0% SOC */
-#endif
-
-// Emergency sensor timeouts
-#define ONE_WHEEL_LIFT_EMERGENCY_MILLIS 2000
-#define BOTH_WHEELS_LIFT_EMERGENCY_MILLIS 1000
-#define TILT_EMERGENCY_MILLIS 500 // used for both the mechanical and accelerometer based detection
-#define STOP_BUTTON_EMERGENCY_MILLIS 100
-#define PLAY_BUTTON_CLEAR_EMERGENCY_MILLIS 2000
-#if BOARD_YARDFORCE500B_LFP
-// CLOUDY relaxed 0x38 (~26 deg, Z<0.896g) -> 0x2C (~45 deg, Z<0.704g, = stock). At 0x38 the
-// onboard LIS3DH Z-low tilt INT false-tripped at the board's resting/dock orientation (chassis
-// is level per the IMU, but the GForce board mounts at a slight tilt so its Z sat just under
-// 0.896g), latching a TILT emergency on the dock that the host's release couldn't clear.
-// 0x2C still protects against a real tip-over.
-#define IMU_ONBOARD_INCLINATION_THRESHOLD 0x2C
-#else
-#define IMU_ONBOARD_INCLINATION_THRESHOLD 0x38 // stock firmware uses 0x2C (way more allowed inclination)
-#endif
-
-#if BOARD_YARDFORCE500B_LFP
-// --- CLOUDY bump sensor: blue wheel-lift input remapped as a front bump sensor ---
-// On this build Emergency_WheelLiftBlue() is disabled and HALLSTOP_Left/Right_Sense()
-// read the blue wheel-lift pin instead (only one physical bump sensor). The remap is
-// gated on BOARD_YARDFORCE500B_LFP directly in emergency.c / main.c / drivemotor.c.
-// TEMPORARY: this drives a low-level reverse reflex only (drivemotor.c). The ROS2
-// high level (Nav2 collision_monitor -> StuckBackoff) is meant to own obstacle
-// recovery; plan to remove the firmware reflex once lidar/costmap recovery is trusted.
-#define BUMP_MILLIS_WHILE_MOWING 100  // sustained-bump debounce while mowing [ms]
-#define BUMP_MILLIS_WHILE_DOCKING 500 // sustained-bump debounce while docking [ms]
-#define BUMP_REVERSE_MILLIS 1000      // how long to back off after a bump [ms] (was 2000; kept short on purpose)
-#endif
+// Battery/charge envelope, emergency-sensor timeouts and the onboard-IMU tilt
+// threshold are single-sourced in board_defaults.h (shared with board.h.template
+// so CI and the GUI-flashed firmware can never drift). This file defines none of
+// them itself; the #ifndef fallbacks in board_defaults.h supply the blessed
+// values. To change one, edit board_defaults.h (NOT here).
+#include "board_defaults.h"
 
 // Enable Emergency debugging
 //#define EMERGENCY_DEBUG

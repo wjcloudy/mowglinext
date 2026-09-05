@@ -1,88 +1,66 @@
 import React from "react";
-import { Alert, Card, Col, Form, InputNumber, Row, Typography } from "antd";
+import { Alert, Card, Typography } from "antd";
 import { WarningOutlined } from "@ant-design/icons";
+import { useTranslation } from "react-i18next";
 
-const { Text, Paragraph } = Typography;
+const { Paragraph } = Typography;
 
 type Props = {
     values: Record<string, any>;
     onChange: (key: string, value: any) => void;
 };
 
-export const SafetySection: React.FC<Props> = ({ values, onChange }) => {
+/**
+ * Safety section — deliberately read-only.
+ *
+ * Issue #195: this section used to render a "Motor Temperature Limits" card
+ * (motor_temp_high_c / motor_temp_low_c, "Stop Above" / "Resume Below") that
+ * promised a thermal blade cutoff implemented by NO layer of the stack. The
+ * firmware only MEASURES blade temperature (adc.c) and REPORTS it
+ * (cpp_main.cpp); no ROS2 node ever read either key. The card was removed.
+ *
+ * Nothing was put in its place on purpose. The remaining keys the section
+ * claims (see SECTION_DEFINITIONS in useSettingsManager.ts) are
+ * lift_recovery_mode and lift_blade_resume_delay_sec, and neither is exposed:
+ *
+ *  - lift_recovery_mode is safety-adjacent. In hardware_bridge_node.cpp it
+ *    SUPPRESSES the ROS2 lift emergency while the firmware LIFT bit is set and
+ *    repeatedly requests a firmware emergency-latch release. Turning it on
+ *    from a settings page is not a cosmetic preference, and it was never
+ *    GUI-editable before. Changing that is out of scope for #195.
+ *  - lift_blade_resume_delay_sec only has an effect INSIDE that recovery path
+ *    (blade_was_enabled_before_lift_ is set only in the lift_recovery_mode_
+ *    branch), so on a default robot it is inert — exposing it alone would be
+ *    the same "control that does nothing" bug #195 asked us to remove.
+ *
+ * Both keys stay listed in the safety section's `keys` array so they keep
+ * falling outside AdvancedSection's free-form editor, exactly as before.
+ */
+export const SafetySection: React.FC<Props> = () => {
+    const { t } = useTranslation();
     return (
         <div>
             <Alert
                 type="warning"
                 showIcon
                 icon={<WarningOutlined />}
-                message="Safety settings protect the robot and its surroundings"
-                description="Firmware is the sole safety authority. These settings configure firmware behavior — disabling them reduces protection."
+                message={t("settingsSafety.alertMessage")}
+                description={t("settingsSafety.alertDescription")}
                 style={{ marginBottom: 16 }}
             />
 
-            {/* Lift / tilt detection is handled by the STM32 firmware,
-                not by ROS2. The previous emergency_stop_on_lift /
-                emergency_stop_on_tilt switches were UI-only — no node
-                in ROS2 ever read them — so they were removed (audit
-                2026-05-12). The firmware always emergency-stops on
-                lift/tilt when its physical thresholds are tripped;
-                this is not configurable from the GUI. */}
-
-            {/* Temperature */}
-            <Card size="small" title="Motor Temperature Limits" style={{ marginBottom: 16 }}>
-                <Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 12 }}>
-                    Blade motor stops above the high threshold and resumes below the low threshold (hysteresis).
+            <Card size="small" title={t("settingsSafety.firmwareOwnedTitle")} style={{ marginBottom: 16 }}>
+                <Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 8 }}>
+                    {t("settingsSafety.firmwareOwnedDescription")}
                 </Paragraph>
-                <Form layout="vertical" size="small">
-                    <Row gutter={[16, 0]}>
-                        <Col xs={12}>
-                            <Form.Item
-                                label={<Text style={{ color: "#f5222d", fontSize: 12 }}>Stop Above</Text>}
-                                tooltip="Stop blade motor above this temperature"
-                            >
-                                <InputNumber
-                                    value={values.motor_temp_high_c}
-                                    onChange={(v) => onChange("motor_temp_high_c", v)}
-                                    min={40} max={120} step={5} precision={0}
-                                    style={{ width: "100%" }} addonAfter="C"
-                                />
-                            </Form.Item>
-                        </Col>
-                        <Col xs={12}>
-                            <Form.Item
-                                label={<Text style={{ color: "#52c41a", fontSize: 12 }}>Resume Below</Text>}
-                                tooltip="Resume blade motor below this temperature"
-                            >
-                                <InputNumber
-                                    value={values.motor_temp_low_c}
-                                    onChange={(v) => onChange("motor_temp_low_c", v)}
-                                    min={20} max={80} step={5} precision={0}
-                                    style={{ width: "100%" }} addonAfter="C"
-                                />
-                            </Form.Item>
-                        </Col>
-                    </Row>
-                </Form>
+                <Paragraph type="secondary" style={{ fontSize: 12, marginBottom: 0 }}>
+                    {t("settingsSafety.temperatureThresholdsNote")}
+                </Paragraph>
             </Card>
 
-            {/* Obstacle avoidance */}
-            <Card size="small" title="Obstacle Avoidance" style={{ marginBottom: 16 }}>
-                <Form layout="vertical" size="small">
-                    <Row gutter={[16, 0]}>
-                        <Col xs={12} sm={8}>
-                            <Form.Item label="Max Detour Distance" tooltip="Maximum distance to detour around an obstacle before giving up">
-                                <InputNumber
-                                    value={values.max_obstacle_avoidance_distance}
-                                    onChange={(v) => onChange("max_obstacle_avoidance_distance", v)}
-                                    min={0.5} max={10} step={0.5} precision={1}
-                                    style={{ width: "100%" }} addonAfter="m"
-                                />
-                            </Form.Item>
-                        </Col>
-                    </Row>
-                </Form>
-            </Card>
+            {/* max_obstacle_avoidance_distance moved to the Obstacles
+                section (ObstaclesSection.tsx) alongside the other
+                obstacle-avoidance knobs. */}
         </div>
     );
 };

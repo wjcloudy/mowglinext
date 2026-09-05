@@ -19,6 +19,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(ament_cmake        REQUIRED)
 find_package(rclcpp             REQUIRED)
+find_package(rclcpp_action      REQUIRED)
 find_package(nav_msgs           REQUIRED)
 find_package(geometry_msgs      REQUIRED)
 find_package(sensor_msgs        REQUIRED)
@@ -145,11 +146,15 @@ add_executable(calibrate_imu_yaw_node
   src/calibrate_imu_yaw_node.cpp
 )
 
+target_include_directories(calibrate_imu_yaw_node PUBLIC ${INCLUDE_DIR})
+
 ament_target_dependencies(calibrate_imu_yaw_node
   rclcpp
+  rclcpp_action
   geometry_msgs
   sensor_msgs
   nav_msgs
+  std_srvs
   mowgli_interfaces
 )
 
@@ -291,6 +296,54 @@ if(BUILD_TESTING)
   )
   ament_target_dependencies(test_costmap_scan_filter
     sensor_msgs
+  )
+
+  ament_add_gtest(test_navsat_projection_utils
+    test/test_navsat_projection_utils.cpp
+  )
+  target_include_directories(test_navsat_projection_utils PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  ament_target_dependencies(test_navsat_projection_utils
+    mowgli_interfaces
+    sensor_msgs
+  )
+
+  # ---- test_dock_cog_gate ----
+  # Pure C++ test of the one-click dock-calibration COG-coherence gate
+  # (dock_cog_gate.hpp): Resolution A — dock_yaw = circular_mean of the
+  # /imu/cog_heading body-heading samples (NO +pi), cross-checked against the
+  # reversed GPS travel bearing. No ROS2 deps, link gtest.
+  ament_add_gtest(test_dock_cog_gate
+    test/test_dock_cog_gate.cpp
+  )
+  target_include_directories(test_dock_cog_gate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  # ---- test_delta_gate ----
+  # Pure C++ test of the map→odom yaw (Δ) stabilisation gate used by
+  # gps_dock_detection (delta_gate.hpp): jump-reject + EMA, and the issue #390
+  # stale-latch recovery (a sustained mutually-consistent rejection re-seeds Δ;
+  # a flapping transient never does). No ROS2 deps, link gtest.
+  ament_add_gtest(test_delta_gate
+    test/test_delta_gate.cpp
+  )
+  target_include_directories(test_delta_gate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  # ---- test_robot_yaml_scalar ----
+  # Guards the ONE canonical dock_pose persist path (Invariant 6): the
+  # motion-derived (yaw_source=MOTION) write must splice only the dock_pose_*
+  # values, preserve every comment (Invariant 15 sparse config), skip the
+  # dock_pose_yaw_sigma_rad lookalike key, and write atomically once. The
+  # header lives in mowgli_interfaces; this package already depends on it.
+  ament_add_gtest(test_robot_yaml_scalar
+    test/test_robot_yaml_scalar.cpp
+  )
+  ament_target_dependencies(test_robot_yaml_scalar
+    mowgli_interfaces
   )
 
 endif()

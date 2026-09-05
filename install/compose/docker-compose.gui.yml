@@ -11,6 +11,10 @@ services:
       project: mowglinext
       app: gui
     network_mode: host
+    # pid: host lets the GUI backend enter host init's namespaces (nsenter -t 1)
+    # to run the host's `systemctl reboot`/`poweroff` for the Restart/Shutdown Pi
+    # power-menu actions. Without it a container can't power-cycle its host.
+    pid: host
     privileged: true
     environment:
       FOXGLOVE_URL: ws://localhost:8765
@@ -25,7 +29,7 @@ services:
       - ./docker/config/mowgli:/mowgli_config
       - ./docker:/runtime_config
       - /var/run/docker.sock:/var/run/docker.sock
-      - /dev/bus/usb:/dev/bus/usb
+      - /dev:/dev
       - mowgli_maps:/ros2_ws/maps
     depends_on:
       - mowgli

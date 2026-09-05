@@ -18,6 +18,8 @@
 
 #include "fusion_graph/fusion_graph_node.hpp"
 #include "fusion_graph/fusion_graph_node_util.hpp"
+#include "fusion_graph/loop_closure_gate.hpp"
+#include "fusion_graph/yaw_gates.hpp"
 
 namespace fusion_graph
 {
@@ -25,6 +27,37 @@ namespace fusion_graph
 void FusionGraphNode::OnTimer()
 {
   const double now_s = this->now().seconds();
+
+  // Boot dock-seed fallback. The normal init paths are (a) is_charging →
+  // SeedFromDockPose, and (b) GPS xy + COG/mag yaw → TrySeedInitialPose.
+  // Both can silently fail on a fresh boot on the dock: is_charging may
+  // never be delivered (degraded DDS discovery), and a parked chassis
+  // produces no COG heading, so seed_yaw_ stays empty. When that happens
+  // the graph never initializes, no map→odom TF is published, and Nav2's
+  // planner_server aborts activation (global_costmap can't get map→base),
+  // taking the whole lifecycle bringup down with it. If we're still
+  // uninitialized a few seconds after boot, fall back to the calibrated
+  // dock pose — the robot normally boots parked on the dock. Suppressed
+  // when hardware status has been seen AND reports NOT charging, so a
+  // robot that boots away from the dock is left to GPS-based init.
+  constexpr double kDockSeedFallbackS = 6.0;
+  if (!graph_->IsInitialized())
+  {
+    if (boot_stamp_s_ < 0.0)
+    {
+      boot_stamp_s_ = now_s;
+    }
+    else if (!dock_seed_fallback_done_ && (now_s - boot_stamp_s_) > kDockSeedFallbackS &&
+             (!last_is_charging_valid_ || last_is_charging_))
+    {
+      RCLCPP_WARN(get_logger(),
+                  "fusion_graph: still uninitialized %.1fs after boot "
+                  "(is_charging/COG unavailable) — seeding from dock pose",
+                  now_s - boot_stamp_s_);
+      SeedFromDockPose();
+      dock_seed_fallback_done_ = true;
+    }
+  }
 
   // Run scan-matching against the previous-node scan and queue the
   // resulting between-factor before Tick — Tick consumes the queue
@@ -54,7 +87,13 @@ void FusionGraphNode::OnTimer()
     const double dth_init = (std::abs(dth_gyro) > 1e-9) ? dth_gyro : dth_wheel;
     const gtsam::Pose2 init_guess(dx, dy, dth_init);
 
-    auto res = scan_matcher_->Match(prev_node_scan_, curr_scan, init_guess);
+    // Match(source=curr, target=prev) so the returned delta == prev.between(curr)
+    // — the FORWARD prev→curr motion, the same convention the wheel between-factor
+    // and BetweenFactor(k_prev, k_curr) expect (graph_manager_node.cpp:346). With
+    // body-frame scans, Match returns target.between(source); calling it
+    // (prev, curr) would yield curr.between(prev) = the INVERSE, pushing the nodes
+    // apart the wrong way and mismatching the forward-motion init_guess.
+    auto res = scan_matcher_->Match(curr_scan, prev_node_scan_, init_guess);
 
     // Guard rails — drop the match if any signal screams degenerate.
     // The factor would otherwise corrupt iSAM2 for many ticks (ICP
@@ -107,14 +146,25 @@ void FusionGraphNode::OnTimer()
       // scan-matching carries dead-reckoning through the no-fix window.
       double sm_sigma_xy = res.sigma_xy;
       double sm_sigma_theta = res.sigma_theta;
-      if (scan_yield_to_rtk_ && last_rtk_fixed_stamp_ &&
-          (this->now() - *last_rtk_fixed_stamp_).seconds() < scan_yield_timeout_s_)
+      if (scan_yield_to_rtk_ && RtkFixedReceiptIsFresh(scan_yield_timeout_s_))
       {
         sm_sigma_xy = std::max(sm_sigma_xy, scan_yield_sigma_xy_);
         sm_sigma_theta = std::max(sm_sigma_theta, scan_yield_sigma_theta_);
       }
+      // Level 2: floor the scan yaw σ so LiDAR yields yaw to the gyro (keeps
+      // σ_xy tight → still carries POSITION through Float). See header.
+      sm_sigma_theta = ScanYawSigma(sm_sigma_theta, scan_yaw_sigma_floor_rad_);
       graph_->QueueScanBetween(res.delta, sm_sigma_xy, sm_sigma_theta);
       ++scan_matches_ok_;
+      // ICP-only odometry: cache the latest accepted scan-between delta (motion
+      // since the previous node). It is composed into icp_pose_ exactly ONCE,
+      // when Tick() creates the next node (below). Do NOT compose here: OnTimer
+      // runs ~N ticks per node and res.delta is cumulative-since-node, so
+      // per-tick composition over-integrates ~N× (the cause of the large
+      // static-robot heading drift). Latest-wins mirrors the QueueScanBetween
+      // the graph itself consumes once per node.
+      last_scan_between_delta_ = res.delta;
+      last_scan_between_valid_ = true;
     }
     else
     {
@@ -124,7 +174,7 @@ void FusionGraphNode::OnTimer()
 
   // ── Scan-to-keyframe ABSOLUTE constraint (the RTK-Float carry) ───────
   // Match the live scan to nearby frozen RTK-anchored keyframes and queue a
-  // PoseTranslationPrior that pins absolute xy — this is what holds <2 cm
+  // PriorFactor<Pose2> that pins absolute xy + yaw — this is what holds <2 cm
   // through a Float window where dead-reckoning would otherwise drift. ENGAGE
   // only when RTK-Fixed is NOT recent (during Float / no-fix): under Fixed the
   // GnssLeverArmFactor owns absolute position and double-counting would
@@ -133,8 +183,7 @@ void FusionGraphNode::OnTimer()
   // direction locked by test_factors.cpp::ScanToKeyframeComposition.
   if (use_keyframe_map_ && scan_matcher_ && curr_valid)
   {
-    const bool rtk_recent = last_rtk_fixed_stamp_ &&
-                            (this->now() - *last_rtk_fixed_stamp_).seconds() < kf_engage_age_s_;
+    const bool rtk_recent = RtkFixedReceiptIsFresh(kf_engage_age_s_);
     if (!rtk_recent)
     {
       if (auto cur = graph_->LatestSnapshot())
@@ -148,57 +197,73 @@ void FusionGraphNode::OnTimer()
                                                       kf_match_max_dist_m_,
                                                       kf_max_candidates_);
         double best_rmse = 1e9;
-        gtsam::Vector2 best_xy;
+        gtsam::Pose2 best_abs_meas;
         double best_sigma = 0.0;
+        double best_sigma_theta = 0.0;
         bool have_best = false;
         for (uint64_t kid : cand)
         {
           auto kf = graph_->GetKeyframe(kid);
           if (!kf || kf->scan_body.empty())
             continue;
-          const gtsam::Pose2 init = kf->abs_pose.between(pred);
-          const auto res = scan_matcher_->Match(kf->scan_body, curr_scan, init);
+          // Warm start ICP toward the value it actually converges to:
+          // Match(kf, curr) returns curr.between(kf), so seed with
+          // pred.between(kf) (≈ curr.between(kf)), NOT kf.between(pred) (its
+          // inverse — which sent the brute-force NN the wrong way during pivots).
+          // The composition below (kf.abs_pose.compose(delta.inverse())) is the
+          // direction locked by test_factors.cpp::ScanToKeyframeComposition and
+          // stays unchanged.
+          const gtsam::Pose2 init = pred.between(kf->abs_pose);
+          const auto res = scan_matcher_->Match(kf->scan_body, curr_scan, init, kf_min_inliers_);
           if (!res.ok)
           {
             graph_->RecordIcpRejectInliers();
             continue;
           }
-          if (res.rmse > icp_max_rmse_m_)
+          if (res.rmse > kf_match_max_rmse_m_)
           {
             graph_->RecordIcpRejectRmse();
             continue;
           }
-          if (std::abs(res.delta.x()) > icp_max_delta_xy_m_ ||
-              std::abs(res.delta.y()) > icp_max_delta_xy_m_ ||
-              std::abs(res.delta.theta()) > icp_max_delta_theta_rad_)
-          {
-            graph_->RecordIcpRejectSanity();
-            continue;
-          }
+          // NOTE: icp_max_delta_* sanity check SKIPPED here — res.delta is
+          // the full cross-viewpoint transform (keyframe → live scan), not
+          // an incremental between two consecutive scans ~50ms apart. The
+          // divergence check below already guards against pathological ICP.
           const gtsam::Pose2 dev = init.between(res.delta);
-          if (std::hypot(dev.x(), dev.y()) > icp_max_divergence_xy_m_ ||
-              std::abs(dev.theta()) > icp_max_divergence_theta_rad_)
+          if (std::hypot(dev.x(), dev.y()) > kf_match_max_divergence_xy_m_ ||
+              std::abs(dev.theta()) > kf_match_max_divergence_theta_rad_)
           {
             graph_->RecordIcpRejectDivergence();
             continue;
           }
           const gtsam::Pose2 abs_meas = kf->abs_pose.compose(res.delta.inverse());
-          // Mirror-guard: a swapped/mirror match lands far from the
+          // Mirror-guard (xy): a swapped/mirror match lands far from the
           // wheel-predicted pose (Huber can't reject a low-rmse mirror).
           if (std::hypot(abs_meas.x() - pred.x(), abs_meas.y() - pred.y()) >
-              icp_max_divergence_xy_m_)
+              kf_match_max_divergence_xy_m_)
+            continue;
+          // Mirror-guard (yaw): reject a match whose implied ABSOLUTE yaw is far
+          // from the gyro-predicted yaw — a mirrored/flipped ICP solution can
+          // sit within the xy bound yet carry a grossly wrong heading, and this
+          // prior engages during Float where COG yaw can't correct it.
+          if (!KeyframeYawWithinGate(abs_meas.theta(), pred.theta(), kf_match_max_yaw_dev_rad_))
             continue;
           if (res.rmse < best_rmse)
           {
             best_rmse = res.rmse;
-            best_xy = gtsam::Vector2(abs_meas.x(), abs_meas.y());
-            best_sigma = std::max(res.sigma_xy, kf_apply_sigma_floor_m_);
+            best_abs_meas = abs_meas;
+            // Positional σ can never be tighter than the capture gate: a
+            // keyframe frozen up to kf_capture_sigma_max_m off its true pose
+            // must not be applied as a tighter anchor than that error.
+            best_sigma =
+                std::max(res.sigma_xy, std::max(kf_apply_sigma_floor_m_, kf_capture_sigma_max_m_));
+            best_sigma_theta = std::max(res.sigma_theta, kf_apply_sigma_theta_rad_);
             have_best = true;
           }
         }
         if (have_best)
         {
-          graph_->QueueScanToKeyframe(best_xy, best_sigma, /*robust=*/true);
+          graph_->QueueScanToKeyframe(best_abs_meas, best_sigma, best_sigma_theta, /*robust=*/true);
           ++kf_matches_ok_;
         }
         else if (!cand.empty())
@@ -221,6 +286,25 @@ void FusionGraphNode::OnTimer()
       graph_->AttachScan(out->node_index, curr_scan);
     }
 
+    // Advance the LiDAR-only odometry exactly once per node, by the same
+    // scan-between delta the graph just consumed. Seeds from the new node's
+    // fused pose on the first node so it starts aligned, then drifts (relative
+    // scan-matching, no absolute reference) — diagnostics only.
+    if (last_scan_between_valid_)
+    {
+      if (!icp_pose_seeded_)
+      {
+        icp_pose_ = out->pose;
+        icp_pose_seeded_ = true;
+      }
+      else
+      {
+        icp_pose_ = icp_pose_.compose(last_scan_between_delta_);
+      }
+      PublishIcpOdom();
+      last_scan_between_valid_ = false;
+    }
+
     // ── Keyframe capture (build the absolute map under stable RTK-Fixed) ──
     // Freeze the GPS-fused node pose (out->pose — NEVER the raw antenna ENU,
     // which is lever-offset) + scan as a keyframe when: the fix is mm-accurate
@@ -231,8 +315,7 @@ void FusionGraphNode::OnTimer()
     // above (Float) never both fire.
     if (use_keyframe_map_ && curr_valid && curr_scan.size() >= 10)
     {
-      const bool rtk_fresh =
-          last_rtk_fixed_stamp_ && (this->now() - *last_rtk_fixed_stamp_).seconds() < 1.0;
+      const bool rtk_fresh = RtkFixedReceiptIsFresh(1.0);
       const bool moved = !last_kf_capture_xy_ ||
                          std::hypot(out->pose.x() - last_kf_capture_xy_->x(),
                                     out->pose.y() - last_kf_capture_xy_->y()) >= kf_spacing_m_;
@@ -255,11 +338,32 @@ void FusionGraphNode::OnTimer()
     // ~no information — an unbounded leak over a long stationary dwell that
     // OOM-killed the node 2026-06-09. Re-enables once the fix is stale past
     // scan_yield_timeout_s so LC still carries the no-fix (tree-cover) windows.
-    const bool rtk_fixed_fresh =
-        last_rtk_fixed_stamp_ &&
-        (this->now() - *last_rtk_fixed_stamp_).seconds() < scan_yield_timeout_s_;
-    if (loop_closure_enabled_ && scan_matcher_ && curr_valid &&
-        !(lc_skip_when_rtk_fixed_ && rtk_fixed_fresh))
+    const bool rtk_fixed_fresh = RtkFixedReceiptIsFresh(scan_yield_timeout_s_);
+
+    // Rate/travel gate (issue #513): with LC enabled exactly when GPS is Float
+    // or absent, the unbounded search accepted 13.7 LC/s on featureless grass
+    // (3816 in 286 s of mowing), each a 5 cm factor snapping to the adjacent
+    // swath. Skip the whole candidate search (no ICP paid) until BOTH
+    // lc_min_interval_s AND lc_min_travel_m have accrued since the last
+    // ACCEPTED LC; the accumulators are reset on accept only — see
+    // loop_closure_gate.hpp for why that polarity is right here.
+    const bool lc_search_enabled = loop_closure_enabled_ && scan_matcher_ && curr_valid &&
+                                   !(lc_skip_when_rtk_fixed_ && rtk_fixed_fresh);
+
+    const double time_since_lc_s = last_lc_accept_stamp_
+                                       ? (this->now() - *last_lc_accept_stamp_).seconds()
+                                       : std::numeric_limits<double>::infinity();
+
+    const bool lc_gate_open =
+        lc_search_enabled && LoopClosureRateAllows(wheel_dist_since_last_lc_m_,
+                                                   time_since_lc_s,
+                                                   lc_min_travel_m_,
+                                                   lc_min_interval_s_);
+
+    if (lc_search_enabled && !lc_gate_open)
+      ++lc_rate_gated_;
+
+    if (lc_gate_open)
     {
       auto candidates = graph_->FindLoopClosureCandidates(out->node_index,
                                                           lc_max_dist_m_,
@@ -273,9 +377,13 @@ void FusionGraphNode::OnTimer()
           continue;
 
         // Init guess: transform from cand to current in map frame,
-        // i.e. cand.between(curr).
+        // i.e. cand.between(curr). Match(source=curr, target=cand) returns
+        // cand.between(curr) — the measurement BetweenFactor(k_cand, k_curr)
+        // expects (graph_manager_rebase.cpp:377). Calling it (cand, curr) would
+        // return curr.between(cand) = the INVERSE, dragging the trajectory the
+        // wrong way each time an LC fires.
         const gtsam::Pose2 init = cand_pose->between(out->pose);
-        auto res = scan_matcher_->Match(cand_scan, curr_scan, init);
+        auto res = scan_matcher_->Match(curr_scan, cand_scan, init);
         if (!res.ok || res.rmse > lc_max_rmse_)
           continue;
 
@@ -303,20 +411,31 @@ void FusionGraphNode::OnTimer()
         // no-fix (tree-cover) windows.
         double lc_sigma_xy = lc_sigma_xy_;
         double lc_sigma_theta = lc_sigma_theta_;
-        if (scan_yield_to_rtk_ && last_rtk_fixed_stamp_ &&
-            (this->now() - *last_rtk_fixed_stamp_).seconds() < scan_yield_timeout_s_)
+        if (scan_yield_to_rtk_ && RtkFixedReceiptIsFresh(scan_yield_timeout_s_))
         {
           lc_sigma_xy = std::max(lc_sigma_xy, scan_yield_sigma_xy_);
           lc_sigma_theta = std::max(lc_sigma_theta, scan_yield_sigma_theta_);
         }
+        // Issue #513: the RTK-yield above only fires under a fresh Fixed sample,
+        // i.e. never in the Float window where LC actually runs. Floor the LC
+        // σ to the last accepted GNSS σ so an ICP match on grass can never
+        // out-vote a decimetre-σ Float fix; -1 (no GPS ever) leaves it as is.
+        lc_sigma_xy = LoopClosureSigmaFloor(lc_sigma_xy, last_gps_sigma_, lc_gps_sigma_ratio_);
+        // Level 2: floor the loop-closure yaw σ too (yield yaw to gyro).
+        lc_sigma_theta = ScanYawSigma(lc_sigma_theta, scan_yaw_sigma_floor_rad_);
         graph_->AddLoopClosure(cand_idx, out->node_index, res.delta, lc_sigma_xy, lc_sigma_theta);
         RCLCPP_INFO(get_logger(),
                     "fusion_graph: loop closure %lu -> %lu accepted "
-                    "(rmse=%.3f, dist=%.2f m)",
+                    "(rmse=%.3f, dist=%.2f m, sigma_xy=%.3f)",
                     static_cast<unsigned long>(cand_idx),
                     static_cast<unsigned long>(out->node_index),
                     res.rmse,
-                    std::hypot(out->pose.x() - cand_pose->x(), out->pose.y() - cand_pose->y()));
+                    std::hypot(out->pose.x() - cand_pose->x(), out->pose.y() - cand_pose->y()),
+                    lc_sigma_xy);
+        // One accepted LC per node, max — and re-arm the gate from THIS accept.
+        wheel_dist_since_last_lc_m_ = 0.0;
+        last_lc_accept_stamp_ = this->now();
+        break;
       }
     }
 
@@ -358,6 +477,26 @@ void FusionGraphNode::OnTimer()
       t_map_odom_anchor_ = snap->pose.compose(dr_at_node.inverse());
       last_anchored_node_index_ = snap->node_index;
       t_map_odom_anchor_valid_ = true;
+    }
+    // Odom re-base: once the robot has driven odom_rebase_dist_m from the odom
+    // origin, reset the odom POSITION onto the robot (heading kept) and shift
+    // the anchor so map→base is unchanged. This keeps the lever arm |dr| small
+    // so graph-yaw jitter can't rotate it into large map→odom position steps.
+    // OnImu (same executor thread) can't interrupt; the lock guards the TF
+    // reader thread. force_pub_resync_ makes the slew snap the published anchor
+    // to the new (coordinated) target so map→base stays continuous.
+    if (odom_rebase_dist_m_ > 0.0 && t_map_odom_anchor_valid_)
+    {
+      std::lock_guard<std::mutex> lock(tf_state_mu_);
+      if (std::hypot(dr_x_, dr_y_) > odom_rebase_dist_m_)
+      {
+        const gtsam::Pose2 map_base =
+            t_map_odom_anchor_.compose(gtsam::Pose2(dr_x_, dr_y_, dr_yaw_));
+        dr_x_ = 0.0;
+        dr_y_ = 0.0;
+        t_map_odom_anchor_ = map_base.compose(gtsam::Pose2(0.0, 0.0, dr_yaw_).inverse());
+        force_pub_resync_.store(true, std::memory_order_release);
+      }
     }
     PublishOutputs(*snap);
   }

@@ -87,7 +87,7 @@ int32_t I2C_platform_read(void *handle, uint8_t reg, uint8_t *bufp, uint16_t len
   /* Read multiple command */
   reg |= 0x80;
 #if BOARD_YARDFORCE500B_LFP
-  /* CLOUDY: propagate the I2C status so callers (e.g. the tilt INT read) can fail safe
+  /* CLOUDY: propagate the I2C status so callers (e.g. the tilt INT read) can reject it
      instead of trusting a possibly-stale/uninitialised buffer after a NACK/timeout. */
   return (HAL_I2C_Mem_Read(handle, LIS3DH_I2C_ADD_L, reg, I2C_MEMADD_SIZE_8BIT, bufp, len, 1000) == HAL_OK) ? 0 : -1;
 #else
@@ -108,7 +108,6 @@ void I2C_ReadAccelerometer(float *x, float *y, float *z)
     dev_ctx.read_reg = I2C_platform_read;
     dev_ctx.handle = &I2C_Handle;
 
-    int16_t data_raw_acceleration[3];            
     lis3dh_reg_t reg;        
 
     lis3dh_xl_data_ready_get(&dev_ctx, &reg.byte);        
@@ -118,6 +117,7 @@ void I2C_ReadAccelerometer(float *x, float *y, float *z)
       max_tries--;
     }    
     if (reg.byte) {            
+            int16_t data_raw_acceleration[3];
             memset(data_raw_acceleration, 0x00, 3 * sizeof(int16_t));
             lis3dh_acceleration_raw_get(&dev_ctx, data_raw_acceleration);
             *x = lis3dh_from_fs2_hr_to_mg(data_raw_acceleration[0]) / 1000.0 * MS2_PER_G;
@@ -146,7 +146,6 @@ float I2C_ReadAccelerometerTemp(void)
     dev_ctx.read_reg = I2C_platform_read;
     dev_ctx.handle = &I2C_Handle;
 
-    static float temperature_degC = 0.0;
     static int16_t data_raw_temperature;
     lis3dh_reg_t reg;  
 
@@ -155,6 +154,7 @@ float I2C_ReadAccelerometerTemp(void)
     // Read temperature data 
     if (reg.byte)
     {
+        float temperature_degC;
         memset(&data_raw_temperature, 0x00, sizeof(int16_t));
         lis3dh_temperature_raw_get(&dev_ctx, &data_raw_temperature);
         temperature_degC =lis3dh_from_lsb_hr_to_celsius(data_raw_temperature);            
@@ -202,7 +202,8 @@ uint8_t I2C_TestZLowINT(void)
     dev_ctx.handle = &I2C_Handle;
 
 #if BOARD_YARDFORCE500B_LFP
-    /* CLOUDY fail-safe: a flaky/absent onboard LIS3DH read must NEVER assert a phantom tilt.
+    /* CLOUDY: preserve the custom no-tilt-on-read-error policy to suppress phantom trips.
+       This is not failed-sensor detection: an absent sensor also returns no tilt.
        Init the source struct and bail to "no tilt" if the I2C read errors. Otherwise an
        uninitialised/garbage int1_src can latch a spurious TILT emergency on the dock (and,
        since the emergency release is gated on the live sensors, briefly block its clearing).

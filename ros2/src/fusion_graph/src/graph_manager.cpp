@@ -69,7 +69,8 @@ void GraphManager::RefreshEstimateLocked() const
   estimate_dirty_ = false;
 }
 
-GraphManager::GraphManager(const GraphParams& params) : params_(params)
+GraphManager::GraphManager(const GraphParams& params)
+    : params_(params), slip_window_(SlipWindowNodes(params.slip_window_s, params.node_period_s))
 {
   gtsam::ISAM2Params p;
   // Gauss-Newton is faster than Dogleg here — graph is small (sliding
@@ -140,9 +141,9 @@ void GraphManager::AddGyroDelta(double wz, double dt)
   // GyroPreintFactor. We still apply the latest bias_estimate_at_node
   // (stored in current_bias_estimate_) so the integrated ω is in the
   // right ballpark for iSAM2's linearisation point.
-  const double bias_correction =
-      params_.use_imu_preint ? current_bias_estimate_
-      : (params_.gyro_bias_estimation_enabled ? gyro_bias_z_ : 0.0);
+  const double bias_correction = params_.use_imu_preint
+                                     ? current_bias_estimate_
+                                     : (params_.gyro_bias_estimation_enabled ? gyro_bias_z_ : 0.0);
   const double wz_corrected = wz - bias_correction;
   accum_.dtheta_gyro += wz_corrected * dt;
 
@@ -158,12 +159,16 @@ void GraphManager::AddGyroDelta(double wz, double dt)
   }
 }
 
-void GraphManager::QueueGnss(double x, double y, double sigma_xy, bool robust)
+bool GraphManager::QueueGnss(
+    double x, double y, double sigma_xy, bool robust, std::optional<uint64_t> target_node)
 {
   std::lock_guard<std::mutex> lock(mu_);
+  if (target_node && !HasPoseAt(*target_node))
+    return false;
   if (sigma_xy < params_.gps_sigma_floor)
     sigma_xy = params_.gps_sigma_floor;
-  queue_.gnss = UnaryQueue::Gnss{gtsam::Vector2(x, y), sigma_xy, robust};
+  queue_.gnss = UnaryQueue::Gnss{gtsam::Vector2(x, y), sigma_xy, robust, target_node};
+  return true;
 }
 
 void GraphManager::QueueYaw(double yaw, double sigma_yaw, bool robust)
@@ -184,12 +189,17 @@ void GraphManager::QueueScanBetween(const gtsam::Pose2& delta, double sigma_xy, 
   queue_.scan_between = UnaryQueue::ScanBetween{delta, sigma_xy, sigma_theta};
 }
 
-void GraphManager::QueueScanToKeyframe(const gtsam::Vector2& abs_xy, double sigma_xy, bool robust)
+void GraphManager::QueueScanToKeyframe(const gtsam::Pose2& abs_pose,
+                                       double sigma_xy,
+                                       double sigma_theta,
+                                       bool robust)
 {
   std::lock_guard<std::mutex> lock(mu_);
   if (sigma_xy <= 0.0)
     sigma_xy = 0.1;
-  queue_.scan_to_keyframe = UnaryQueue::ScanToKeyframe{abs_xy, sigma_xy, robust};
+  if (sigma_theta <= 0.0)
+    sigma_theta = 0.1;
+  queue_.scan_to_keyframe = UnaryQueue::ScanToKeyframe{abs_pose, sigma_xy, sigma_theta, robust};
 }
 
 void GraphManager::Initialize(const gtsam::Pose2& X0,
@@ -221,8 +231,7 @@ void GraphManager::Initialize(const gtsam::Pose2& X0,
     new_values_.insert(k_bias0, 0.0);
     auto bias_prior_noise = gtsam::noiseModel::Diagonal::Sigmas(
         gtsam::Vector1(params_.gyro_bias_prior_sigma_rad_per_s));
-    new_factors_.add(
-        gtsam::PriorFactor<double>(k_bias0, 0.0, bias_prior_noise));
+    new_factors_.add(gtsam::PriorFactor<double>(k_bias0, 0.0, bias_prior_noise));
   }
 
   isam_.update(new_factors_, new_values_);
@@ -232,6 +241,8 @@ void GraphManager::Initialize(const gtsam::Pose2& X0,
 
   next_index_ = 1;
   last_node_time_s_ = timestamp;
+  node_time_index_.clear();
+  node_time_index_.emplace_back(timestamp, 0);
   initialized_ = true;
 
   TickOutput out;
@@ -241,6 +252,20 @@ void GraphManager::Initialize(const gtsam::Pose2& X0,
   out.node_index = 0;
   out.timestamp = timestamp;
   latest_ = out;
+}
+
+std::optional<uint64_t> GraphManager::FindNodeAtOrBefore(double timestamp_s) const
+{
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!initialized_ || !std::isfinite(timestamp_s))
+    return std::nullopt;
+
+  for (auto it = node_time_index_.rbegin(); it != node_time_index_.rend(); ++it)
+  {
+    if (it->first <= timestamp_s && HasPoseAt(it->second))
+      return it->second;
+  }
+  return std::nullopt;
 }
 
 std::optional<TickOutput> GraphManager::LatestSnapshot() const

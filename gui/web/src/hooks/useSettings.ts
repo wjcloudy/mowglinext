@@ -1,7 +1,10 @@
 import {useApi} from "./useApi.ts";
 import {App} from "antd";
 import {useEffect, useState} from "react";
+import {useTranslation} from "react-i18next";
 import {useConfig} from "./useConfig.tsx";
+import {parseBoolish} from "../utils/settingsValues.ts";
+import {stringifyValue} from "../utils/stringifyValue.ts";
 
 export enum SettingValueType {
     String = "string",
@@ -161,6 +164,7 @@ const flattenConfig = (newConfig: Record<string, any>): Record<string, any> => {
 export const useSettings = () => {
     const guiApi = useApi()
     const {notification} = App.useApp();
+    const {t} = useTranslation();
     const db = useConfig(SettingKeysFromDB)
     const [loading, setLoading] = useState<boolean>(false)
     const [settings, setSettings] = useState<Record<keyof typeof SettingsDesc, any>>({})
@@ -169,11 +173,8 @@ export const useSettings = () => {
             const newSettings: Record<string, any> = {}
             Object.keys(db.config).forEach((key) => {
                 if (SettingsDesc[key]?.type === SettingValueType.Boolean) {
-                    if (db.config[key] === "true") {
-                        newSettings[key] = true
-                    } else if (db.config[key] === "false") {
-                        newSettings[key] = false
-                    }
+                    const parsed = parseBoolish(db.config[key])
+                    newSettings[key] = parsed ?? db.config[key]
                 } else {
                     newSettings[key] = db.config[key]
                 }
@@ -196,11 +197,8 @@ export const useSettings = () => {
                 const newSettings: Record<string, any> = {}
                 Object.keys(fetchedSettings).forEach((key) => {
                     if (SettingsDesc[key]?.type === SettingValueType.Boolean) {
-                        if (fetchedSettings[key] === "True" || fetchedSettings[key] == "1") {
-                            newSettings[key] = true
-                        } else if (fetchedSettings[key] === "False" || fetchedSettings[key] == "0") {
-                            newSettings[key] = false
-                        }
+                        const parsed = parseBoolish(fetchedSettings[key])
+                        newSettings[key] = parsed ?? fetchedSettings[key]
                     } else {
                         newSettings[key] = fetchedSettings[key]
                     }
@@ -220,7 +218,7 @@ export const useSettings = () => {
                 setLoading(false)
             } catch (e: any) {
                 notification.error({
-                    message: "Failed to load settings",
+                    message: t("useSettingsHook.loadFailed"),
                     description: e.message,
                 })
                 setLoading(false)
@@ -231,34 +229,24 @@ export const useSettings = () => {
         try {
             newConfig = flattenConfig(newConfig)
             setLoading(true)
-            const configFiltered = Object.keys(newConfig).reduce((acc, key) => {
-                if (SettingsDesc[key]?.settingType === SettingType.ConfigFile) {
-                    acc[key] = newConfig[key]
-                }
-                return acc
-            }, {} as SettingsConfig)
             const dbFiltered = Object.keys(newConfig).reduce((acc, key) => {
                 if (SettingsDesc[key]?.settingType === SettingType.Db) {
                     if (SettingsDesc[key]?.type === SettingValueType.Boolean) {
-                        acc[key] = newConfig[key].toString()
+                        acc[key] = stringifyValue(newConfig[key])
                     } else {
                         acc[key] = newConfig[key]
                     }
                 }
                 return acc
             }, {} as Record<string, any>)
-            const res = await guiApi.settings.settingsCreate(configFiltered)
-            if (res.error) {
-                throw new Error(res.error.error)
-            }
             await db.setConfig(dbFiltered)
             notification.success({
-                message: "Settings saved",
+                message: t("useSettingsHook.saved"),
             })
             setLoading(false)
         } catch (e: any) {
             notification.error({
-                message: "Failed to save settings",
+                message: t("useSettingsHook.saveFailed"),
                 description: e.message,
             })
             setLoading(false)

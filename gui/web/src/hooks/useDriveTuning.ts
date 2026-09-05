@@ -48,12 +48,34 @@ export interface DriveTuningTrial {
     settling_time?: number | null;
     stall_detected: boolean;
     oscillation_detected: boolean;
+    live_oscillation_detected?: boolean;
+    trial_quality?: string;
     integral_saturation_suspected: boolean;
     ground_speed_mean?: number | null;
     odom_distance_m?: number | null;
     rtk_distance_m?: number | null;
     rtk_accepted: boolean;
     left_right_tick_imbalance?: number | null;
+    warnings?: string[];
+    notes?: string[];
+}
+
+export interface DriveTuningStatusSnapshot {
+    active_emergency?: boolean | null;
+    latched_emergency?: boolean | null;
+    is_charging?: boolean | null;
+    mower_status?: number | null;
+    esc_power?: boolean | null;
+    wheel_tick_factor?: number | null;
+    last_wheel_tick_timestamp?: string | null;
+}
+
+export interface DriveTuningDrivetrainDiagnostics {
+    wheel_radius_m?: number | null;
+    wheel_circumference_m?: number | null;
+    estimated_wheel_revolutions_per_meter?: number | null;
+    estimated_encoder_counts_per_wheel_revolution?: number | null;
+    configured_ticks_per_revolution?: number | null;
     notes?: string[];
 }
 
@@ -63,18 +85,26 @@ export interface DriveTuningReport {
     profile: string;
     backup_file: string;
     cmd_topic: string;
+    cmd_vel_topic?: string;
     applied_live: boolean;
     requested_apply: boolean;
     distance_m: number;
     max_speed_mps: number;
     test_speed_mps?: number | null;
     segment_duration_s: number;
+    odom_timeout_s?: number;
     passes: number;
     auto_turn: boolean;
     turn_direction: string;
+    robot_mass_kg?: number | null;
+    internal_tuning_tier?: string;
+    hardware_config_path?: string;
+    drivetrain_diagnostics?: DriveTuningDrivetrainDiagnostics;
     current_params: Record<string, number>;
     starting_params: Record<string, number>;
     proposed_params: Record<string, number>;
+    failure_message?: string;
+    status_snapshot?: DriveTuningStatusSnapshot;
     reasons: string[];
     trials: DriveTuningTrial[];
 }

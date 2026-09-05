@@ -29,8 +29,10 @@ FusionGraphNode::FusionGraphNode(const rclcpp::NodeOptions& opts)
   // ── Parameters ────────────────────────────────────────────────────
   GraphParams gp;
   gp.node_period_s = declare_parameter<double>("node_period_s", 0.1);
-  gp.wheel_sigma_x = declare_parameter<double>("wheel_sigma_x", 0.05);
-  gp.wheel_sigma_y = declare_parameter<double>("wheel_sigma_y", 0.005);
+  // Random-walk coefficients (m/√m), not per-node sigmas — issue #491.
+  gp.wheel_sigma_x_per_sqrt_m = declare_parameter<double>("wheel_sigma_x_per_sqrt_m", 0.05);
+  gp.wheel_sigma_y_per_sqrt_m = declare_parameter<double>("wheel_sigma_y_per_sqrt_m", 0.005);
+  gp.wheel_creep_speed_mps = declare_parameter<double>("wheel_creep_speed_mps", 0.04);
   gp.wheel_sigma_theta = declare_parameter<double>("wheel_sigma_theta", 0.01);
   gp.gyro_sigma_theta = declare_parameter<double>("gyro_sigma_theta", 0.005);
   gp.gps_sigma_floor = declare_parameter<double>("gps_sigma_floor", 0.003);
@@ -43,77 +45,98 @@ FusionGraphNode::FusionGraphNode(const rclcpp::NodeOptions& opts)
   // we only mirror the magnitude here for the gate-side threshold
   // and never re-apply the offset to the GPS sample.
   lever_arm_radius_m_ = std::hypot(gp.lever_arm_x, gp.lever_arm_y);
+  // ...and the full vector for the docked antenna prediction (issue #512):
+  // dock_pose ⊕ R(yaw)·lever_arm is where a correct fix puts the antenna.
+  lever_arm_x_m_ = gp.lever_arm_x;
+  lever_arm_y_m_ = gp.lever_arm_y;
   gp.cov_update_every_n = declare_parameter<int>("cov_update_every_n", 10);
   gp.isam2_relinearize_skip = declare_parameter<int>("isam2_relinearize_skip", 5);
-  gp.max_graph_nodes =
-      static_cast<uint64_t>(declare_parameter<int>("max_graph_nodes", 3000));
+  gp.max_graph_nodes = static_cast<uint64_t>(declare_parameter<int>("max_graph_nodes", 6000));
   gp.stationary_motion_thresh_m = declare_parameter<double>("stationary_motion_thresh_m", 0.02);
   gp.stationary_motion_thresh_theta =
       declare_parameter<double>("stationary_motion_thresh_theta", 0.01);
   gp.stationary_node_period_s = declare_parameter<double>("stationary_node_period_s", 5.0);
-  gp.stationary_thresh_xy_m =
-      declare_parameter<double>("stationary_thresh_xy_m", 1.0e-3);
-  gp.stationary_thresh_theta =
-      declare_parameter<double>("stationary_thresh_theta", 2.0e-3);
-  gp.stationary_sigma_theta =
-      declare_parameter<double>("stationary_sigma_theta", 1.0e-3);
-  gp.pivot_gate_dtheta_rad =
-      declare_parameter<double>("pivot_gate_dtheta_rad", 0.012);
-  gp.pivot_wheel_sigma_x =
-      declare_parameter<double>("pivot_wheel_sigma_x", 0.5);
+  gp.stationary_thresh_xy_m = declare_parameter<double>("stationary_thresh_xy_m", 1.0e-3);
+  gp.stationary_thresh_theta = declare_parameter<double>("stationary_thresh_theta", 2.0e-3);
+  gp.stationary_sigma_theta = declare_parameter<double>("stationary_sigma_theta", 1.0e-3);
+  gp.pivot_gate_dtheta_rad = declare_parameter<double>("pivot_gate_dtheta_rad", 0.012);
+  gp.pivot_wheel_sigma_x = declare_parameter<double>("pivot_wheel_sigma_x", 0.5);
   gp.stationary_gyro_thresh_rad_per_s =
       declare_parameter<double>("stationary_gyro_thresh_rad_per_s", 0.10);
   // Slip veto: zero the BetweenFactor translation when wheel-vs-gyro
   // rotation disagreement signals the encoders are skating. See
   // graph_manager.cpp Tick() comments.
-  gp.slip_residual_thresh_rad =
-      declare_parameter<double>("slip_residual_thresh_rad", 0.01);
-  gp.slip_gyro_max_rad =
-      declare_parameter<double>("slip_gyro_max_rad", 0.005);
-  gp.slip_wheel_min_rad =
-      declare_parameter<double>("slip_wheel_min_rad", 0.005);
-  gp.gyro_bias_estimation_enabled =
-      declare_parameter<bool>("gyro_bias_estimation_enabled", true);
-  gp.gyro_bias_ema_tau_s =
-      declare_parameter<double>("gyro_bias_ema_tau_s", 30.0);
+  gp.slip_residual_thresh_rad = declare_parameter<double>("slip_residual_thresh_rad", 0.01);
+  gp.slip_gyro_max_rad = declare_parameter<double>("slip_gyro_max_rad", 0.005);
+  gp.slip_wheel_min_rad = declare_parameter<double>("slip_wheel_min_rad", 0.005);
+  // Window the three thresholds are integrated over (issue #516); 0 = per node.
+  gp.slip_window_s = declare_parameter<double>("slip_window_s", 0.5);
+  gp.gyro_bias_estimation_enabled = declare_parameter<bool>("gyro_bias_estimation_enabled", true);
+  gp.gyro_bias_ema_tau_s = declare_parameter<double>("gyro_bias_ema_tau_s", 30.0);
   gp.gyro_bias_max_sample_rad_per_s =
       declare_parameter<double>("gyro_bias_max_sample_rad_per_s", 0.10);
   // Full IMU preintegration with joint bias optimisation (opt-in).
   // When true, the EMA bias path is skipped and the graph carries a
   // per-node `bias` variable plus a GyroPreintFactor on each pair of
   // consecutive poses. See GraphParams docs in graph_manager.hpp.
-  gp.use_imu_preint =
-      declare_parameter<bool>("use_imu_preint", false);
+  gp.use_imu_preint = declare_parameter<bool>("use_imu_preint", false);
   gp.gyro_noise_density_rad_per_s =
       declare_parameter<double>("gyro_noise_density_rad_per_s", 0.015);
-  gp.gyro_bias_rw_rad_per_s =
-      declare_parameter<double>("gyro_bias_rw_rad_per_s", 0.001);
+  gp.gyro_bias_rw_rad_per_s = declare_parameter<double>("gyro_bias_rw_rad_per_s", 0.001);
   gp.gyro_bias_prior_sigma_rad_per_s =
       declare_parameter<double>("gyro_bias_prior_sigma_rad_per_s", 0.05);
-  gp.adaptive_noise_enabled_gain =
-      declare_parameter<double>("adaptive_noise_enabled_gain", 10.0);
-  gp.adaptive_noise_ema_tau_s =
-      declare_parameter<double>("adaptive_noise_ema_tau_s", 0.5);
+  gp.adaptive_noise_enabled_gain = declare_parameter<double>("adaptive_noise_enabled_gain", 10.0);
+  gp.adaptive_noise_ema_tau_s = declare_parameter<double>("adaptive_noise_ema_tau_s", 0.5);
   gp.adaptive_noise_residual_floor_rad =
       declare_parameter<double>("adaptive_noise_residual_floor_rad", 0.005);
 
   // RTK wrong-fix detection (handled in OnGnss, not in graph_manager).
-  rtk_wrongfix_max_jump_m_ =
-      declare_parameter<double>("rtk_wrongfix_max_jump_m", 0.05);
+  rtk_wrongfix_max_jump_m_ = declare_parameter<double>("rtk_wrongfix_max_jump_m", 0.05);
+  // Speed-dependent GPS σ inflation (OnGnss): σ_eff = sqrt(σ_msg² + (coeff·v)²).
+  // Accounts for GPS-latency × velocity + lever-arm sweep that the receiver
+  // covariance omits. 0 = disabled (raw receiver σ, prior behaviour).
+  gps_sigma_speed_coeff_ = declare_parameter<double>("gps_sigma_speed_coeff", 0.0);
+  // SAFETY: reject any fix whose computed σ_xy exceeds this (m), so a garbage /
+  // standalone fix can't enter the graph. 0 = disabled. Sized generously (it must
+  // NOT reject genuine RTK-Float, which the multi-minute ride-through depends on
+  // and which can legitimately sit at dm-to-m σ); it only catches truly unusable
+  // fixes. The unknown/zero-covariance reject below is unconditional and separate.
+  gps_max_sigma_reject_m_ = declare_parameter<double>("gps_max_sigma_reject_m", 0.0);
   // Dock-pose hold while charging: re-assert a firm ForceAnchor at the full
   // dock_pose once per new node (replaces the weak live-GPS factor that walked
   // the docked pose 11.5 cm + 53° over a dwell — field 2026-06-10). σ small so
   // the dock prior dominates xy; yaw σ from dock_pose_yaw_sigma_rad.
   dock_reanchor_sigma_xy_m_ = declare_parameter<double>("dock_reanchor_sigma_xy_m", 0.03);
+  // Dock-prior vs RTK-Fixed GPS consistency (issue #512, dock_gps_consistency.hpp).
+  // Field case 2026-09-02, 12:27-12:50 UTC, robot docked + charging after a
+  // power cycle: the ZED-F9P reported RTK Fixed at 14-20 mm while placing the
+  // antenna 2.45 m / 2.33 m / 1.88 m from dock_pose (three bases/readings);
+  // it converged to 10-24 cm on its own after ~45 min. The 3 cm prior pinned
+  // the pose through all of it and nothing was logged. Above
+  // dock_prior_max_gps_disagreement_m — with a FRESH Fixed sample whose σ is
+  // ≤ dock_prior_max_gps_sigma_m — the prior yields for that node and the
+  // sample is fused instead (ERROR log + diagnostics). 0.50 m sits far above
+  // the 5-30 cm ambiguity-set shift the dock hold exists for, and the σ cap
+  // keeps a Float fix (dm-m σ) from ever triggering it. No fix / Float on the
+  // dock (the terrace case) is deliberately NOT a trigger. ≤ 0 disables.
+  dock_prior_max_gps_disagreement_m_ =
+      declare_parameter<double>("dock_prior_max_gps_disagreement_m", 0.50);
+  dock_prior_max_gps_sigma_m_ = declare_parameter<double>("dock_prior_max_gps_sigma_m", 0.05);
+  // Dead-reckoning slip veto thresholds (see header + dr_slip_veto.hpp).
+  // dr_slip_wheel_min_rad_per_s MUST stay above the 1-tick quantization floor
+  // of the wheel-derived yaw rate, or the veto fires on encoder rounding
+  // during ordinary straight driving (issue #488).
+  dr_slip_gyro_max_rad_per_s_ =
+      declare_parameter<double>("dr_slip_gyro_max_rad_per_s", dr_slip_gyro_max_rad_per_s_);
+  dr_slip_wheel_min_rad_per_s_ =
+      declare_parameter<double>("dr_slip_wheel_min_rad_per_s", dr_slip_wheel_min_rad_per_s_);
+
   // Dock-approach pose stabilisation (see header). During the final graceful
   // approach, drop COG yaw + reject RTK-float epochs so the dock controller
   // gets a stable target instead of a flickering pose.
   docking_active_timeout_s_ = declare_parameter<double>("docking_active_timeout_s", 1.0);
   gate_cog_during_docking_ = declare_parameter<bool>("gate_cog_during_docking", true);
   gate_float_gps_during_docking_ = declare_parameter<bool>("gate_float_gps_during_docking", true);
-  rtk_wrongfix_max_wheel_m_ =
-      declare_parameter<double>("rtk_wrongfix_max_wheel_m", 0.02);
-
   datum_lat_ = declare_parameter<double>("datum_lat", 0.0);
   datum_lon_ = declare_parameter<double>("datum_lon", 0.0);
   datum_cos_lat_ = std::cos(datum_lat_ * M_PI / 180.0);
@@ -126,17 +149,37 @@ FusionGraphNode::FusionGraphNode(const rclcpp::NodeOptions& opts)
   gp.datum_lon = datum_lon_;
   gp.kf_spacing_m = declare_parameter<double>("kf_spacing_m", 0.5);
   gp.max_keyframes = static_cast<uint64_t>(declare_parameter<int>("max_keyframes", 2000));
+  // Hard yaw-σ floor on the scan-to-keyframe absolute prior (GraphManager-side,
+  // enforced in CreateNodeLocked). Mirrors the scan/loop-closure LiDAR-yaw floor
+  // so the keyframe heading can only weakly correct gyro drift. See graph_params.
+  gp.kf_yaw_sigma_floor_rad = declare_parameter<double>("kf_apply_yaw_sigma_floor_rad", 0.30);
   kf_spacing_m_ = gp.kf_spacing_m;  // node reuses for the capture-spacing gate
 
   map_frame_ = declare_parameter<std::string>("map_frame", "map");
   odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
   base_frame_ = declare_parameter<std::string>("base_frame", "base_footprint");
-  tf_publish_lead_s_ = declare_parameter<double>("tf_publish_lead_s", 0.0);
+  tf_publish_lead_s_ = declare_parameter<double>("tf_publish_lead_s", 0.05);
   // Dedicated TF-broadcast thread rate (see fusion_graph_node.hpp). 20 Hz
   // halves worst-case TF staleness vs the 25 Hz tick cadence while staying
   // cheap (constant anchor + integrated dr_*). <= 0 disables the thread and
   // falls back to inline OnTimer publishing.
   tf_broadcast_rate_hz_ = declare_parameter<double>("tf_broadcast_rate_hz", 20.0);
+
+  // map→odom slew-rate limiter (see fusion_graph_node.hpp). Eases the
+  // published anchor toward the raw graph target at a bounded rate so
+  // per-node graph corrections enter map→base as continuous sub-second
+  // ramps instead of steps (the weave/hunting root cause). A jump past the
+  // snap thresholds is a genuine relocalization → applied immediately.
+  anchor_slew_enabled_ = declare_parameter<bool>("anchor_slew_enabled", true);
+  anchor_max_lin_slew_mps_ = declare_parameter<double>("anchor_max_lin_slew_mps", 0.10);
+  anchor_max_ang_slew_radps_ = declare_parameter<double>("anchor_max_ang_slew_radps", 0.20);
+  anchor_snap_dist_m_ = declare_parameter<double>("anchor_snap_dist_m", 0.50);
+  anchor_snap_yaw_rad_ = declare_parameter<double>("anchor_snap_yaw_rad", 0.35);
+  // Odom re-base distance (see fusion_graph_node.hpp). Reset the odom position
+  // origin onto the robot once it has driven this far, so the map→odom lever
+  // arm (and thus graph-yaw-jitter → position-jump amplification) stays small.
+  // 0 = disabled.
+  odom_rebase_dist_m_ = declare_parameter<double>("odom_rebase_dist_m", 0.0);
 
   graph_ = std::make_shared<GraphManager>(gp);
   DeclareParameters();

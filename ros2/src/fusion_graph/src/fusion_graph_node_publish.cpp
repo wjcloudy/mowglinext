@@ -16,6 +16,8 @@
 #include <tf2/exceptions.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
+#include "fusion_graph/anchor_slew.hpp"
+#include "fusion_graph/covariance_frame.hpp"
 #include "fusion_graph/fusion_graph_node.hpp"
 #include "fusion_graph/fusion_graph_node_util.hpp"
 
@@ -102,6 +104,13 @@ void FusionGraphNode::PublishLocalOdom()
   odom.pose.pose.orientation = q_msg;
   odom.twist.twist.linear.x = wheel_vx_;
   odom.twist.twist.linear.y = 0.0;
+  // Bias-corrected gyro yaw rate — the SAME rate dead-reckoning integrates into
+  // dr_yaw_. Leaving this 0 made /odometry/filtered unusable as Nav2's
+  // controller_server.odom_topic (MPPI seeds rollouts / RPP scales lookahead
+  // from twist.angular.z — the documented "controllers had zero velocity
+  // feedback" gap that forced odom_topic onto raw /wheel_odom). Same executor
+  // thread as the dr_* writers, so no lock needed here.
+  odom.twist.twist.angular.z = dr_last_gz_;
   // Dead reckoning has unbounded drift — leave pose covariance loose
   // and let Nav2 trust the graph's /odometry/filtered_map for absolute
   // positioning. Tight roll/pitch/z so 2D consumers don't see NaN.
@@ -113,7 +122,32 @@ void FusionGraphNode::PublishLocalOdom()
   odom.pose.covariance[21] = 1e-9;  // roll
   odom.pose.covariance[28] = 1e-9;  // pitch
   odom.pose.covariance[35] = 0.02;  // yaw — gyro short-term σ ≈ 0.14 rad
+  for (auto& v : odom.twist.covariance)
+    v = 0.0;
+  odom.twist.covariance[0] = 0.02;  // vx — wheel-odom velocity noise
+  odom.twist.covariance[35] = 4e-4;  // wz — gyro rate noise (σ ≈ 0.02 rad/s)
   pub_local_odom_->publish(odom);
+}
+
+void FusionGraphNode::PublishIcpOdom()
+{
+  // LiDAR-only (scan-match integrated) pose for GUI comparison against the
+  // fused/GPS estimate. Seeded from the graph pose at the first accepted match
+  // (see OnTimer), so it starts aligned with the graph and then drifts — the
+  // drift IS the signal. Map frame so the GUI overlays it on the same canvas.
+  if (!icp_pose_seeded_ || !pub_icp_odom_)
+  {
+    return;
+  }
+  nav_msgs::msg::Odometry odom;
+  odom.header.stamp = this->now();
+  odom.header.frame_id = map_frame_;
+  odom.child_frame_id = base_frame_;
+  odom.pose.pose.position.x = icp_pose_.x();
+  odom.pose.pose.position.y = icp_pose_.y();
+  odom.pose.pose.position.z = 0.0;
+  odom.pose.pose.orientation = QuatFromYaw(icp_pose_.theta());
+  pub_icp_odom_->publish(odom);
 }
 
 void FusionGraphNode::PublishOutputs(const TickOutput& out)
@@ -138,18 +172,27 @@ void FusionGraphNode::PublishOutputs(const TickOutput& out)
   odom.pose.pose.position.z = 0.0;
   odom.pose.pose.orientation = QuatFromYaw(extrapolated_map_base.theta());
 
-  // Pose covariance is 6x6 row-major: x, y, z, roll, pitch, yaw.
+  // Pose covariance is 6x6 row-major: x, y, z, roll, pitch, yaw, and — like
+  // every other field in this message — it is expressed in header.frame_id
+  // (map). GTSAM hands back the marginal in the pose's LOCAL tangent frame,
+  // so it must be rotated by the pose's heading before it goes out; the wheel
+  // between-factor is non-holonomic (sigma_x >> sigma_y), which makes the
+  // body-frame matrix strongly anisotropic and the difference material.
+  // See covariance_frame.hpp.
+  const Eigen::Matrix3d cov_map =
+      BodyToMapCovariance(out.covariance, extrapolated_map_base.theta());
+
   for (auto& v : odom.pose.covariance)
     v = 0.0;
-  odom.pose.covariance[0] = out.covariance(0, 0);
-  odom.pose.covariance[1] = out.covariance(0, 1);
-  odom.pose.covariance[5] = out.covariance(0, 2);
-  odom.pose.covariance[6] = out.covariance(1, 0);
-  odom.pose.covariance[7] = out.covariance(1, 1);
-  odom.pose.covariance[11] = out.covariance(1, 2);
-  odom.pose.covariance[30] = out.covariance(2, 0);
-  odom.pose.covariance[31] = out.covariance(2, 1);
-  odom.pose.covariance[35] = out.covariance(2, 2);
+  odom.pose.covariance[0] = cov_map(0, 0);
+  odom.pose.covariance[1] = cov_map(0, 1);
+  odom.pose.covariance[5] = cov_map(0, 2);
+  odom.pose.covariance[6] = cov_map(1, 0);
+  odom.pose.covariance[7] = cov_map(1, 1);
+  odom.pose.covariance[11] = cov_map(1, 2);
+  odom.pose.covariance[30] = cov_map(2, 0);
+  odom.pose.covariance[31] = cov_map(2, 1);
+  odom.pose.covariance[35] = cov_map(2, 2);
   // Z, roll, pitch — clamped, give them tiny variance so consumers
   // don't choke on zero.
   odom.pose.covariance[14] = 1e-9;
@@ -230,6 +273,48 @@ void FusionGraphNode::PublishOutputs(const TickOutput& out)
   t_map_odom.child_frame_id = odom_frame_;
   t_map_odom.transform = tf2::toMsg(T_map_odom);
   tf_broadcaster_->sendTransform(t_map_odom);
+}
+
+gtsam::Pose2 FusionGraphNode::SlewPublishedAnchor(const gtsam::Pose2& target,
+                                                  bool anchor_valid,
+                                                  double dt)
+{
+  // An odom re-base (OnTimer) sets force_pub_resync_: the target anchor just
+  // jumped by a coordinated amount that leaves map→base UNCHANGED, so the
+  // published anchor must snap to it (not ramp) or map→base would move. Drop
+  // pub_valid so AnchorSlewStep snaps on this cycle.
+  if (force_pub_resync_.exchange(false, std::memory_order_acq_rel))
+    t_map_odom_pub_valid_ = false;
+
+  // Thin wrapper over the pure AnchorSlewStep (anchor_slew.hpp). Single
+  // writer of t_map_odom_pub_ per run mode (TF thread when the broadcast
+  // thread runs, executor otherwise) → no lock taken here.
+  const AnchorSlewCfg cfg{anchor_slew_enabled_,
+                          anchor_max_lin_slew_mps_,
+                          anchor_max_ang_slew_radps_,
+                          anchor_snap_dist_m_,
+                          anchor_snap_yaw_rad_};
+  double px = t_map_odom_pub_.x();
+  double py = t_map_odom_pub_.y();
+  double pyaw = t_map_odom_pub_.theta();
+  double ox = 0.0;
+  double oy = 0.0;
+  double oyaw = 0.0;
+  AnchorSlewStep(t_map_odom_pub_valid_,
+                 px,
+                 py,
+                 pyaw,
+                 anchor_valid,
+                 target.x(),
+                 target.y(),
+                 target.theta(),
+                 dt,
+                 cfg,
+                 ox,
+                 oy,
+                 oyaw);
+  t_map_odom_pub_ = gtsam::Pose2(px, py, pyaw);
+  return gtsam::Pose2(ox, oy, oyaw);
 }
 
 void FusionGraphNode::TfBroadcastLoop()

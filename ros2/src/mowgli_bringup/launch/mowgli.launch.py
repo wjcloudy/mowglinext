@@ -27,8 +27,8 @@ Brings up:
 """
 
 import os
+import sys
 
-import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -41,6 +41,12 @@ from launch.substitutions import (
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+
+# Shared robot-config loader (sibling module installed alongside this launch
+# file). Deep-merges the SPARSE installed mowgli_robot.yaml over the in-package
+# template defaults, so a missing key falls through to its versioned default.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from robot_config_util import load_robot_params  # noqa: E402
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -73,15 +79,11 @@ def generate_launch_description() -> LaunchDescription:
     # ------------------------------------------------------------------
     # Robot config (mowgli_robot.yaml)
     # ------------------------------------------------------------------
-    # Try the Docker-mounted config first, fall back to the in-package default.
-    robot_config_path = "/ros2_ws/config/mowgli_robot.yaml"
-    if not os.path.isfile(robot_config_path):
-        robot_config_path = os.path.join(bringup_dir, "config", "mowgli_robot.yaml")
-
-    with open(robot_config_path, "r") as f:
-        robot_config_yaml = yaml.safe_load(f) or {}
-
-    robot_params = robot_config_yaml.get("mowgli", {}).get("ros__parameters", {})
+    # Merged params = in-package template defaults with the installed sparse
+    # config layered on top (robot_config_util.load_robot_params). A key the
+    # installed config omits falls through to its versioned template default;
+    # a missing installed file yields the pure template. Single source of truth.
+    robot_params = load_robot_params(bringup_dir, "/ros2_ws/config/mowgli_robot.yaml")
 
     # ------------------------------------------------------------------
     # URDF / xacro
@@ -92,6 +94,7 @@ def generate_launch_description() -> LaunchDescription:
     chassis_length   = float(robot_params.get("chassis_length", 0.54))
     chassis_width    = float(robot_params.get("chassis_width", 0.40))
     chassis_height   = float(robot_params.get("chassis_height", 0.19))
+    chassis_mass_kg  = float(robot_params.get("chassis_mass_kg", 8.76))
     chassis_center_x = float(robot_params.get("chassis_center_x", 0.18))
     wheel_radius     = float(robot_params.get("wheel_radius", 0.093))
     wheel_width      = float(robot_params.get("wheel_width", 0.04))
@@ -104,7 +107,7 @@ def generate_launch_description() -> LaunchDescription:
     # Sensor positions from config
     lidar_x   = str(robot_params.get("lidar_x", 0.38))
     lidar_y   = str(robot_params.get("lidar_y", 0.0))
-    lidar_z   = str(robot_params.get("lidar_z", 0.22))
+    lidar_z   = str(robot_params.get("lidar_z", 0.30))
     lidar_yaw = str(robot_params.get("lidar_yaw", 0.0))
     imu_x     = str(robot_params.get("imu_x", 0.18))
     imu_y     = str(robot_params.get("imu_y", 0.0))
@@ -135,6 +138,7 @@ def generate_launch_description() -> LaunchDescription:
             " chassis_length:=", str(chassis_length),
             " chassis_width:=", str(chassis_width),
             " chassis_height:=", str(chassis_height),
+            " chassis_mass_kg:=", str(chassis_mass_kg),
             " chassis_center_x:=", str(chassis_center_x),
             " wheel_radius:=", str(wheel_radius),
             " wheel_width:=", str(wheel_width),
@@ -198,21 +202,22 @@ def generate_launch_description() -> LaunchDescription:
             {"dock_pose_yaw": float(robot_params.get("dock_pose_yaw", 0.0))},
             {"imu_yaw": float(robot_params.get("imu_yaw", 0.0))},
             # Wheel odometry kinematics — single source of truth in
-            # mowgli_robot.yaml. Hardware bridge previously hardcoded
-            # 0.325 m / 300 ticks/m which silently diverged from the
-            # YAML and the URDF (also from the firmware's TICKS_PER_M).
+            # mowgli_robot.yaml. hardware_bridge uses ticks_per_meter for
+            # host-side odometry and also re-sends it to the STM32 so the
+            # wheel PI / firmware odom leave board.h TICKS_PER_M as a
+            # startup-only fallback.
             {"wheel_track": float(robot_params.get("wheel_track", 0.325))},
             {"ticks_per_meter": float(robot_params.get("ticks_per_meter", 300.0))},
             # Drive-motor wheel-velocity PID + feedforward, pushed to the STM32
             # firmware so the GUI can retune the per-wheel loop without
-            # reflashing. Defaults mirror the firmware compile-time fallback.
-            {"wheel_pid_kp": float(robot_params.get("wheel_pid_kp", 30.0))},
-            {"wheel_pid_ki": float(robot_params.get("wheel_pid_ki", 5000.0))},
-            {"wheel_pid_kd": float(robot_params.get("wheel_pid_kd", 0.0))},
+            # reflashing. Fallback defaults match the mowgli_bringup template.
+            {"wheel_pid_kp": float(robot_params.get("wheel_pid_kp", 0.2))},
+            {"wheel_pid_ki": float(robot_params.get("wheel_pid_ki", 0.092))},
+            {"wheel_pid_kd": float(robot_params.get("wheel_pid_kd", 0.01))},
             {"wheel_pid_integral_limit": float(robot_params.get(
-                "wheel_pid_integral_limit", 100.0))},
+                "wheel_pid_integral_limit", 15.0))},
             {"wheel_pid_pwm_per_mps": float(robot_params.get(
-                "wheel_pid_pwm_per_mps", 300.0))},
+                "wheel_pid_pwm_per_mps", 282.135))},
             # IMU calibration tuning (operator-tunable via the GUI).
             {"imu_cal_samples": int(robot_params.get("imu_cal_samples", 200))},
             {"imu_cal_persist_path": str(robot_params.get(
@@ -225,16 +230,27 @@ def generate_launch_description() -> LaunchDescription:
             {"lift_recovery_mode": bool(robot_params.get("lift_recovery_mode", False))},
             {"lift_blade_resume_delay_sec": float(robot_params.get(
                 "lift_blade_resume_delay_sec", 1.0))},
-            # Gyro angular-rate loop — now operator-tunable via the GUI config
-            # (was only in hardware_bridge.yaml / the node default). Set
-            # angular_rate_loop_enabled:false in mowgli_robot.yaml for plain wz
-            # passthrough (the firmware per-wheel velocity PID then owns wheel
-            # control) when the loop oscillates in yaw. Default keeps the prior
-            # behaviour (enabled) so sim / other configs are unchanged.
-            {"angular_rate_loop_enabled": bool(robot_params.get(
-                "angular_rate_loop_enabled", True))},
-            {"angular_rate_kp": float(robot_params.get("angular_rate_kp", 0.4))},
-            {"angular_rate_ki": float(robot_params.get("angular_rate_ki", 2.0))},
+            # Dry-run inhibit (issue #195): false suppresses every blade ENABLE
+            # that reaches /hardware_bridge/mower_control — the merged chokepoint
+            # every caller (BT, FollowStrip, GUI) goes through. NOT a safety
+            # interlock: the firmware remains the sole blade safety authority and
+            # a DISABLE always passes through (mowgli_hardware/blade_gate.hpp).
+            {"mowing_enabled": bool(robot_params.get("mowing_enabled", True))},
+            # 2026-07-17 Option C (task #34): the host-side gyro angular-rate
+            # loop (angular_rate_loop_enabled/_kp/_ki/_kff, Option B task #24)
+            # is REMOVED — the yaw-rate loop now runs in firmware (task #33),
+            # closing on the same gyro without the host's USB round-trip
+            # latency. hardware_bridge now sends wz straight through; these
+            # tune the firmware loop instead, pushed via PACKET_ID_LL_SET_YAW_PID
+            # (a separate packet from SET_DRIVE_PID — Firmware-2's #33 report).
+            # Defaults match the firmware's own power-on fallback.
+            {"yaw_kp": float(robot_params.get("yaw_kp", 0.12))},
+            {"yaw_ki": float(robot_params.get("yaw_ki", 0.40))},
+            {"yaw_trim_limit_mps": float(robot_params.get("yaw_trim_limit_mps", 0.15))},
+            {"yaw_loop_enabled": bool(robot_params.get("yaw_loop_enabled", True))},
+            # gyro_sign is the field sign-check remedy for the physical IMU
+            # mounting (UNVALIDATED default +1) — see send_yaw_pid().
+            {"yaw_gyro_sign": int(robot_params.get("yaw_gyro_sign", 1))},
         ],
         # The node publishes on ~/topic (e.g. /hardware_bridge/wheel_odom).
         # behavior_tree_node subscribes to /hardware_bridge/status etc.

@@ -1,35 +1,53 @@
 import React from "react";
 import { Card, Col, Collapse, Form, InputNumber, Row, Space, Switch, Typography } from "antd";
 import { HomeOutlined } from "@ant-design/icons";
+import { useTranslation } from "react-i18next";
 import { useThemeMode } from "../../theme/ThemeContext.tsx";
+import { SettingFieldLabel } from "./SettingFieldLabel.tsx";
+import { DockCalibrationCard } from "./DockCalibrationCard.tsx";
 
 const { Text, Paragraph } = Typography;
 
 type Props = {
     values: Record<string, any>;
     onChange: (key: string, value: any) => void;
+    isOverridden?: (key: string) => boolean;
+    hasDefault?: (key: string) => boolean;
+    onReset?: (key: string) => void;
 };
 
-export const DockingSection: React.FC<Props> = ({ values, onChange }) => {
+export const DockingSection: React.FC<Props> = ({ values, onChange, isOverridden, hasDefault, onReset }) => {
     const { colors } = useThemeMode();
+    const { t } = useTranslation();
+    const fieldLabel = (key: string, label: React.ReactNode) => (
+        <SettingFieldLabel
+            settingKey={key}
+            label={label}
+            overridden={isOverridden?.(key) ?? false}
+            canReset={hasDefault?.(key) ?? false}
+            onReset={onReset}
+        />
+    );
     return (
         <div>
+            {/* One-click dock calibration — the unified surface that replaces the
+                old separate IMU-yaw modal + onboarding ImuYawStep. */}
+            <DockCalibrationCard />
             <Card size="small" style={{ marginBottom: 16 }}>
                 <Space direction="vertical" size={12} style={{ width: "100%" }}>
                     <div>
                         <Text strong className="mn-display" style={{ fontSize: 14, color: colors.text }}>
                             <HomeOutlined style={{ marginRight: 6, color: colors.primary }} />
-                            Comportement de l'accostage
+                            {t('dockingSection.dockingBehaviour')}
                         </Text>
                         <Paragraph type="secondary" style={{ margin: "4px 0 0" }}>
-                            Réglez la façon dont le robot s'approche et quitte la base.
-                            La position de la base (X, Y, Yaw) se définit depuis l'éditeur de carte.
+                            {t('dockingSection.dockingBehaviourDescription')}
                         </Paragraph>
                     </div>
                     <Form layout="vertical" size="small">
                         <Row gutter={[16, 0]}>
                             <Col xs={24} sm={12}>
-                                <Form.Item label="Distance de désaccostage" tooltip="Distance de recul en quittant la base">
+                                <Form.Item label={fieldLabel("undock_distance", t('dockingSection.undockDistance'))} tooltip={t('dockingSection.undockDistanceTooltip')}>
                                     <InputNumber
                                         value={values.undock_distance}
                                         onChange={(v) => onChange("undock_distance", v)}
@@ -39,7 +57,7 @@ export const DockingSection: React.FC<Props> = ({ values, onChange }) => {
                                 </Form.Item>
                             </Col>
                             <Col xs={24} sm={12}>
-                                <Form.Item label="Vitesse de désaccostage" tooltip="Vitesse de recul au désaccostage">
+                                <Form.Item label={fieldLabel("undock_speed", t('dockingSection.undockSpeed'))} tooltip={t('dockingSection.undockSpeedTooltip')}>
                                     <InputNumber
                                         value={values.undock_speed}
                                         onChange={(v) => onChange("undock_speed", v)}
@@ -49,7 +67,7 @@ export const DockingSection: React.FC<Props> = ({ values, onChange }) => {
                                 </Form.Item>
                             </Col>
                             <Col xs={24} sm={12}>
-                                <Form.Item label="Distance d'approche" tooltip="Distance du point de préparation devant la base">
+                                <Form.Item label={fieldLabel("dock_approach_distance", t('dockingSection.approachDistance'))} tooltip={t('dockingSection.approachDistanceTooltip')}>
                                     <InputNumber
                                         value={values.dock_approach_distance}
                                         onChange={(v) => onChange("dock_approach_distance", v)}
@@ -59,7 +77,7 @@ export const DockingSection: React.FC<Props> = ({ values, onChange }) => {
                                 </Form.Item>
                             </Col>
                             <Col xs={24} sm={12}>
-                                <Form.Item label="Détection du chargeur" tooltip="Utiliser la tension de charge pour confirmer l'accostage">
+                                <Form.Item label={fieldLabel("dock_use_charger_detection", t('dockingSection.chargerDetection'))} tooltip={t('dockingSection.chargerDetectionTooltip')}>
                                     <Switch
                                         checked={values.dock_use_charger_detection ?? true}
                                         onChange={(v) => onChange("dock_use_charger_detection", v)}
@@ -76,14 +94,14 @@ export const DockingSection: React.FC<Props> = ({ values, onChange }) => {
                                 key: "advanced",
                                 label: (
                                     <Text strong style={{ color: colors.textSecondary }}>
-                                        Avancé
+                                        {t('dockingSection.advanced')}
                                     </Text>
                                 ),
                                 children: (
                                     <Form layout="vertical" size="small">
                                         <Row gutter={[16, 0]}>
                                             <Col xs={24} sm={12}>
-                                                <Form.Item label="Tentatives max" tooltip="Nombre d'essais d'accostage avant d'abandonner">
+                                                <Form.Item label={fieldLabel("dock_max_retries", t('dockingSection.maxRetries'))} tooltip={t('dockingSection.maxRetriesTooltip')}>
                                                     <InputNumber
                                                         value={values.dock_max_retries}
                                                         onChange={(v) => onChange("dock_max_retries", v)}
@@ -93,7 +111,7 @@ export const DockingSection: React.FC<Props> = ({ values, onChange }) => {
                                                 </Form.Item>
                                             </Col>
                                             <Col xs={24} sm={12}>
-                                                <Form.Item label="Seuil de charge" tooltip="Courant batterie (A) à partir duquel SimpleChargingDock considère la base atteinte. Plus élevé = le robot s'enfonce davantage dans les contacts avant de s'arrêter ; plus bas = s'arrête plus tôt. ~0,3 A donne un contact stable sur le chargeur YardForce.">
+                                                <Form.Item label={fieldLabel("dock_charging_threshold", t('dockingSection.chargingThreshold'))} tooltip={t('dockingSection.chargingThresholdTooltip')}>
                                                     <InputNumber
                                                         value={values.dock_charging_threshold}
                                                         onChange={(v) => onChange("dock_charging_threshold", v)}
@@ -103,7 +121,7 @@ export const DockingSection: React.FC<Props> = ({ values, onChange }) => {
                                                 </Form.Item>
                                             </Col>
                                             <Col xs={24} sm={12}>
-                                                <Form.Item label="Dépassement d'approche" tooltip="Distance (m) parcourue au-delà de la pose de la base pour bien enfoncer les contacts de charge. ~0,05 m compense le bruit RTK/bras de levier résiduel.">
+                                                <Form.Item label={fieldLabel("dock_approach_overshoot", t('dockingSection.approachOvershoot'))} tooltip={t('dockingSection.approachOvershootTooltip')}>
                                                     <InputNumber
                                                         value={values.dock_approach_overshoot}
                                                         onChange={(v) => onChange("dock_approach_overshoot", v)}
@@ -113,7 +131,7 @@ export const DockingSection: React.FC<Props> = ({ values, onChange }) => {
                                                 </Form.Item>
                                             </Col>
                                             <Col xs={24} sm={12}>
-                                                <Form.Item label="Incertitude du cap de la base" tooltip="Écart-type (rad) du cap de la base utilisé pour amorcer le graphe de fusion au contact de charge. Plus faible = on fait davantage confiance au cap calibré.">
+                                                <Form.Item label={fieldLabel("dock_pose_yaw_sigma_rad", t('dockingSection.baseHeadingUncertainty'))} tooltip={t('dockingSection.baseHeadingUncertaintyTooltip')}>
                                                     <InputNumber
                                                         value={values.dock_pose_yaw_sigma_rad}
                                                         onChange={(v) => onChange("dock_pose_yaw_sigma_rad", v)}

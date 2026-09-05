@@ -1,10 +1,14 @@
 import {useCallback, useEffect, useState} from "react";
+import {useTranslation} from "react-i18next";
+import i18n from "../i18n";
 import {Table, Tag, Button, Popconfirm, message} from "antd";
 import {DeleteOutlined} from "@ant-design/icons";
 import {useApi} from "../hooks/useApi.ts";
 import {useDiagnosticsSnapshot} from "../hooks/useDiagnosticsSnapshot.ts";
 import {useThemeMode} from "../theme/ThemeContext.tsx";
 import {useIsMobile} from "../hooks/useIsMobile";
+import {useTimeFormat} from "../hooks/useTimeFormat.tsx";
+import type {TimeZoneMode} from "../utils/logTime.ts";
 import {DashCard, Bar} from "../components/dashboard";
 import {YearOfLawn} from "../components/YearOfLawn.tsx";
 
@@ -62,14 +66,21 @@ function formatDistanceUnit(meters: number): string {
   return meters >= 1000 ? "km" : "m";
 }
 
-function formatDate(timestamp: string): string {
+// Keeps its friendly locale shape, but takes the zone from the shared
+// preference instead of implicitly using the browser's.
+function formatDate(timestamp: string, timeZoneMode: TimeZoneMode): string {
   if (!timestamp) return "--";
-  return new Date(timestamp).toLocaleString(undefined, {
+  const parsed = new Date(timestamp);
+  if (Number.isNaN(parsed.getTime())) return timestamp;
+  return parsed.toLocaleString(i18n.language, {
     month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+    ...(timeZoneMode === 'utc' ? {timeZone: 'UTC'} : {}),
   });
 }
 
 export const StatisticsPage = () => {
+  const {t} = useTranslation();
+  const {timeZoneMode} = useTimeFormat();
   const guiApi = useApi();
   const {snapshot} = useDiagnosticsSnapshot();
   const {colors} = useThemeMode();
@@ -96,12 +107,12 @@ export const StatisticsPage = () => {
   const clearStats = useCallback(async () => {
     try {
       await guiApi.request({path: "/diagnostics/sessions", method: "DELETE", format: "json"});
-      message.success("Statistics cleared");
+      message.success(t('statisticsPage.statisticsCleared'));
       await fetchData();
     } catch {
-      message.error("Failed to clear statistics");
+      message.error(t('statisticsPage.failedToClearStatistics'));
     }
-  }, [fetchData]);
+  }, [fetchData, t]);
 
   useEffect(() => {
     fetchData();
@@ -114,13 +125,21 @@ export const StatisticsPage = () => {
 
   const coverage = snapshot?.coverage ?? [];
 
-  // Generate fake weekly data from sessions for the bar chart
+  // Weekly distance bars. The buckets are ROLLING 7-day windows measured back
+  // from "now" on absolute instants, NOT calendar weeks, so they are unaffected
+  // by the time-zone toggle and carry no date labels to disagree with. Keep it
+  // that way: switching to calendar weeks would need `zonedDayAnchorMs` here
+  // too, or a bar would count a session whose displayed date sits in the
+  // neighbouring column.
+  const nowMs = Date.now();
   const weeklyBars = Array.from({length: 12}, (_, i) => {
-    const weekAgo = 12 - i;
+    // i=0 is the oldest column (11 weeks ago), i=11 is the current week
+    // (diffWeeks === 0). Using 12 - i skipped week 0 and hid the current week.
+    const weekAgo = 11 - i;
     const weekSessions = sessions.filter(s => {
-      const d = new Date(s.start_time);
-      const now = new Date();
-      const diffWeeks = Math.floor((now.getTime() - d.getTime()) / (7 * 24 * 60 * 60 * 1000));
+      const startedAtMs = Date.parse(s.start_time);
+      if (!Number.isFinite(startedAtMs)) return false;
+      const diffWeeks = Math.floor((nowMs - startedAtMs) / (7 * 24 * 60 * 60 * 1000));
       return diffWeeks === weekAgo;
     });
     return weekSessions.reduce((acc, s) => acc + (s.distance_meters / 1000), 0);
@@ -129,22 +148,22 @@ export const StatisticsPage = () => {
 
   const sessionColumns = [
     {
-      title: "Date", dataIndex: "start_time", key: "start_time",
+      title: t('statisticsPage.colDate'), dataIndex: "start_time", key: "start_time",
       sorter: (a: MowingSession, b: MowingSession) =>
-        new Date(b.start_time).getTime() - new Date(a.start_time).getTime(),
-      defaultSortOrder: "ascend" as const,
-      render: (v: string) => <span style={{fontSize: 13}}>{formatDate(v)}</span>,
+        new Date(a.start_time).getTime() - new Date(b.start_time).getTime(),
+      defaultSortOrder: "descend" as const,
+      render: (v: string) => <span style={{fontSize: 13}}>{formatDate(v, timeZoneMode)}</span>,
     },
     ...(!isMobile ? [{
-      title: "Duration", dataIndex: "duration_sec", key: "duration",
+      title: t('statisticsPage.colDuration'), dataIndex: "duration_sec", key: "duration",
       render: (v: number) => <span style={{fontSize: 13}}>{formatDuration(v)}</span>,
     }] : []),
     {
-      title: "Area", dataIndex: "area_index", key: "area_index",
+      title: t('statisticsPage.colArea'), dataIndex: "area_index", key: "area_index",
       render: (v: number) => <span style={{fontSize: 13}}>{v != null && v >= 0 ? `#${v}` : "--"}</span>,
     },
     {
-      title: "Coverage", dataIndex: "coverage_percent", key: "coverage",
+      title: t('statisticsPage.colCoverage'), dataIndex: "coverage_percent", key: "coverage",
       render: (v: number) => (
         <div style={{display: 'flex', alignItems: 'center', gap: 8, minWidth: isMobile ? 60 : 80}}>
           <Bar value={v ?? 0} color={colors.accent} track={colors.border} height={6}/>
@@ -155,14 +174,14 @@ export const StatisticsPage = () => {
       ),
     },
     ...(!isMobile ? [{
-      title: "Status", dataIndex: "status", key: "status",
+      title: t('statisticsPage.colStatus'), dataIndex: "status", key: "status",
       render: (v: string, record: MowingSession) => {
         const c = v === "completed" ? "success" : v === "aborted" ? "warning" : "error";
         return (
           <span style={{display: 'inline-flex', gap: 6, alignItems: 'center'}}>
             <Tag color={c}>{v ?? "--"}</Tag>
             {record.recharge_pauses ? (
-              <Tag color="processing">⏸ {record.recharge_pauses}× recharge</Tag>
+              <Tag color="processing">⏸ {t('statisticsPage.rechargeTag', {count: record.recharge_pauses})}</Tag>
             ) : null}
           </span>
         );
@@ -180,23 +199,23 @@ export const StatisticsPage = () => {
           fontSize: 11, color: colors.textMuted, fontWeight: 600,
           letterSpacing: '0.12em', textTransform: 'uppercase' as const,
         }}>
-          Statistiques
+          {t('statisticsPage.statistics')}
         </div>
         <div className="mn-display" style={{
           fontSize: isMobile ? 30 : 40, color: colors.text,
           lineHeight: 1.05, marginTop: 4, letterSpacing: '-0.02em',
         }}>
-          Une année de tonte
+          {t('statisticsPage.aYearOfMowing')}
         </div>
       </div>
 
       {/* Hero stats -- accent watermark per metric, no border to feel lighter */}
       <div style={{display: 'grid', gridTemplateColumns: isMobile ? 'repeat(2, 1fr)' : 'repeat(4, 1fr)', gap: 12}}>
         {[
-          {label: 'Total distance', value: formatDistance(stats?.total_distance_m ?? 0), unit: formatDistanceUnit(stats?.total_distance_m ?? 0), hint: 'since install', color: colors.accent},
-          {label: 'Hours active', value: formatTotalHours(stats?.total_duration_sec ?? 0), unit: 'h', hint: `${stats?.total_sessions ?? 0} sessions`, color: colors.sky},
-          {label: 'Completion rate', value: `${completionRate}`, unit: '%', hint: `${stats?.completed ?? 0} completed`, color: colors.amber},
-          {label: 'Runs completed', value: `${stats?.total_sessions ?? 0}`, unit: '', hint: `avg ${Math.round(stats?.avg_coverage_pct ?? 0)}% coverage`, color: colors.accent},
+          {label: t('statisticsPage.heroTotalDistance'), value: formatDistance(stats?.total_distance_m ?? 0), unit: formatDistanceUnit(stats?.total_distance_m ?? 0), hint: t('statisticsPage.heroSinceInstall'), color: colors.accent},
+          {label: t('statisticsPage.heroHoursActive'), value: formatTotalHours(stats?.total_duration_sec ?? 0), unit: 'h', hint: t('statisticsPage.heroSessionsCount', {count: stats?.total_sessions ?? 0}), color: colors.sky},
+          {label: t('statisticsPage.heroCompletionRate'), value: `${completionRate}`, unit: '%', hint: t('statisticsPage.heroCompletedCount', {count: stats?.completed ?? 0}), color: colors.amber},
+          {label: t('statisticsPage.heroRunsCompleted'), value: `${stats?.total_sessions ?? 0}`, unit: '', hint: t('statisticsPage.heroAvgCoverage', {pct: Math.round(stats?.avg_coverage_pct ?? 0)}), color: colors.accent},
         ].map(s => (
           <DashCard key={s.label} padding={isMobile ? 16 : 20}
                     style={{position: 'relative', overflow: 'hidden'}}>
@@ -239,10 +258,10 @@ export const StatisticsPage = () => {
       {isEmpty && (
         <DashCard padding={isMobile ? 16 : 20} style={{textAlign: 'center'}}>
           <div style={{fontSize: 14, fontWeight: 600, color: colors.text}}>
-            Aucune tonte pour l'instant
+            {t('statisticsPage.noMowingYet')}
           </div>
           <div style={{fontSize: 12, color: colors.textDim, marginTop: 6}}>
-            Votre première session apparaîtra ici.
+            {t('statisticsPage.firstSessionWillAppearHere')}
           </div>
         </DashCard>
       )}
@@ -256,8 +275,8 @@ export const StatisticsPage = () => {
       <DashCard>
         <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16}}>
           <div>
-            <div style={{fontSize: 14, fontWeight: 600}}>Distance per week</div>
-            <div style={{fontSize: 11, color: colors.textMuted}}>Last 12 weeks (km)</div>
+            <div style={{fontSize: 14, fontWeight: 600}}>{t('statisticsPage.distancePerWeek')}</div>
+            <div style={{fontSize: 11, color: colors.textMuted}}>{t('statisticsPage.last12Weeks')}</div>
           </div>
         </div>
         <div style={{display: 'flex', alignItems: 'flex-end', gap: isMobile ? 4 : 8, height: isMobile ? 120 : 180, paddingBottom: 20, position: 'relative'}}>
@@ -285,7 +304,7 @@ export const StatisticsPage = () => {
                 onMouseEnter={() => setHoveredBar(i)}
                 onMouseLeave={() => setHoveredBar(null)}
                 onClick={() => setHoveredBar(hoveredBar === i ? null : i)}
-                title={`Week ${i + 1}: ${v.toFixed(2)} km`}
+                title={t('statisticsPage.weekTooltip', {week: i + 1, km: v.toFixed(2)})}
                 style={{flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6, position: 'relative', cursor: 'pointer'}}
               >
                 <div style={{
@@ -313,13 +332,13 @@ export const StatisticsPage = () => {
       <div style={{display: 'grid', gridTemplateColumns: isMobile ? '1fr' : (coverage.length > 0 ? '1fr 1.4fr' : '1fr'), gap: 14}}>
         {coverage.length > 0 && (
           <DashCard>
-            <div style={{fontSize: 14, fontWeight: 600, marginBottom: 14}}>Zone coverage</div>
+            <div style={{fontSize: 14, fontWeight: 600, marginBottom: 14}}>{t('statisticsPage.zoneCoverage')}</div>
             {coverage.map(area => (
               <div key={area.area_index} style={{marginBottom: 10}}>
                 <div style={{display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4}}>
-                  <span style={{color: colors.text, fontWeight: 500}}>Area {area.area_index}</span>
+                  <span style={{color: colors.text, fontWeight: 500}}>{t('statisticsPage.areaLabel', {index: area.area_index})}</span>
                   <span style={{color: colors.textDim}}>
-                    {area.mowed_cells}/{area.total_cells} cells
+                    {t('statisticsPage.cellsLabel', {mowed: area.mowed_cells, total: area.total_cells})}
                   </span>
                 </div>
                 <Bar
@@ -334,21 +353,21 @@ export const StatisticsPage = () => {
         <DashCard padding={0}>
           <div style={{padding: '18px 18px 0', display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12}}>
             <div>
-              <div style={{fontSize: 14, fontWeight: 600, marginBottom: 4}}>Session history</div>
+              <div style={{fontSize: 14, fontWeight: 600, marginBottom: 4}}>{t('statisticsPage.sessionHistory')}</div>
               <div style={{fontSize: 11, color: colors.textMuted, marginBottom: 14}}>
-                {sessions.length} session{sessions.length !== 1 ? 's' : ''} recorded
+                {t('statisticsPage.sessionsRecorded', {count: sessions.length})}
               </div>
             </div>
             <Popconfirm
-              title="Clear all statistics?"
-              description="This permanently deletes every recorded session. This cannot be undone."
-              okText="Clear"
+              title={t('statisticsPage.clearAllTitle')}
+              description={t('statisticsPage.clearAllDescription')}
+              okText={t('statisticsPage.clear')}
               okButtonProps={{danger: true}}
-              cancelText="Cancel"
+              cancelText={t('statisticsPage.cancel')}
               onConfirm={clearStats}
             >
               <Button size="small" danger icon={<DeleteOutlined/>} disabled={sessions.length === 0}>
-                Clear
+                {t('statisticsPage.clear')}
               </Button>
             </Popconfirm>
           </div>
@@ -362,7 +381,7 @@ export const StatisticsPage = () => {
             locale={{
               emptyText: (
                 <div style={{padding: '24px 0', color: colors.textSecondary}}>
-                  No mowing sessions recorded yet.
+                  {t('statisticsPage.noSessionsRecorded')}
                 </div>
               ),
             }}

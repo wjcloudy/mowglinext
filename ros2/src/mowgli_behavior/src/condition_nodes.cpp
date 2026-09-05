@@ -46,7 +46,18 @@ BT::NodeStatus IsEmergency::tick()
     return BT::NodeStatus::SUCCESS;  // stale data → assume emergency
   }
 
-  return ctx->latest_emergency.active_emergency ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+  // Treat a set firmware LATCH as emergency too, not just an actively-asserted
+  // physical trigger. A software e-stop (the /hardware_bridge/emergency_stop
+  // service, used by the GUI stop button and tooling) sets the firmware latch
+  // WITHOUT a physical lift/stop assertion, so active_emergency stays false
+  // while latched_emergency is true. Keying only off active_emergency let the
+  // BT keep ticking MainLogic (flapping into a spurious RECORDING state) while
+  // the firmware held the motors disabled — the BT must instead surface
+  // EMERGENCY and run its stop/auto-reset handler. The firmware remains the
+  // safety authority; this only fixes what the BT reports and does.
+  return (ctx->latest_emergency.active_emergency || ctx->latest_emergency.latched_emergency)
+             ? BT::NodeStatus::SUCCESS
+             : BT::NodeStatus::FAILURE;
 }
 
 // ---------------------------------------------------------------------------
@@ -87,8 +98,15 @@ BT::NodeStatus IsBatteryLow::tick()
   // Voltage gate as a redundant trip: a sagging pack can read fine on
   // percent (which is interpolated from full/empty endpoints) and still
   // be below the safe operating voltage. Disabled when threshold is 0.
-  if (voltage_threshold > 0.0f && ctx->latest_power.v_battery > 0.0f &&
-      ctx->latest_power.v_battery < voltage_threshold)
+  //
+  // Reads the FILTERED voltage, not latest_power.v_battery. Both trips in this
+  // node have to see the same signal — gating this one on the raw rail would
+  // re-open, for any operator who sets battery_critical_voltage, exactly the
+  // motor-transient false trip that filtering battery_percent closes. A pack
+  // that is genuinely below the threshold stays below it, so the gate still
+  // fires, just one time constant (~2 s) later. 0 means no reading yet.
+  if (voltage_threshold > 0.0f && ctx->battery_voltage_filtered > 0.0f &&
+      ctx->battery_voltage_filtered < voltage_threshold)
   {
     return BT::NodeStatus::SUCCESS;
   }
@@ -171,6 +189,17 @@ BT::NodeStatus IsCommand::tick()
 }
 
 // ---------------------------------------------------------------------------
+// IsCoverageComplete
+// ---------------------------------------------------------------------------
+
+BT::NodeStatus IsCoverageComplete::tick()
+{
+  auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
+  std::lock_guard<std::mutex> lock(ctx->context_mutex);
+  return ctx->coverage_all_complete ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+}
+
+// ---------------------------------------------------------------------------
 // IsGPSFixed
 // ---------------------------------------------------------------------------
 
@@ -202,6 +231,28 @@ BT::NodeStatus IsBoundaryViolation::tick()
 }
 
 // ---------------------------------------------------------------------------
+// IsLocalizationDegraded
+// ---------------------------------------------------------------------------
+
+BT::NodeStatus IsLocalizationDegraded::tick()
+{
+  auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
+  std::lock_guard<std::mutex> lock(ctx->context_mutex);
+  return ctx->localization_degraded ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+}
+
+// ---------------------------------------------------------------------------
+// IsDigEscalated
+// ---------------------------------------------------------------------------
+
+BT::NodeStatus IsDigEscalated::tick()
+{
+  auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
+  std::lock_guard<std::mutex> lock(ctx->context_mutex);
+  return ctx->dig_escalated ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+}
+
+// ---------------------------------------------------------------------------
 // IsLethalBoundaryViolation
 // ---------------------------------------------------------------------------
 
@@ -209,6 +260,16 @@ BT::NodeStatus IsLethalBoundaryViolation::tick()
 {
   auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
   return ctx->lethal_boundary_violation ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+}
+
+// ---------------------------------------------------------------------------
+// IsDocking
+// ---------------------------------------------------------------------------
+
+BT::NodeStatus IsDocking::tick()
+{
+  auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
+  return ctx->docking_active ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
 }
 
 // ---------------------------------------------------------------------------
@@ -309,14 +370,33 @@ BT::NodeStatus IsChargingProgressing::tick()
   auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
   std::lock_guard<std::mutex> lock(ctx->context_mutex);
 
+  const auto now = std::chrono::steady_clock::now();
+
+  // New-charge-session detection MUST run BEFORE the charger_failed_ guard, or
+  // the latch is permanent (the old clear site sat after the guard and was thus
+  // unreachable). A long gap since the last tick means the BT left the charging
+  // branch and came back — a fresh session — so clear any latched failure and
+  // force a new baseline. Also treat "not charging right now" as a session reset
+  // (the robot is no longer on the dock pulling current).
+  if (last_tick_set_)
+  {
+    const double gap = std::chrono::duration<double>(now - last_tick_time_).count();
+    if (gap > session_gap_sec_ || !ctx->latest_power.charger_enabled)
+    {
+      charger_failed_ = false;
+      baseline_set_ = false;
+    }
+  }
+  last_tick_time_ = now;
+  last_tick_set_ = true;
+
   // Once a charger failure is detected, keep returning FAILURE until the
-  // next charging session resets the node via a fresh baseline.
+  // next charging session resets the node (above) via a fresh baseline.
   if (charger_failed_)
   {
     return BT::NodeStatus::FAILURE;
   }
 
-  const auto now = std::chrono::steady_clock::now();
   const float current_battery = ctx->battery_percent;
 
   if (!baseline_set_)
@@ -472,11 +552,31 @@ BT::NodeStatus PreFlightCheck::tick()
     }
   }
 
+  // ── 6. Firmware compatibility ────────────────────────────────────────────
+  // hardware_bridge handshakes the STM32 on connect and reports whether the
+  // firmware's wire-protocol version matches this image. An incompatible (or
+  // too-old-to-answer) firmware could misread blade/emergency/odom packets, so
+  // block undock/mow until the operator reflashes.
+  {
+    std::lock_guard<std::mutex> lock(ctx->context_mutex);
+    if (!ctx->latest_status.firmware_compatible)
+    {
+      const std::string& ver = ctx->latest_status.firmware_version;
+      char buf[96];
+      snprintf(buf,
+               sizeof(buf),
+               "firmware-incompatible (fw=%s proto=%u — reflash)",
+               ver.empty() ? "?" : ver.c_str(),
+               static_cast<unsigned>(ctx->latest_status.firmware_protocol_version));
+      failures.emplace_back(buf);
+    }
+  }
+
   // ── Verdict ──────────────────────────────────────────────────────────────
   if (failures.empty())
   {
     RCLCPP_INFO(ctx->node->get_logger(),
-                "PreFlightCheck PASS: battery=%.1f%% fix=%u area-ok tf-ok",
+                "PreFlightCheck PASS: battery=%.1f%% fix=%u area-ok tf-ok fw-ok",
                 battery,
                 fix_type);
     return BT::NodeStatus::SUCCESS;
@@ -679,8 +779,7 @@ BT::NodeStatus WasRecentlyInCollisionStop::tick()
   }
 
   const auto now = std::chrono::steady_clock::now();
-  const double age_sec =
-      std::chrono::duration<double>(now - ctx->last_collision_stop_end).count();
+  const double age_sec = std::chrono::duration<double>(now - ctx->last_collision_stop_end).count();
   if (age_sec <= max_age_sec)
   {
     RCLCPP_INFO(ctx->node->get_logger(),
@@ -691,6 +790,139 @@ BT::NodeStatus WasRecentlyInCollisionStop::tick()
     return BT::NodeStatus::SUCCESS;
   }
   return BT::NodeStatus::FAILURE;
+}
+
+BT::NodeStatus IsScanStale::tick()
+{
+  auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
+
+  double max_age_sec = 1.0;
+  if (auto res = getInput<double>("max_age_sec"))
+  {
+    max_age_sec = res.value();
+  }
+
+  std::lock_guard<std::mutex> lock(ctx->context_mutex);
+
+  // No scan EVER received this session → no-LiDAR install (or LiDAR still
+  // booting). The guard stays inert — it only arms once a real stream has
+  // existed and then died.
+  if (ctx->last_scan_time.time_since_epoch().count() == 0)
+  {
+    return BT::NodeStatus::FAILURE;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  const double age_sec = std::chrono::duration<double>(now - ctx->last_scan_time).count();
+  if (age_sec > max_age_sec)
+  {
+    RCLCPP_ERROR_THROTTLE(ctx->node->get_logger(),
+                          *ctx->node->get_clock(),
+                          5000,
+                          "IsScanStale: /scan_collision silent for %.1fs (>%.1fs) — "
+                          "LiDAR/scan-filter chain is DEAD, halting mowing (blade off)",
+                          age_sec,
+                          max_age_sec);
+    return BT::NodeStatus::SUCCESS;
+  }
+  return BT::NodeStatus::FAILURE;
+}
+
+BT::NodeStatus IsCollisionStopSustained::tick()
+{
+  auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
+
+  double min_duration_sec = 60.0;
+  if (auto res = getInput<double>("min_duration_sec"))
+  {
+    min_duration_sec = res.value();
+  }
+  double max_state_age_sec = 3.0;
+  if (auto res = getInput<double>("max_state_age_sec"))
+  {
+    max_state_age_sec = res.value();
+  }
+
+  std::lock_guard<std::mutex> lock(ctx->context_mutex);
+
+  // CollisionMonitorState::STOP == 1 (same constant IsObstacleStuck reads).
+  if (ctx->collision_action_type != 1)
+  {
+    return BT::NodeStatus::FAILURE;
+  }
+  if (ctx->collision_stop_since.time_since_epoch().count() == 0)
+  {
+    return BT::NodeStatus::FAILURE;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+
+  // FRESHNESS GATE (field 2026-07-23 deadlock): collision_monitor only
+  // processes — and republishes state — while cmd_vel_nav flows. Once this
+  // guard halts the tree, Nav2 goes silent, the monitor goes silent, and
+  // collision_action_type becomes a stale latch: without this gate the STOP
+  // held forever (268 s observed) and the guard never released. A stale
+  // latch is "unknown", not "still stopped" — release the guard; if the
+  // obstacle is still there, the resumed cmd_vel flow makes the monitor
+  // re-publish STOP within one cycle and the subscriber re-stamps a fresh
+  // episode (see the stale-gap re-stamp in behavior_tree_node.cpp).
+  if (ctx->last_collision_state_time.time_since_epoch().count() == 0 ||
+      std::chrono::duration<double>(now - ctx->last_collision_state_time).count() >
+          max_state_age_sec)
+  {
+    return BT::NodeStatus::FAILURE;
+  }
+
+  const double stop_age_sec =
+      std::chrono::duration<double>(now - ctx->collision_stop_since).count();
+  if (stop_age_sec >= min_duration_sec)
+  {
+    RCLCPP_WARN_THROTTLE(ctx->node->get_logger(),
+                         *ctx->node->get_clock(),
+                         5000,
+                         "IsCollisionStopSustained: collision_monitor STOP held %.1fs "
+                         "(≥%.1fs) — halting mowing (blade off) until it clears",
+                         stop_age_sec,
+                         min_duration_sec);
+    return BT::NodeStatus::SUCCESS;
+  }
+  return BT::NodeStatus::FAILURE;
+}
+
+// ---------------------------------------------------------------------------
+// IsCoverageStartBlocked
+// ---------------------------------------------------------------------------
+
+BT::NodeStatus IsCoverageStartBlocked::tick()
+{
+  auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
+
+  // Consume: one blocked pass fires the recovery branch exactly once.
+  // Not guarded by context_mutex — coverage_start_blocked is written by
+  // FollowStrip from the BT tick itself, on the same MutuallyExclusive callback
+  // group (see the thread-safety comment in bt_context.hpp).
+  if (!ctx->coverage_start_blocked)
+  {
+    return BT::NodeStatus::FAILURE;
+  }
+  ctx->coverage_start_blocked = false;
+
+  // ARM the bounded escape motion (issue #487 follow-up). This is the ONLY
+  // place the token is set, so the escape provably cannot fire on any failure
+  // other than a confirmed START_OCCUPIED-with-zero-progress pass.
+  // EscapeStartBlocked consumes it, and refuses a token older than
+  // kStartBlockedEscapeArmMaxAgeSec.
+  ctx->start_blocked_escape_armed = true;
+  ctx->start_blocked_escape_armed_time = std::chrono::steady_clock::now();
+
+  RCLCPP_WARN(ctx->node->get_logger(),
+              "IsCoverageStartBlocked: the last coverage pass was refused from the robot's own "
+              "pose (START_OCCUPIED on every sub-path, 0 swaths mowed) — running the recovery "
+              "(stop, blade off, bounded escape nudge, clear costmaps, wait) before retrying. "
+              "NOTE: clearing the costmaps only helps if the lethal cell came from a TRANSIENT "
+              "obstacle reading; a keepout zone is a static costmap FILTER and survives the "
+              "clear, which is why the escape motion exists");
+  return BT::NodeStatus::SUCCESS;
 }
 
 }  // namespace mowgli_behavior

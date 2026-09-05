@@ -71,6 +71,7 @@ RUN . /opt/ros/kilted/setup.sh && \
         -DBUILD_TUTORIALS=OFF \
         -DBUILD_DOC=OFF \
         -DALLOW_PARALLELIZATION=ON \
+        -DCMAKE_CXX_FLAGS=-DALLOW_PARALLELIZATION \
         -DBUILD_SHARED_LIBS=ON \
  && make -j$(nproc) install
 
@@ -163,77 +164,6 @@ RUN . /opt/ros/kilted/setup.sh \
  && rm -rf /ws/build /ws/log /ws/src
 
 # =============================================================================
-# Stage 0d: nav2-mppi-patched-builder
-# Rebuilds nav2_mppi_controller from the upstream Kilted source with our local
-# arc-length path-progress patch (ros2/patches/, backport of upstream PR #6055,
-# fixes issue #5925). Kilted's apt package (ros-kilted-nav2-mppi-controller
-# 1.4.2) still has the Euclidean findPathFurthestReachedPoint(), which makes
-# MPPI cut corners / "lose" the swath at the tight reversals on coverage paths
-# (~180-degree swath flips, concentric headland-ring reversals).
-#
-# The patched package is built as a STANDALONE overlay into
-# /opt/nav2_mppi_patched, COPY'd into the runtime stage, and sourced by
-# ros2_entrypoint.sh AFTER /opt/ros/kilted but BEFORE the workspace overlay so
-# it shadows the apt-installed system package without rebuilding our own
-# workspace against it.
-#
-# Pinned to navigation2 kilted @ 71a1d84 (= nav2_mppi_controller 1.4.2, the
-# version the apt package ships). If the SHA is bumped, re-verify the patch
-# still applies (see ros2/patches/README.md). REMOVE this whole stage once
-# Kilted ships PR #6055 — otherwise it silently shadows a future fixed
-# nav2_mppi_controller with our stale 1.4.2 build.
-# =============================================================================
-FROM ros:kilted-ros-base AS nav2-mppi-patched-builder
-
-ARG DEBIAN_FRONTEND=noninteractive
-ARG NAV2_REF=kilted
-ARG NAV2_SHA=71a1d84f49dc48e226c96619188ee12054824ff3
-ARG NAV2_URL=https://github.com/ros-navigation/navigation2.git
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential cmake git patch \
-      python3-colcon-common-extensions \
-      ros-kilted-nav2-core \
-      ros-kilted-nav2-costmap-2d \
-      ros-kilted-nav2-util \
-      ros-kilted-nav2-msgs \
-      ros-kilted-nav2-controller \
- && rm -rf /var/lib/apt/lists/*
-
-# Sparse-checkout just nav2_mppi_controller from the pinned navigation2 ref.
-WORKDIR /ws/src
-RUN git clone --filter=blob:none --sparse ${NAV2_URL} navigation2 \
- && cd navigation2 \
- && git sparse-checkout set nav2_mppi_controller \
- && git checkout ${NAV2_SHA}
-
-# Apply the local arc-length path-progress patch (PR #6055 backport). Use
-# `patch`, NOT `git apply`: in this blob-filtered + sparse clone `git apply`
-# silently NO-OPs (exit 0, file unchanged) because it can't reconcile the
-# index blob hashes — that would ship an UNPATCHED controller. The grep after
-# patching is a fail-fast guard so a future silent miss breaks the build
-# instead of regressing MPPI to corner-cutting behaviour.
-COPY patches/nav2_mppi_controller-findPathFurthestReachedPoint-arclength.patch /tmp/mppi.patch
-RUN cd /ws/src/navigation2/nav2_mppi_controller \
- && patch -p1 < /tmp/mppi.patch \
- && grep -q 'path_integrated_dists' include/nav2_mppi_controller/tools/utils.hpp \
- && echo "Applied + verified nav2_mppi_controller arc-length patch"
-
-# Build the single patched package into a standalone overlay prefix. The
-# resulting libmppi_controller.so + plugin manifest live under
-# /opt/nav2_mppi_patched and take precedence once the overlay is sourced.
-WORKDIR /ws
-RUN /bin/bash -c "\
-    source /opt/ros/kilted/setup.bash && \
-    colcon build --merge-install \
-      --packages-select nav2_mppi_controller \
-      --install-base /opt/nav2_mppi_patched \
-      --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -Wno-dev \
-      --parallel-workers \$(nproc) \
-    " \
- && rm -rf /ws/build /ws/log /ws/src
-
-# =============================================================================
 # Stage 1: base
 # Installs all runtime ROS2 dependencies. Both runtime and simulation stages
 # inherit from here, keeping the image lean.
@@ -241,6 +171,11 @@ RUN /bin/bash -c "\
 FROM ros:kilted-ros-base AS base
 
 ARG DEBIAN_FRONTEND=noninteractive
+
+# LOCAL-ONLY (do not commit): this Docker host has no IPv6 route, so apt's
+# default IPv6-first to ports.ubuntu.com times out. Force IPv4 for all apt in
+# the base-derived stages.
+RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Navigation
@@ -316,13 +251,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-websockets \
  && rm -rf /var/lib/apt/lists/*
 
-# Pull source-built GTSAM 4.3a1 into /opt/gtsam, register its lib
-# directory with ldconfig, and expose the CMake config dir so
-# find_package(GTSAM) resolves without extra hints. GTSAM's runtime
-# .so links against libboost-* and libmetis5, both already present.
+# Pull source-built GTSAM 4.3a1 into /opt/gtsam and register its lib
+# directory with ldconfig. The full workspace build re-exports the
+# external CMake prefixes explicitly before colcon so the overlay setup
+# scripts cannot drop them.
 COPY --from=gtsam-builder /opt/gtsam /opt/gtsam
 RUN echo '/opt/gtsam/lib' > /etc/ld.so.conf.d/gtsam.conf && ldconfig
-ENV CMAKE_PREFIX_PATH=/opt/gtsam:${CMAKE_PREFIX_PATH}
 
 # Coverage runs on Fields2Cover v3 (Phase 1b). Pull BOTH source-built trees in
 # but ldconfig ONLY v3 — they share the SONAME libFields2Cover.so, so exactly
@@ -364,40 +298,47 @@ WORKDIR /ros2_ws
 
 # Copy only package.xml + CMakeLists.txt to resolve rosdep deps (cache layer).
 # This ensures the expensive rosdep install is only re-run when package
-# definitions change, NOT when source code changes.
-COPY src/mowgli_interfaces/package.xml    src/mowgli_interfaces/package.xml
-COPY src/mowgli_interfaces/CMakeLists.txt src/mowgli_interfaces/CMakeLists.txt
-COPY src/mowgli_hardware/package.xml      src/mowgli_hardware/package.xml
-COPY src/mowgli_hardware/CMakeLists.txt   src/mowgli_hardware/CMakeLists.txt
-COPY src/mowgli_localization/package.xml  src/mowgli_localization/package.xml
-COPY src/mowgli_localization/CMakeLists.txt src/mowgli_localization/CMakeLists.txt
-COPY src/mowgli_map/package.xml           src/mowgli_map/package.xml
-COPY src/mowgli_map/CMakeLists.txt        src/mowgli_map/CMakeLists.txt
-COPY src/mowgli_nav2_plugins/package.xml  src/mowgli_nav2_plugins/package.xml
-COPY src/mowgli_nav2_plugins/CMakeLists.txt src/mowgli_nav2_plugins/CMakeLists.txt
-COPY src/mowgli_behavior/package.xml      src/mowgli_behavior/package.xml
-COPY src/mowgli_behavior/CMakeLists.txt   src/mowgli_behavior/CMakeLists.txt
-COPY src/mowgli_monitoring/package.xml    src/mowgli_monitoring/package.xml
-COPY src/mowgli_monitoring/CMakeLists.txt src/mowgli_monitoring/CMakeLists.txt
-COPY src/mowgli_simulation/package.xml    src/mowgli_simulation/package.xml
-COPY src/mowgli_simulation/CMakeLists.txt src/mowgli_simulation/CMakeLists.txt
-COPY src/mowgli_bringup/package.xml       src/mowgli_bringup/package.xml
-COPY src/mowgli_bringup/CMakeLists.txt    src/mowgli_bringup/CMakeLists.txt
-COPY src/fusion_graph/package.xml         src/fusion_graph/package.xml
-COPY src/fusion_graph/CMakeLists.txt      src/fusion_graph/CMakeLists.txt
+# definitions change, NOT when source code changes. The Docker build context
+# is the monorepo root so we can also pull the sidecar tools/motor package.
+COPY ros2/src/mowgli_interfaces/package.xml    src/mowgli_interfaces/package.xml
+COPY ros2/src/mowgli_interfaces/CMakeLists.txt src/mowgli_interfaces/CMakeLists.txt
+COPY ros2/src/mowgli_hardware/package.xml      src/mowgli_hardware/package.xml
+COPY ros2/src/mowgli_hardware/CMakeLists.txt   src/mowgli_hardware/CMakeLists.txt
+COPY ros2/src/mowgli_localization/package.xml  src/mowgli_localization/package.xml
+COPY ros2/src/mowgli_localization/CMakeLists.txt src/mowgli_localization/CMakeLists.txt
+COPY ros2/src/mowgli_map/package.xml           src/mowgli_map/package.xml
+COPY ros2/src/mowgli_map/CMakeLists.txt        src/mowgli_map/CMakeLists.txt
+COPY ros2/src/mowgli_nav2_plugins/package.xml  src/mowgli_nav2_plugins/package.xml
+COPY ros2/src/mowgli_nav2_plugins/CMakeLists.txt src/mowgli_nav2_plugins/CMakeLists.txt
+COPY ros2/src/mowgli_behavior/package.xml      src/mowgli_behavior/package.xml
+COPY ros2/src/mowgli_behavior/CMakeLists.txt   src/mowgli_behavior/CMakeLists.txt
+COPY ros2/src/mowgli_monitoring/package.xml    src/mowgli_monitoring/package.xml
+COPY ros2/src/mowgli_monitoring/CMakeLists.txt src/mowgli_monitoring/CMakeLists.txt
+COPY ros2/src/mowgli_leds/package.xml          src/mowgli_leds/package.xml
+COPY ros2/src/mowgli_leds/CMakeLists.txt      src/mowgli_leds/CMakeLists.txt
+COPY ros2/src/mowgli_simulation/package.xml    src/mowgli_simulation/package.xml
+COPY ros2/src/mowgli_simulation/CMakeLists.txt src/mowgli_simulation/CMakeLists.txt
+COPY ros2/src/mowgli_bringup/package.xml       src/mowgli_bringup/package.xml
+COPY ros2/src/mowgli_bringup/CMakeLists.txt    src/mowgli_bringup/CMakeLists.txt
+COPY ros2/src/fusion_graph/package.xml         src/fusion_graph/package.xml
+COPY ros2/src/fusion_graph/CMakeLists.txt      src/fusion_graph/CMakeLists.txt
 # fusion_graph is the opt-in factor-graph replacement for ekf_map_node;
 # depends on libgtsam-dev installed in the base stage.
-COPY src/mowgli_coverage/package.xml      src/mowgli_coverage/package.xml
-COPY src/mowgli_coverage/CMakeLists.txt   src/mowgli_coverage/CMakeLists.txt
+COPY ros2/src/mowgli_coverage/package.xml      src/mowgli_coverage/package.xml
+COPY ros2/src/mowgli_coverage/CMakeLists.txt   src/mowgli_coverage/CMakeLists.txt
 # opennav_coverage submodule provides opennav_coverage_msgs (action types
 # consumed by mowgli_coverage). Pulled by checkout submodules: recursive.
-COPY src/opennav_coverage/opennav_coverage_msgs/package.xml    src/opennav_coverage/opennav_coverage_msgs/package.xml
-COPY src/opennav_coverage/opennav_coverage_msgs/CMakeLists.txt src/opennav_coverage/opennav_coverage_msgs/CMakeLists.txt
+COPY ros2/src/opennav_coverage/opennav_coverage_msgs/package.xml    src/opennav_coverage/opennav_coverage_msgs/package.xml
+COPY ros2/src/opennav_coverage/opennav_coverage_msgs/CMakeLists.txt src/opennav_coverage/opennav_coverage_msgs/CMakeLists.txt
 # universal-gnss is vendored as a git submodule under ros2/src/external.
 # gnss_ros2 is the only colcon package; its sibling gnss_* libraries are
 # plain CMake subdirectories pulled in at build time from the same repo root.
-COPY src/external/universal-gnss/gnss_ros2/package.xml    src/external/universal-gnss/gnss_ros2/package.xml
-COPY src/external/universal-gnss/gnss_ros2/CMakeLists.txt src/external/universal-gnss/gnss_ros2/CMakeLists.txt
+COPY ros2/src/external/universal-gnss/gnss_ros2/package.xml    src/external/universal-gnss/gnss_ros2/package.xml
+COPY ros2/src/external/universal-gnss/gnss_ros2/CMakeLists.txt src/external/universal-gnss/gnss_ros2/CMakeLists.txt
+# operator-side drivetrain tools live outside ros2/src but must still be built
+# into the runtime workspace as the ROS 2 package mowgli_tools.
+COPY tools/motor/package.xml    src/mowgli_tools/package.xml
+COPY tools/motor/CMakeLists.txt src/mowgli_tools/CMakeLists.txt
 
 # Resolve rosdep dependencies (cached until package.xml changes)
 RUN rosdep update --rosdistro kilted \
@@ -416,7 +357,7 @@ RUN rosdep update --rosdistro kilted \
 FROM deps AS build-interfaces
 
 # Copy the full mowgli_interfaces package
-COPY src/mowgli_interfaces/ src/mowgli_interfaces/
+COPY ros2/src/mowgli_interfaces/ src/mowgli_interfaces/
 
 RUN /bin/bash -c "\
     source /opt/ros/kilted/setup.bash && \
@@ -434,8 +375,9 @@ FROM build-interfaces AS build
 
 ARG BUILD_TYPE=Release
 
-# Now copy the rest of the source tree
-COPY src/ src/
+# Now copy the rest of the source tree plus the sidecar tools package
+COPY ros2/src/ src/
+COPY tools/motor/ src/mowgli_tools/
 
 # Skip every opennav_coverage subpackage except _msgs. The upstream server
 # is pinned to F2C 1.2.1 (no TrapezoidalDecomp / generateHeadlandSwaths /
@@ -449,13 +391,21 @@ RUN touch \
       src/opennav_coverage/opennav_coverage_navigator/COLCON_IGNORE \
       src/opennav_coverage/opennav_row_coverage/COLCON_IGNORE
 
+RUN /bin/bash -c "\
+    f2c_config=\$(find /opt/fields2cover-300 -type f \( -name 'Fields2CoverConfig.cmake' -o -name 'fields2cover-config.cmake' \) | head -n 1) && \
+    test -n \"\${f2c_config}\" && \
+    echo \"Fields2Cover config: \${f2c_config}\" \
+    "
+
 # Build all packages (mowgli_interfaces is already built and cached)
 RUN /bin/bash -c "\
     source /opt/ros/kilted/setup.bash && \
     source install/setup.bash && \
+    export CMAKE_PREFIX_PATH=/opt/fields2cover-300:/opt/gtsam:\${CMAKE_PREFIX_PATH:-} && \
+    export MAKEFLAGS=-j3 && \
     colcon build \
       --cmake-args -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_TESTING=OFF \
-      --parallel-workers \$(nproc) \
+      --parallel-workers 2 \
       --event-handlers console_cohesion+ \
     "
 
@@ -496,36 +446,29 @@ COPY --from=build /ros2_ws/install/ install/
 # every client reconnect. Sourced by ros2_entrypoint.sh as a ROS overlay.
 COPY --from=ublox-msgs-builder /ws/install /opt/ublox_msgs
 
-# Pull the patched nav2_mppi_controller (arc-length path progress, PR #6055
-# backport — see ros2/patches/). Sourced by ros2_entrypoint.sh AFTER
-# /opt/ros/kilted so it shadows the apt-installed system MPPI controller.
-# REMOVE once Kilted ships the fix (see ros2/patches/README.md).
-COPY --from=nav2-mppi-patched-builder /opt/nav2_mppi_patched /opt/nav2_mppi_patched
-
 # Copy all launch files and config from every package
-COPY src/mowgli_bringup/launch/    /ros2_ws/install/mowgli_bringup/share/mowgli_bringup/launch/
-COPY src/mowgli_bringup/config/    /ros2_ws/install/mowgli_bringup/share/mowgli_bringup/config/
+COPY ros2/src/mowgli_bringup/launch/    /ros2_ws/install/mowgli_bringup/share/mowgli_bringup/launch/
+COPY ros2/src/mowgli_bringup/config/    /ros2_ws/install/mowgli_bringup/share/mowgli_bringup/config/
 # mowgli_localization has no launch files; nodes are brought up from
 # mowgli_bringup/navigation.launch.py. Keep the config copy so the YAML
 # files still land in the install tree.
-COPY src/mowgli_localization/config/  /ros2_ws/install/mowgli_localization/share/mowgli_localization/config/
+COPY ros2/src/mowgli_localization/config/  /ros2_ws/install/mowgli_localization/share/mowgli_localization/config/
 
 # fusion_graph ships its own launch + config used by navigation.launch.py
-# when use_fusion_graph:=true.
-COPY src/fusion_graph/launch/  /ros2_ws/install/fusion_graph/share/fusion_graph/launch/
-COPY src/fusion_graph/config/  /ros2_ws/install/fusion_graph/share/fusion_graph/config/
+COPY ros2/src/fusion_graph/launch/  /ros2_ws/install/fusion_graph/share/fusion_graph/launch/
+COPY ros2/src/fusion_graph/config/  /ros2_ws/install/fusion_graph/share/fusion_graph/config/
 
 # Use Cyclone DDS — FastRTPS shared memory causes stale /dev/shm segments
 # and unreliable service discovery on ARM boards
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 # Entrypoint script sources both ROS and workspace setups before exec'ing CMD
-COPY scripts/ros2_entrypoint.sh /ros2_entrypoint.sh
+COPY ros2/scripts/ros2_entrypoint.sh /ros2_entrypoint.sh
 RUN chmod +x /ros2_entrypoint.sh
 
 # Mow-session monitor — runs alongside the live stack to record a full
 # state timeline per mowing test (see CLAUDE.md "Mowing Session Monitoring").
-COPY scripts/mow_session_monitor.py /ros2_ws/scripts/mow_session_monitor.py
+COPY ros2/scripts/mow_session_monitor.py /ros2_ws/scripts/mow_session_monitor.py
 RUN chmod +x /ros2_ws/scripts/mow_session_monitor.py
 
 ENTRYPOINT ["/ros2_entrypoint.sh"]
@@ -535,14 +478,17 @@ CMD ["ros2", "launch", "mowgli_bringup", "mowgli.launch.py"]
 # Stage 6: simulation
 # Extends runtime with the Webots simulator for headless/web simulation.
 #
-# NOTE: This stage is mid-migration from Gazebo Ignition to Webots. The
-# Gazebo apt packages have been removed; the Webots binary + ROS2 driver
-# install steps are TODO (Phase 2 of the Webots migration). Running the
-# simulation image as-is will fail until Webots is installed here.
+# Webots R2025a is the minimum version required by the ROS 2 Kilted driver.
+# Pin the vendor package so a clean checkout builds the same simulator image.
+# Cyberbotics publishes this Linux package for amd64 only; the regular runtime
+# target remains architecture-neutral, while this simulator target fails early
+# and clearly on unsupported Linux architectures.
 # =============================================================================
 FROM runtime AS simulation
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG TARGETARCH
+ARG WEBOTS_VERSION=R2025a
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Headless rendering (sensors need a virtual display when no GPU)
@@ -555,16 +501,55 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openbox \
     xterm \
     x11-utils \
-    # TODO(webots): install Webots binary + ros-kilted-webots-ros2-driver
+    # Required by Qt 6's xcb platform plugin in the headless Linux image.
+    libxcb-cursor0 \
+    wget \
+    ca-certificates \
+    # Webots ROS 2 launcher, controller and driver
+    ros-kilted-webots-ros2 \
+ && test "${TARGETARCH}" = "amd64" \
+ && wget -q "https://github.com/cyberbotics/webots/releases/download/${WEBOTS_VERSION}/webots_2025a_amd64.deb" -O /tmp/webots.deb \
+ && apt-get install -y --no-install-recommends /tmp/webots.deb \
+ && rm -f /tmp/webots.deb \
  && rm -rf /var/lib/apt/lists/*
 
+ENV WEBOTS_HOME=/usr/local/webots
+ENV USER=root
+
+# Docker Desktop's Linux VM kernel identifies as microsoft-standard. The
+# upstream driver therefore selects its native-WSL path and attempts to use a
+# Windows-side Webots install. In this Linux container Webots is installed at
+# WEBOTS_HOME, so only the driver's Docker execution needs to opt out of that
+# detection. Native WSL remains unchanged.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+path = Path('/opt/ros/kilted/lib/python3.12/site-packages/webots_ros2_driver/utils.py')
+old = "def is_wsl():\n    return 'microsoft-standard' in uname().release\n"
+new = (
+    "def is_wsl():\n"
+    "    return False if os.path.exists('/.dockerenv') else "
+    "'microsoft-standard' in uname().release\n"
+)
+text = path.read_text()
+if old not in text:
+    raise SystemExit(f'Unexpected webots_ros2_driver is_wsl() implementation: {path}')
+path.write_text(text.replace(old, new))
+PY
+
+# Windows checkouts can retain CRLF in Python script shebangs.  These
+# executable simulation helpers are copied into the colcon install tree before
+# this stage; Linux would otherwise interpret their interpreter as `python3\r`.
+RUN find /ros2_ws/install/mowgli_simulation/lib/mowgli_simulation \
+      -type f -name '*.py' -exec sed -i 's/\r$//' {} +
+
 # Copy VNC startup script
-COPY scripts/start_vnc.sh /ros2_ws/scripts/start_vnc.sh
+COPY ros2/scripts/start_vnc.sh /ros2_ws/scripts/start_vnc.sh
 RUN chmod +x /ros2_ws/scripts/start_vnc.sh
 
 
 # Copy Foxglove layout for easy import
-COPY foxglove/ /ros2_ws/foxglove/
+COPY ros2/foxglove/ /ros2_ws/foxglove/
 
 # Foxglove Bridge WebSocket port
 EXPOSE 8765

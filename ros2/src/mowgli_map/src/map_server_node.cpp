@@ -34,6 +34,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/bool.hpp>
 
+#include "mowgli_map/internal_helpers.hpp"
 #include <grid_map_core/GridMap.hpp>
 #include <grid_map_core/GridMapMath.hpp>
 #include <grid_map_core/iterators/CircleIterator.hpp>
@@ -56,6 +57,18 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
   map_size_y_ = declare_parameter<double>("map_size_y", 20.0);
   map_frame_ = declare_parameter<std::string>("map_frame", "map");
   tool_width_ = declare_parameter<double>("tool_width", 0.18);
+  // Wheel-slip dig keepout (see on_dig_event). The keepout is stamped as a
+  // PENDING proposal - live in the mask for this session, never written to
+  // areas.dat until the operator accepts it.
+  //
+  // Size: it used to default to one tool width (0.18 m), which is NARROWER
+  // THAN THE CHASSIS (0.60 m x 0.40 m footprint). Issue #500 recorded the
+  // consequence: 3 dig latches in 18.4 s within 0.13 m - the escape reverses
+  // and the controller drives the body straight back over a keepout the body
+  // does not fit around. Default is now kDefaultDigKeepoutSizeM, one chassis
+  // length, so routing around the patch actually clears it.
+  dig_obstacle_enabled_ = declare_parameter<bool>("dig_obstacle_enabled", true);
+  dig_obstacle_size_ = declare_parameter<double>("dig_obstacle_size", kDefaultDigKeepoutSizeM);
   yaw_convergence_threshold_rad_ =
       declare_parameter<double>("yaw_convergence_threshold_rad", 0.00873);  // 0.5°
   yaw_convergence_window_s_ = declare_parameter<double>("yaw_convergence_window_s", 5.0);
@@ -63,8 +76,21 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
       static_cast<size_t>(declare_parameter<int>("yaw_convergence_min_samples", 20));
   map_file_path_ = declare_parameter<std::string>("map_file_path", "");
   areas_file_path_ = declare_parameter<std::string>("areas_file_path", "");
+  // WGS84 datum the map frame is anchored to — injected at launch from
+  // mowgli_robot.yaml (same source navsat_to_absolute_pose_node projects
+  // GPS fixes with). Drives the areas.dat datum stamp and the on-load
+  // datum-change migration (issue #216). 0/0 = unset.
+  datum_lat_ = declare_parameter<double>("datum_lat", 0.0);
+  datum_lon_ = declare_parameter<double>("datum_lon", 0.0);
+  robot_yaml_path_ = declare_parameter<std::string>("robot_yaml_path", kRuntimeRobotYaml);
   publish_rate_ = declare_parameter<double>("publish_rate", 1.0);
-  keepout_nav_margin_ = declare_parameter<double>("keepout_nav_margin", 1.5);
+  mow_progress_publish_period_s_ = declare_parameter<double>("mow_progress_publish_period_s", 2.0);
+  mow_progress_tool_frame_ =
+      declare_parameter<std::string>("mow_progress_tool_frame", "blade_link");
+  mow_progress_min_blade_rpm_ = declare_parameter<double>("mow_progress_min_blade_rpm", 1000.0);
+  mow_progress_blade_telemetry_max_age_s_ =
+      declare_parameter<double>("mow_progress_blade_telemetry_max_age_s", 1.0);
+  keepout_nav_margin_ = declare_parameter<double>("keepout_nav_margin", 0.45);
   // Hard area-boundary enforcement: when true (operator default), the keepout
   // mask marks every cell OUTSIDE the union of all areas (mowing + navigation)
   // as LETHAL — the planner cannot route there and MPPI cannot steer out of
@@ -73,7 +99,7 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
   // the legacy keepout_nav_margin_ free band governs. See the field note on the
   // 0.32 m concave-boundary excursion (project_coverage_boundary_excursion).
   lethal_outside_areas_ = declare_parameter<bool>("lethal_outside_areas", true);
-  enforce_boundary_margin_m_ = declare_parameter<double>("enforce_boundary_margin_m", 0.25);
+  enforce_boundary_margin_m_ = declare_parameter<double>("enforce_boundary_margin_m", 0.40);
   // Two-tier boundary: if the robot is outside every defined area, we
   // publish /boundary_violation (BT attempts a recovery back inside). If
   // the robot is further than lethal_boundary_margin beyond any area
@@ -107,8 +133,8 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
   boundary_debounce_samples_ =
       static_cast<int>(declare_parameter<int>("boundary_debounce_samples", 3));
   boundary_recovery_offset_m_ = declare_parameter<double>("boundary_recovery_offset_m", 0.8);
-  boundary_inner_margin_m_ = declare_parameter<double>("boundary_inner_margin_m", 0.3);
-  strip_boundary_margin_m_ = declare_parameter<double>("strip_boundary_margin_m", 0.5);
+  boundary_inner_margin_m_ = declare_parameter<double>("boundary_inner_margin_m", 0.0);
+  strip_boundary_margin_m_ = declare_parameter<double>("strip_boundary_margin_m", 1.20);
   mow_angle_override_deg_ =
       declare_parameter<double>("mow_angle_deg", std::numeric_limits<double>::quiet_NaN());
 
@@ -121,6 +147,10 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
   chassis_width_m_ = declare_parameter<double>("chassis_width", 0.40);
   bypass_safety_margin_m_ = declare_parameter<double>("bypass_safety_margin_m", 0.05);
   bypass_max_length_m_ = declare_parameter<double>("max_obstacle_avoidance_distance", 2.0);
+  // Extra LETHAL band around drawn obstacle polygons in the keepout mask.
+  // Same key drives coverage_server's F2C hole buffering (injected at launch
+  // from mowgli_robot.yaml.obstacle_margin) — keep the two in lockstep.
+  obstacle_margin_m_ = std::clamp(declare_parameter<double>("obstacle_margin", 0.15), 0.0, 1.0);
 
   // Dock body (physical structure the robot cannot drive into). Cells
   // inside are marked OBSTACLE_PERMANENT — F2C strips stop at the body
@@ -165,8 +195,6 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
   init_map();
 
   // ── Publishers ───────────────────────────────────────────────────────────
-  grid_map_pub_ = create_publisher<grid_map_msgs::msg::GridMap>("~/grid_map", rclcpp::QoS(1));
-
   // Mowed-area progress overlay. transient_local so the GUI receives the latest
   // accumulated coverage immediately on (re)connect.
   mow_progress_pub_ =
@@ -182,11 +210,6 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
 
   keepout_mask_pub_ =
       create_publisher<nav_msgs::msg::OccupancyGrid>("/keepout_mask", transient_qos);
-
-  speed_filter_info_pub_ =
-      create_publisher<nav2_msgs::msg::CostmapFilterInfo>("/speed_filter_info", transient_qos);
-
-  speed_mask_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>("/speed_mask", transient_qos);
 
   // ── Subscribers ──────────────────────────────────────────────────────────
   occupancy_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
@@ -222,7 +245,7 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
   // obstacles (separate concern: review/approve + survive restarts).
   const auto costmap_topic =
       declare_parameter<std::string>("costmap_topic", "/global_costmap/costmap");
-  costmap_obstacle_threshold_ = declare_parameter<int>("costmap_obstacle_threshold", 80);
+  costmap_obstacle_threshold_ = declare_parameter<int>("costmap_obstacle_threshold", 99);
   costmap_max_age_s_ = declare_parameter<double>("costmap_max_age_s", 2.0);
   costmap_sub_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
       costmap_topic,
@@ -362,6 +385,25 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
         on_obstacles(std::move(msg));
       });
 
+  // ── Wheel-slip dig reports (hardware_bridge_node) ─────────────────────
+  // The bridge detects the robot digging a hole (wheels turning, GNSS pose
+  // not moving), hard-stops and reverses out. We stamp a PENDING keepout at
+  // that location so the next coverage pass routes around it instead of
+  // driving back into the same patch; making it permanent is the operator's
+  // call (~/promote_obstacle{pending_id}). TRANSIENT_LOCAL matches the
+  // bridge's publisher so a dig that happened while we were restarting
+  // still lands.
+  if (dig_obstacle_enabled_)
+  {
+    dig_event_sub_ = create_subscription<mowgli_interfaces::msg::DigEvent>(
+        "/hardware_bridge/dig_event",
+        rclcpp::QoS(10).transient_local(),
+        [this](mowgli_interfaces::msg::DigEvent::ConstSharedPtr msg)
+        {
+          on_dig_event(std::move(msg));
+        });
+  }
+
   promote_obstacle_srv_ = create_service<mowgli_interfaces::srv::PromoteObstacle>(
       "~/promote_obstacle",
       [this](const mowgli_interfaces::srv::PromoteObstacle::Request::SharedPtr req,
@@ -370,30 +412,20 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
         on_promote_obstacle(req, res);
       });
 
-  // ── Load pre-defined areas from parameters ────────────────────────────
-  load_areas_from_params();
-
-  // ── Auto-load persisted areas from file (overrides parameter areas) ───
-  if (!areas_file_path_.empty())
-  {
-    try
-    {
-      load_areas_from_file(areas_file_path_);
-      RCLCPP_INFO(get_logger(), "Loaded persisted areas from %s", areas_file_path_.c_str());
-    }
-    catch (const std::exception& ex)
-    {
-      RCLCPP_WARN(get_logger(), "No persisted areas to load: %s", ex.what());
-    }
-  }
-
-  // Resize map to fit loaded areas (if any).
-  resize_map_to_areas();
+  discard_obstacle_srv_ = create_service<mowgli_interfaces::srv::ClearObstacle>(
+      "~/discard_obstacle",
+      [this](const mowgli_interfaces::srv::ClearObstacle::Request::SharedPtr req,
+             mowgli_interfaces::srv::ClearObstacle::Response::SharedPtr res)
+      {
+        on_discard_obstacle(req, res);
+      });
 
   // Dock pose: single source of truth is mowgli_robot.yaml. Calibration
   // (calibrate_imu_yaw_node) and manual GUI placement (~/set_docking_point
   // below) write back to that file, so the parameters declared here are
-  // always the latest persisted values.
+  // always the latest persisted values. Read BEFORE the areas-file load so
+  // the datum-change migration inside load_areas_from_file can re-project
+  // the dock pose together with the area polygons (issue #216).
   double dock_x = declare_parameter<double>("dock_pose_x", 0.0);
   double dock_y = declare_parameter<double>("dock_pose_y", 0.0);
   double dock_yaw = declare_parameter<double>("dock_pose_yaw", 0.0);
@@ -415,6 +447,26 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
                 dock_yaw);
   }
 
+  // ── Load pre-defined areas from parameters ────────────────────────────
+  load_areas_from_params();
+
+  // ── Auto-load persisted areas from file (overrides parameter areas) ───
+  if (!areas_file_path_.empty())
+  {
+    try
+    {
+      load_areas_from_file(areas_file_path_);
+      RCLCPP_INFO(get_logger(), "Loaded persisted areas from %s", areas_file_path_.c_str());
+    }
+    catch (const std::exception& ex)
+    {
+      RCLCPP_WARN(get_logger(), "No persisted areas to load: %s", ex.what());
+    }
+  }
+
+  // Resize map to fit loaded areas (if any).
+  resize_map_to_areas();
+
   // Publish docking pose if available (transient_local ensures late subscribers get it).
   if (docking_pose_set_)
   {
@@ -424,72 +476,7 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
     pose_msg.pose = docking_pose_;
     docking_pose_pub_->publish(pose_msg);
 
-    // Build the three coupled dock polygons. All three rectangles live in
-    // the dock's local frame (origin at docking_pose_, +X forward) and are
-    // rotated into the map frame using d_yaw.
-    //
-    //   * body     — physical dock structure: from -dock_body_length_m
-    //                (rear of body, behind dock origin) to 0 along +X,
-    //                ±dock_body_width_m/2 along Y. Marks OBSTACLE_PERMANENT.
-    //   * corridor — approach lane: from -approach_back to
-    //                -dock_body_length_m along +X (i.e. immediately behind
-    //                the body), ±half_width along Y. Marks DOCKING_AREA,
-    //                carved out of keepout mask.
-    //   * exclusion — union (-approach_back to 0, ±max half-widths). Kept
-    //                 for visualization / GUI overlay only.
-    //
-    // Convention: dock_pose_ is the *docked-robot* pose (front of robot
-    // touching the dock). +X in dock-local frame points AWAY from the dock
-    // (the staging direction); the body sits in -X, behind the docked
-    // robot's reference point. The corridor extends further in -X.
-    const double body_len = dock_body_length_m_;
-    const double body_half_width = 0.5 * dock_body_width_m_;
-    const double corridor_back = dock_approach_corridor_length_m_;
-    const double corridor_half_width = dock_approach_corridor_half_width_m_;
-    const double d_x = docking_pose_.position.x;
-    const double d_y = docking_pose_.position.y;
-    const double d_yaw = 2.0 * std::atan2(docking_pose_.orientation.z, docking_pose_.orientation.w);
-    const double cy = std::cos(d_yaw);
-    const double sy = std::sin(d_yaw);
-
-    auto append_rect =
-        [&](geometry_msgs::msg::Polygon& poly, double x_min, double x_max, double y_half)
-    {
-      const double corners[][2] = {
-          {x_max, y_half},
-          {x_max, -y_half},
-          {x_min, -y_half},
-          {x_min, y_half},
-      };
-      for (const auto& c : corners)
-      {
-        geometry_msgs::msg::Point32 pt;
-        pt.x = static_cast<float>(d_x + cy * c[0] - sy * c[1]);
-        pt.y = static_cast<float>(d_y + sy * c[0] + cy * c[1]);
-        pt.z = 0.0F;
-        poly.points.push_back(pt);
-      }
-      poly.points.push_back(poly.points.front());
-    };
-
-    append_rect(dock_body_polygon_, -body_len, 0.0, body_half_width);
-    append_rect(dock_corridor_polygon_, -corridor_back, -body_len, corridor_half_width);
-    append_rect(dock_exclusion_polygon_,
-                -corridor_back,
-                0.0,
-                std::max(body_half_width, corridor_half_width));
-    has_dock_exclusion_ = true;
-    RCLCPP_INFO(get_logger(),
-                "Dock polygons: pose=(%.2f, %.2f) yaw=%.2f rad — "
-                "body %.2fm × %.2fm (OBSTACLE_PERMANENT), "
-                "corridor %.2fm × %.2fm (DOCKING_AREA, keepout carve-out)",
-                d_x,
-                d_y,
-                d_yaw,
-                body_len,
-                2.0 * body_half_width,
-                corridor_back - body_len,
-                2.0 * corridor_half_width);
+    rebuild_dock_polygons();
   }
 
   // ── Publish timer ────────────────────────────────────────────────────────
@@ -503,6 +490,81 @@ MapServerNode::MapServerNode(const rclcpp::NodeOptions& options)
                                      });
 
   RCLCPP_INFO(get_logger(), "MapServerNode ready (%zu areas loaded).", areas_.size());
+}
+
+void MapServerNode::rebuild_dock_polygons()
+{
+  // (Re)build the three coupled dock polygons. All three rectangles live in
+  // the dock's local frame (origin at docking_pose_, +X forward) and are
+  // rotated into the map frame using d_yaw.
+  //
+  //   * body     — physical dock structure: from -dock_body_length_m
+  //                (rear of body, behind dock origin) to 0 along +X,
+  //                ±dock_body_width_m/2 along Y. Marks OBSTACLE_PERMANENT.
+  //   * corridor — approach lane: from -approach_back to -dock_body_length_m
+  //                along +X (immediately behind the body), ±half_width along
+  //                Y. Marks DOCKING_AREA, carved out of keepout mask.
+  //   * exclusion — union (-approach_back to 0, ±max half-widths). Kept for
+  //                 visualization / GUI overlay only.
+  //
+  // Convention: dock_pose_ is the *docked-robot* pose (front of robot touching
+  // the dock). +X in dock-local frame points AWAY from the dock (the staging
+  // direction); the body sits in -X, behind the docked robot's reference
+  // point. The corridor extends further in -X.
+  //
+  // Clear first so a re-placement (on_set_docking_point) replaces, not appends.
+  dock_body_polygon_.points.clear();
+  dock_corridor_polygon_.points.clear();
+  dock_exclusion_polygon_.points.clear();
+
+  const double body_len = dock_body_length_m_;
+  const double body_half_width = 0.5 * dock_body_width_m_;
+  const double corridor_back = dock_approach_corridor_length_m_;
+  const double corridor_half_width = dock_approach_corridor_half_width_m_;
+  const double d_x = docking_pose_.position.x;
+  const double d_y = docking_pose_.position.y;
+  const double d_yaw = 2.0 * std::atan2(docking_pose_.orientation.z, docking_pose_.orientation.w);
+  const double cy = std::cos(d_yaw);
+  const double sy = std::sin(d_yaw);
+
+  auto append_rect =
+      [&](geometry_msgs::msg::Polygon& poly, double x_min, double x_max, double y_half)
+  {
+    const double corners[][2] = {
+        {x_max, y_half},
+        {x_max, -y_half},
+        {x_min, -y_half},
+        {x_min, y_half},
+    };
+    for (const auto& c : corners)
+    {
+      geometry_msgs::msg::Point32 pt;
+      pt.x = static_cast<float>(d_x + cy * c[0] - sy * c[1]);
+      pt.y = static_cast<float>(d_y + sy * c[0] + cy * c[1]);
+      pt.z = 0.0F;
+      poly.points.push_back(pt);
+    }
+    poly.points.push_back(poly.points.front());
+  };
+
+  append_rect(dock_body_polygon_, -body_len, 0.0, body_half_width);
+  append_rect(dock_corridor_polygon_, -corridor_back, -body_len, corridor_half_width);
+  append_rect(dock_exclusion_polygon_,
+              -corridor_back,
+              0.0,
+              std::max(body_half_width, corridor_half_width));
+  has_dock_exclusion_ = true;
+  RCLCPP_INFO(get_logger(),
+              "Dock polygons: pose=(%.2f, %.2f) yaw=%.2f rad — "
+              "body %.2fm × %.2fm (OBSTACLE_PERMANENT), "
+              "corridor %.2fm × %.2fm (DOCKING_AREA, keepout carve-out)",
+              d_x,
+              d_y,
+              d_yaw,
+              body_len,
+              2.0 * body_half_width,
+              corridor_back - body_len,
+              2.0 * corridor_half_width);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -551,7 +613,10 @@ void MapServerNode::on_occupancy_grid(nav_msgs::msg::OccupancyGrid::ConstSharedP
 
 void MapServerNode::on_mower_status(mowgli_interfaces::msg::Status::ConstSharedPtr msg)
 {
-  mow_blade_enabled_ = msg->mow_enabled;
+  mow_blade_requested_ = msg->mow_enabled;
+  mow_blade_active_ = msg->mower_esc_status != 0U;
+  mow_blade_rpm_ = msg->mower_motor_rpm;
+  mow_blade_telemetry_time_ = rclcpp::Time(msg->blade_status_stamp);
   last_is_charging_ = msg->is_charging;
   last_status_time_ = now();
 }
@@ -603,10 +668,49 @@ void MapServerNode::on_odom(nav_msgs::msg::Odometry::ConstSharedPtr /*msg*/)
   last_robot_x_ = x;
   last_robot_y_ = y;
 
-  // Accumulate the mowed footprint while the blade is running.
-  if (mow_blade_enabled_)
+  const rclcpp::Time now_t = now();
+  const bool telemetry_fresh =
+      mow_blade_telemetry_time_.nanoseconds() > 0 &&
+      (now_t - mow_blade_telemetry_time_).seconds() >= 0.0 &&
+      (now_t - mow_blade_telemetry_time_).seconds() <= mow_progress_blade_telemetry_max_age_s_;
+  const auto reason = GetMowProgressInhibitReason(mow_blade_requested_,
+                                                  telemetry_fresh,
+                                                  mow_blade_active_,
+                                                  mow_blade_rpm_,
+                                                  mow_progress_min_blade_rpm_);
+  if (reason != mow_progress_reason_)
   {
-    stamp_mow_progress(x, y);
+    RCLCPP_INFO(get_logger(),
+                "Mow-progress stamping %s: %s",
+                reason == MowProgressInhibitReason::kActive ? "enabled" : "inhibited",
+                ToString(reason));
+    mow_progress_reason_ = reason;
+  }
+
+  if (reason == MowProgressInhibitReason::kActive)
+  {
+    try
+    {
+      const auto tool_tf =
+          tf_buffer_->lookupTransform(map_frame_, mow_progress_tool_frame_, tf2::TimePointZero);
+      stamp_mow_progress(tool_tf.transform.translation.x, tool_tf.transform.translation.y);
+    }
+    catch (const tf2::TransformException& ex)
+    {
+      have_last_mow_tool_position_ = false;
+      RCLCPP_WARN_THROTTLE(get_logger(),
+                           *get_clock(),
+                           5000,
+                           "Mow-progress stamping inhibited: no %s -> %s transform: %s",
+                           map_frame_.c_str(),
+                           mow_progress_tool_frame_.c_str(),
+                           ex.what());
+    }
+  }
+  else
+  {
+    // Never sweep across a period in which cutting was unverified.
+    have_last_mow_tool_position_ = false;
   }
 
   check_boundary_violation(x, y);
@@ -740,9 +844,6 @@ void MapServerNode::on_publish_timer()
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
 
-    auto grid_map_msg = grid_map::GridMapRosConverter::toMessage(map_);
-    grid_map_pub_->publish(std::move(grid_map_msg));
-
     // Only publish masks when something changed. The publishers use
     // transient_local QoS so late subscribers (e.g. costmap_filter)
     // automatically receive the most recent mask. Republishing a
@@ -753,16 +854,26 @@ void MapServerNode::on_publish_timer()
     if (masks_dirty_)
     {
       publish_keepout_mask();
-      publish_speed_mask();
       masks_dirty_ = false;
     }
 
-    // Republish the mowed overlay only when it grew this period (transient_local
-    // keeps late subscribers up to date without re-sending an unchanged grid).
-    if (mow_progress_dirty_)
+    // Rebuild the full-extent OccupancyGrid only after coverage changed, then
+    // republish that cached message at the existing throttle interval. Foxglove
+    // WebSocket reconnects do not reliably receive transient_local history.
+    const rclcpp::Time now_t = now();
+    if (last_mow_progress_pub_time_.nanoseconds() == 0 ||
+        (now_t - last_mow_progress_pub_time_).seconds() >= mow_progress_publish_period_s_)
     {
-      publish_mow_progress();
-      mow_progress_dirty_ = false;
+      if (mow_progress_dirty_)
+      {
+        rebuild_mow_progress_cache();
+        mow_progress_dirty_ = false;
+      }
+      if (mow_progress_cache_valid_)
+      {
+        publish_cached_mow_progress();
+        last_mow_progress_pub_time_ = now_t;
+      }
     }
   }
 }
@@ -779,36 +890,103 @@ void MapServerNode::stamp_mow_progress(double x, double y)
       mow_progress_map_.getSize()(1) != map_.getSize()(1) ||
       mow_progress_map_.getPosition() != map_.getPosition())
   {
-    mow_progress_map_ = grid_map::GridMap({layer});
-    mow_progress_map_.setFrameId(map_frame_);
-    mow_progress_map_.setGeometry(map_.getLength(), map_.getResolution(), map_.getPosition());
-    mow_progress_map_[layer].setConstant(0.0F);
+    initialize_mow_progress_map();
   }
 
   const grid_map::Position center(x, y);
   const double radius = std::max(tool_width_ * 0.5, mow_progress_map_.getResolution());
-  for (grid_map::CircleIterator it(mow_progress_map_, center, radius); !it.isPastEnd(); ++it)
+  const auto stamp_disc = [this, &layer, radius](const grid_map::Position& position)
   {
-    if (mow_progress_map_.at(layer, *it) < 100.0F)
+    for (grid_map::CircleIterator it(mow_progress_map_, position, radius); !it.isPastEnd(); ++it)
     {
-      mow_progress_map_.at(layer, *it) = 100.0F;
-      mow_progress_dirty_ = true;
+      if (mow_progress_map_.at(layer, *it) < 100.0F)
+      {
+        mow_progress_map_.at(layer, *it) = 100.0F;
+        mow_progress_dirty_ = true;
+      }
+    }
+  };
+
+  if (have_last_mow_tool_position_)
+  {
+    const double distance = (center - last_mow_tool_position_).norm();
+    const size_t steps = SweepStepCount(distance, mow_progress_map_.getResolution());
+    for (size_t step = 1; step <= steps; ++step)
+    {
+      const double fraction = static_cast<double>(step) / static_cast<double>(steps);
+      stamp_disc(last_mow_tool_position_ + fraction * (center - last_mow_tool_position_));
     }
   }
+  else
+  {
+    stamp_disc(center);
+  }
+  last_mow_tool_position_ = center;
+  have_last_mow_tool_position_ = true;
 }
 
-void MapServerNode::publish_mow_progress()
+float MapServerNode::mow_progress_value_for_test(double x, double y) const
+{
+  std::lock_guard<std::mutex> lock(map_mutex_);
+  const std::string layer = "mowed";
+  grid_map::Index index;
+  if (!mow_progress_map_.exists(layer) ||
+      !mow_progress_map_.getIndex(grid_map::Position(x, y), index))
+  {
+    return 0.0F;
+  }
+  return mow_progress_map_.at(layer, index);
+}
+
+bool MapServerNode::mow_progress_cache_valid_for_test() const
+{
+  std::lock_guard<std::mutex> lock(map_mutex_);
+  return mow_progress_cache_valid_;
+}
+
+void MapServerNode::rebuild_mow_progress_cache()
 {
   const std::string layer = "mowed";
   if (!mow_progress_map_.exists(layer))
   {
+    mow_progress_cache_valid_ = false;
     return;
   }
-  nav_msgs::msg::OccupancyGrid grid;
   // 0 → unmowed (rendered transparent by the GUI), 100 → mowed. The converter
   // handles the grid_map↔OccupancyGrid index convention correctly.
-  grid_map::GridMapRosConverter::toOccupancyGrid(mow_progress_map_, layer, 0.0F, 100.0F, grid);
-  mow_progress_pub_->publish(grid);
+  grid_map::GridMapRosConverter::toOccupancyGrid(
+      mow_progress_map_, layer, 0.0F, 100.0F, mow_progress_cache_);
+  mow_progress_cache_valid_ = true;
+}
+
+void MapServerNode::publish_cached_mow_progress()
+{
+  if (mow_progress_cache_valid_)
+  {
+    mow_progress_pub_->publish(mow_progress_cache_);
+  }
+}
+
+void MapServerNode::reset_mow_progress()
+{
+  mow_progress_map_ = grid_map::GridMap();
+  mow_progress_dirty_ = false;
+  mow_progress_cache_ = nav_msgs::msg::OccupancyGrid();
+  mow_progress_cache_valid_ = false;
+  last_mow_progress_pub_time_ = rclcpp::Time(0, 0, RCL_ROS_TIME);
+  have_last_mow_tool_position_ = false;
+}
+
+void MapServerNode::initialize_mow_progress_map()
+{
+  const std::string layer = "mowed";
+  reset_mow_progress();
+  mow_progress_map_ = grid_map::GridMap({layer});
+  mow_progress_map_.setFrameId(map_frame_);
+  mow_progress_map_.setGeometry(map_.getLength(), map_.getResolution(), map_.getPosition());
+  mow_progress_map_[layer].setConstant(0.0F);
+  // Refresh the latched publisher with the empty grid after a reset or resize.
+  mow_progress_dirty_ = true;
 }
 
 }  // namespace mowgli_map
