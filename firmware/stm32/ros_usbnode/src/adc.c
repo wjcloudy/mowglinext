@@ -18,6 +18,8 @@
 #include "perimeter.h"
 #include "adc.h"
 #include <math.h>
+
+#define ADC_CHARGING_USES_DMA 0
 /******************************************************************************
  * Module Preprocessor Constants
  *******************************************************************************/
@@ -77,6 +79,46 @@ float chargerInputVoltage;
 
 union FtoU ampere_acc;
 union FtoU charge_current_offset;
+
+/* A stalled acquisition must not leave the charger regulating frozen data.
+ * Faults latch until reboot. Completion means a whole channel scan (IRQ), or
+ * a whole DMA ring, not merely a changed ADC value: a steady signal is valid. */
+#define ADC_CHARGING_TIMEOUT_MS 30u
+static volatile uint8_t adc_charging_fault;
+static volatile uint8_t adc_scan_seen;
+static volatile uint32_t adc_last_scan_ms;
+static uint8_t adc_input_ready;
+static uint32_t adc_last_input_ms;
+
+uint8_t ADC_ChargingHealthy(void)
+{
+    /* Snapshot the ISR timestamp before reading time, so an interrupt cannot
+     * supply a future timestamp and make unsigned subtraction look expired. */
+    uint8_t scan_seen = adc_scan_seen;
+    uint32_t last_scan = adc_last_scan_ms;
+    uint32_t now = HAL_GetTick();
+#if BOARD_YARDFORCE500_VARIANT_B
+    if (__HAL_ADC_GET_FLAG(&ADC_Charging_Handle, ADC_FLAG_OVR))
+        adc_charging_fault = 1;
+#endif
+#if ADC_CHARGING_USES_DMA
+    uint32_t errors = __HAL_DMA_GET_TE_FLAG_INDEX(&hdma_adc1)
+        | __HAL_DMA_GET_DME_FLAG_INDEX(&hdma_adc1)
+        | __HAL_DMA_GET_FE_FLAG_INDEX(&hdma_adc1);
+    if (__HAL_DMA_GET_FLAG(&hdma_adc1, errors)
+        || !(hdma_adc1.Instance->CR & DMA_SxCR_EN))
+        adc_charging_fault = 1;
+#endif
+    if ((scan_seen && (uint32_t)(now - last_scan) > ADC_CHARGING_TIMEOUT_MS)
+        || (adc_input_ready && (uint32_t)(now - adc_last_input_ms) > ADC_CHARGING_TIMEOUT_MS))
+        adc_charging_fault = 1;
+    return adc_input_ready && !adc_charging_fault;
+}
+
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc == &ADC_Charging_Handle) adc_charging_fault = 1;
+}
 
 /******************************************************************************
  * Function Prototypes
@@ -235,8 +277,10 @@ void ADC_Charging_Init(void)
 	//		 so we either need manual calibration or just assume it is
 	// 		 calibrated correctly all the time
 #endif
-    HAL_ADC_Start_IT(&ADC_Charging_Handle);
-    HAL_TIM_OC_Start(&TIM2_Handle, TIM_CHANNEL_2);
+    if (HAL_ADC_Start_IT(&ADC_Charging_Handle) != HAL_OK)
+        adc_charging_fault = 1;
+    if (HAL_TIM_OC_Start(&TIM2_Handle, TIM_CHANNEL_2) != HAL_OK)
+        adc_charging_fault = 1;
 
     /* USER CODE BEGIN RTC_MspInit 0 */
     __HAL_RCC_PWR_CLK_ENABLE();
@@ -272,6 +316,11 @@ void ADC_Charging_Init(void)
 void ADC_input(void)
 {
     float l_fTmp;
+    (void)ADC_ChargingHealthy();
+    if (adc_charging_fault) return;
+#if !ADC_CHARGING_USES_DMA
+    if (!adc_scan_seen) return;
+#endif
 
     /* Snapshot volatile ADC values under interrupt lock to avoid torn reads */
     __disable_irq();
@@ -295,6 +344,16 @@ void ADC_input(void)
     if (batt_cnt) raw_battery = (uint16_t)(batt_acc / batt_cnt);
     if (chg_cnt)  raw_charger = (uint16_t)(chg_acc  / chg_cnt);
 #endif
+
+    /* Start the IIRs at measured values, not zero, before enabling charging. */
+    if (!adc_input_ready)
+    {
+        battery_voltage = ((float)raw_battery / 4095.0f) * 3.3f * 10.09f + 0.6f;
+        charge_voltage = ((float)raw_charger / 4095.0f) * 3.3f * 16.0f;
+        current_without_offset = (((float)raw_current / 4095.0f) * 3.3f - 2.5f) * 100.0f / 12.0f;
+        ntc_voltage = ((float)raw_ntc / 4095.0f) * 3.3f;
+        chargerInputVoltage = ((float)raw_chargerInput / 4095.0f) * 3.3f * 16.0f;
+    }
 
     /* battery volatge calculation */
     l_fTmp = ((float)raw_battery / 4095.0f) * 3.3f * 10.09 + 0.6f;
@@ -334,6 +393,8 @@ void ADC_input(void)
     /* Input voltage from the external supply*/
     l_fTmp = (raw_chargerInput / 4095.0f) * 3.3f * (32 / 2);
     chargerInputVoltage = 0.5 * l_fTmp + 0.5 * chargerInputVoltage;
+    adc_last_input_ms = HAL_GetTick();
+    adc_input_ready = 1;
 
 }
 
@@ -378,6 +439,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         case ADC_CHARGING_CHANNEL_NTC:
             adc_u16Input_NTC = l_u16Rawdata;
+            adc_last_scan_ms = HAL_GetTick();
+            adc_scan_seen = 1;
 
             break;
 
@@ -392,7 +455,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 			adc_charging_eChannelSelection = ADC_CHARGING_CHANNEL_CURRENT;
 		adc_charging_SetChannel(adc_charging_eChannelSelection);
 
-        HAL_ADC_Start_IT(&ADC_Charging_Handle);
+        if (HAL_ADC_Start_IT(&ADC_Charging_Handle) != HAL_OK)
+            adc_charging_fault = 1;
     }
 }
 

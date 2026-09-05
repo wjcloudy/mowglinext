@@ -34,6 +34,8 @@ jobs:
         run: python3 firmware/scripts/board_defaults_parity.py
       - name: Exercise LFP charging and profile isolation
         run: python3 firmware/scripts/test_lfp_charger.py
+      - name: Exercise ADC freshness and charger fault cutoff
+        run: python3 firmware/scripts/test_adc_charging.py
 
   build:
     runs-on: ubuntu-latest
