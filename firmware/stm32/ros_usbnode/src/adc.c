@@ -18,6 +18,8 @@
 #include "perimeter.h"
 #include "adc.h"
 #include <math.h>
+
+#define ADC_CHARGING_USES_DMA BOARD_YARDFORCE500_VARIANT_B
 /******************************************************************************
  * Module Preprocessor Constants
  *******************************************************************************/
@@ -62,11 +64,12 @@ volatile uint16_t adc_u16Input_NTC            = 0;
 /* CLOUDY: how many full channel scans the circular DMA buffer holds. On LFP we
  * keep N recent scans so ADC_input() can boxcar-average the noisy battery and
  * charge-voltage columns (~sqrt(N) noise rejection ahead of the IIR); the F401
- * has no hardware oversampler. Stock stays at 1 scan -> byte-identical. */
+ * has no hardware oversampler. Stock keeps two rows so one completed scan is
+ * always available while DMA overwrites the other; it does not average them. */
 #if BOARD_YARDFORCE500B_LFP
 #define ADC_DMA_OVERSAMPLE 8
 #else
-#define ADC_DMA_OVERSAMPLE 1
+#define ADC_DMA_OVERSAMPLE 2
 #endif
 // CLOUDY: circular-DMA target for the full channel scan(s); ADC_input() reads it directly
 volatile uint16_t adc_inputDmaBuf[ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX] = {0};
@@ -82,6 +85,46 @@ float chargerInputVoltage;
 
 union FtoU ampere_acc;
 union FtoU charge_current_offset;
+
+/* A stalled acquisition must not leave the charger regulating frozen data.
+ * Faults latch until reboot. Completion means a whole channel scan (IRQ), or
+ * a whole DMA ring, not merely a changed ADC value: a steady signal is valid. */
+#define ADC_CHARGING_TIMEOUT_MS 30u
+static volatile uint8_t adc_charging_fault;
+static volatile uint8_t adc_scan_seen;
+static volatile uint32_t adc_last_scan_ms;
+static uint8_t adc_input_ready;
+static uint32_t adc_last_input_ms;
+
+uint8_t ADC_ChargingHealthy(void)
+{
+    /* Snapshot the ISR timestamp before reading time, so an interrupt cannot
+     * supply a future timestamp and make unsigned subtraction look expired. */
+    uint8_t scan_seen = adc_scan_seen;
+    uint32_t last_scan = adc_last_scan_ms;
+    uint32_t now = HAL_GetTick();
+#if BOARD_YARDFORCE500_VARIANT_B
+    if (__HAL_ADC_GET_FLAG(&ADC_Charging_Handle, ADC_FLAG_OVR))
+        adc_charging_fault = 1;
+#endif
+#if ADC_CHARGING_USES_DMA
+    uint32_t errors = __HAL_DMA_GET_TE_FLAG_INDEX(&hdma_adc1)
+        | __HAL_DMA_GET_DME_FLAG_INDEX(&hdma_adc1)
+        | __HAL_DMA_GET_FE_FLAG_INDEX(&hdma_adc1);
+    if (__HAL_DMA_GET_FLAG(&hdma_adc1, errors)
+        || !(hdma_adc1.Instance->CR & DMA_SxCR_EN))
+        adc_charging_fault = 1;
+#endif
+    if ((scan_seen && (uint32_t)(now - last_scan) > ADC_CHARGING_TIMEOUT_MS)
+        || (adc_input_ready && (uint32_t)(now - adc_last_input_ms) > ADC_CHARGING_TIMEOUT_MS))
+        adc_charging_fault = 1;
+    return adc_input_ready && !adc_charging_fault;
+}
+
+void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc == &ADC_Charging_Handle) adc_charging_fault = 1;
+}
 
 /******************************************************************************
  * Function Prototypes
@@ -247,12 +290,13 @@ void ADC_Charging_Init(void)
 
     // calibrate  - important for accuracy !
     HAL_ADCEx_Calibration_Start(&ADC_Charging_Handle);
-    HAL_ADC_Start_IT(&ADC_Charging_Handle);
+    if (HAL_ADC_Start_IT(&ADC_Charging_Handle) != HAL_OK)
+        adc_charging_fault = 1;
 #elif BOARD_YARDFORCE500_VARIANT_B
     // CLOUDY: drive the charging ADC by DMA instead of per-conversion interrupts.
     // ADC1 -> DMA2_Stream0 (channel 0), circular; one full channel scan per TIM2 trigger
-    // lands in adc_inputDmaBuf[]. No ADC/DMA NVIC is enabled - ADC_input() reads the
-    // buffer directly (each uint16_t read is atomic), so no ISR is needed.
+    // lands in adc_inputDmaBuf[]. ADC_input() polls completion/error flags and
+    // snapshots the ring; no ADC/DMA NVIC is enabled for this path.
     // (STM32f4 has no ADC calibration call.)
     __HAL_RCC_DMA2_CLK_ENABLE();
     hdma_adc1.Instance = DMA2_Stream0;
@@ -270,10 +314,17 @@ void ADC_Charging_Init(void)
         Error_Handler();
     }
     __HAL_LINKDMA(&ADC_Charging_Handle, DMA_Handle, hdma_adc1);
-    HAL_ADC_Start_DMA(&ADC_Charging_Handle, (uint32_t *)&adc_inputDmaBuf[0], ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX);
-    __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT);
+    if (HAL_ADC_Start_DMA(&ADC_Charging_Handle, (uint32_t *)&adc_inputDmaBuf[0],
+            ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX) != HAL_OK)
+        adc_charging_fault = 1;
+    /* HAL starts DMA with interrupts, but this path polls the flags. In
+     * particular, leave ADC OVR pending for the health check to observe. */
+    __HAL_ADC_DISABLE_IT(&ADC_Charging_Handle, ADC_IT_OVR);
+    __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT | DMA_IT_TC | DMA_IT_TE | DMA_IT_DME);
+    __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_FE);
 #endif
-    HAL_TIM_OC_Start(&TIM2_Handle, TIM_CHANNEL_2);
+    if (HAL_TIM_OC_Start(&TIM2_Handle, TIM_CHANNEL_2) != HAL_OK)
+        adc_charging_fault = 1;
 
     /* USER CODE BEGIN RTC_MspInit 0 */
     __HAL_RCC_PWR_CLK_ENABLE();
@@ -309,28 +360,67 @@ void ADC_Charging_Init(void)
 void ADC_input(void)
 {
     float l_fTmp;
+    (void)ADC_ChargingHealthy();
+    if (adc_charging_fault) return;
+#if !ADC_CHARGING_USES_DMA
+    if (!adc_scan_seen) return;
+#endif
 
 #if BOARD_YARDFORCE500_VARIANT_B
-    /* CLOUDY DMA keeps adc_inputDmaBuf continuously fresh; each 16-bit read is atomic */
-    uint16_t raw_battery       = adc_inputDmaBuf[ADC_CHARGING_CHANNEL_BATTERYVOLTAGE];
-    uint16_t raw_charger       = adc_inputDmaBuf[ADC_CHARGING_CHANNEL_CHARGEVOLTAGE];
-    uint16_t raw_current       = adc_inputDmaBuf[ADC_CHARGING_CHANNEL_CURRENT];
-    uint16_t raw_chargerInput  = adc_inputDmaBuf[ADC_CHARGING_CHANNEL_CHARGERINPUTVOLTAGE];
-    uint16_t raw_ntc           = adc_inputDmaBuf[ADC_CHARGING_CHANNEL_NTC];
-#if BOARD_YARDFORCE500B_LFP && (ADC_DMA_OVERSAMPLE > 1)
-    /* Boxcar-average the two noisy rails over the N scans the circular buffer holds.
-     * DMA may be mid-write while we read, but for an average a torn sample is
-     * harmless. Other channels keep their latest single scan above. */
+    /* TC is sticky even though the circular NDTR counter wraps. Equal NDTR
+     * readings across 10 ms therefore cannot hide a stopped DMA stream. */
+    if (__HAL_DMA_GET_FLAG(&hdma_adc1, __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_adc1)))
     {
-        uint32_t batt_acc = 0, chg_acc = 0;
-        for (uint16_t s = 0; s < ADC_DMA_OVERSAMPLE; s++)
-        {
-            batt_acc += adc_inputDmaBuf[s * ADC_CHARGING_CHANNEL_MAX + ADC_CHARGING_CHANNEL_BATTERYVOLTAGE];
-            chg_acc  += adc_inputDmaBuf[s * ADC_CHARGING_CHANNEL_MAX + ADC_CHARGING_CHANNEL_CHARGEVOLTAGE];
-        }
-        raw_battery = (uint16_t)(batt_acc / ADC_DMA_OVERSAMPLE);
-        raw_charger = (uint16_t)(chg_acc  / ADC_DMA_OVERSAMPLE);
+        __HAL_DMA_CLEAR_FLAG(&hdma_adc1, __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_adc1)
+            | __HAL_DMA_GET_HT_FLAG_INDEX(&hdma_adc1));
+        adc_last_scan_ms = HAL_GetTick();
+        adc_scan_seen = 1;
     }
+    if (!adc_scan_seen) return; // the entire ring must be initialized first
+
+    uint16_t snapshot[ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX];
+    uint32_t remaining = 0;
+    uint8_t copied = 0;
+    for (unsigned attempt = 0; attempt < 3; ++attempt)
+    {
+        uint32_t started = HAL_GetTick();
+        remaining = __HAL_DMA_GET_COUNTER(&hdma_adc1);
+        __DMB();
+        for (unsigned i = 0; i < ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX; ++i)
+            snapshot[i] = adc_inputDmaBuf[i];
+        __DMB();
+        /* Reject a moving ring, including an entire wrap while preempted.
+         * Less than 1 ms is shorter than a complete ring on either profile. */
+        if (remaining == __HAL_DMA_GET_COUNTER(&hdma_adc1)
+            && HAL_GetTick() == started)
+        {
+            copied = 1;
+            break;
+        }
+    }
+    if (!copied) return; // retain previous values; health timeout still applies
+    unsigned written = ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX - remaining;
+    unsigned complete = written / ADC_CHARGING_CHANNEL_MAX;
+    unsigned latest = (complete + ADC_DMA_OVERSAMPLE - 1) % ADC_DMA_OVERSAMPLE;
+    unsigned offset = latest * ADC_CHARGING_CHANNEL_MAX;
+    uint16_t raw_battery = snapshot[offset + ADC_CHARGING_CHANNEL_BATTERYVOLTAGE];
+    uint16_t raw_charger = snapshot[offset + ADC_CHARGING_CHANNEL_CHARGEVOLTAGE];
+    uint16_t raw_current = snapshot[offset + ADC_CHARGING_CHANNEL_CURRENT];
+    uint16_t raw_chargerInput = snapshot[offset + ADC_CHARGING_CHANNEL_CHARGERINPUTVOLTAGE];
+    uint16_t raw_ntc = snapshot[offset + ADC_CHARGING_CHANNEL_NTC];
+#if BOARD_YARDFORCE500B_LFP
+    unsigned partial = written % ADC_CHARGING_CHANNEL_MAX;
+    uint32_t batt_acc = 0, chg_acc = 0, count = 0;
+    for (unsigned row = 0; row < ADC_DMA_OVERSAMPLE; ++row)
+    {
+        // Exclude the partially overwritten row from the voltage average.
+        if (partial && row == complete) continue;
+        batt_acc += snapshot[row * ADC_CHARGING_CHANNEL_MAX + ADC_CHARGING_CHANNEL_BATTERYVOLTAGE];
+        chg_acc += snapshot[row * ADC_CHARGING_CHANNEL_MAX + ADC_CHARGING_CHANNEL_CHARGEVOLTAGE];
+        ++count;
+    }
+    raw_battery = (uint16_t)(batt_acc / count);
+    raw_charger = (uint16_t)(chg_acc / count);
 #endif
 #else
     /* Snapshot volatile ADC values under interrupt lock to avoid torn reads */
@@ -342,6 +432,16 @@ void ADC_input(void)
     uint16_t raw_ntc           = adc_u16Input_NTC;
     __enable_irq();
 #endif
+
+    /* Start the IIRs at measured values, not zero, before enabling charging. */
+    if (!adc_input_ready)
+    {
+        battery_voltage = ((float)raw_battery / 4095.0f) * 3.3f * 10.09f + 0.6f;
+        charge_voltage = ((float)raw_charger / 4095.0f) * 3.3f * 16.0f;
+        current_without_offset = (((float)raw_current / 4095.0f) * 3.3f - 2.5f) * 100.0f / 12.0f;
+        ntc_voltage = ((float)raw_ntc / 4095.0f) * 3.3f;
+        chargerInputVoltage = ((float)raw_chargerInput / 4095.0f) * 3.3f * 16.0f;
+    }
 
     /* battery volatge calculation */
     l_fTmp = ((float)raw_battery / 4095.0f) * 3.3f * 10.09 + 0.6f;
@@ -381,6 +481,8 @@ void ADC_input(void)
     /* Input voltage from the external supply*/
     l_fTmp = (raw_chargerInput / 4095.0f) * 3.3f * (32 / 2);
     chargerInputVoltage = 0.5 * l_fTmp + 0.5 * chargerInputVoltage;
+    adc_last_input_ms = HAL_GetTick();
+    adc_input_ready = 1;
 
 }
 
@@ -420,6 +522,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         case ADC_CHARGING_CHANNEL_NTC:
             adc_u16Input_NTC = l_u16Rawdata;
+            adc_last_scan_ms = HAL_GetTick();
+            adc_scan_seen = 1;
 
             break;
 
@@ -434,7 +538,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 			adc_charging_eChannelSelection = ADC_CHARGING_CHANNEL_CURRENT;
 		adc_charging_SetChannel(adc_charging_eChannelSelection);
 
-        HAL_ADC_Start_IT(&ADC_Charging_Handle);
+        if (HAL_ADC_Start_IT(&ADC_Charging_Handle) != HAL_OK)
+            adc_charging_fault = 1;
 #endif
     }
 }

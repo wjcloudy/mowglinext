@@ -33,7 +33,7 @@ rendering a stock configuration cannot turn the LFP build into a Li-ion profile.
 | Bulk current / maximum charge voltage | 1.8 A / 28.5 V |
 | Float voltage / current cap | 27.5 V / 0.40 A |
 | Full indication current threshold | 0.25 A |
-| Fixed current offset | -0.20 A |
+| Fixed Pi/electronics current compensation | -0.20 A |
 | Low / critical battery voltage | 24.0 / 23.0 V |
 | Dock input threshold / disconnect debounce | 22.0 V / 20 cycles (~200 ms) |
 | CC-to-CV debounce / return hysteresis | 50 cycles (~500 ms) / 2.0 V |
@@ -94,6 +94,29 @@ No packet change is needed; the current v6 host and firmware must be paired.
 - Upstream's normal emergency-enabled release default is retained. The old
   unconditional bench `I_DONT_NEED_MY_FINGERS` define is not carried forward.
 
+## ADC fault handling
+
+Both branches hold charge PWM at zero until ADC input is valid. A start/rearm
+failure, ADC error, or more than 30 ms without acquisition progress latches
+charging off until reboot. The normal 10 ms controller cadence checks that
+deadline; this is not an asynchronous hardware cutoff. The charge counter stops
+integrating invalid input. Voltage/current filters start at the first measured
+values so the controller never ramps against a zero-filled startup buffer.
+
+On the DMA branch, ADC overrun, DMA transfer/direct-mode/FIFO errors and a
+disabled stream also latch the fault. Completion flags are polled; no additional
+DMA interrupts are installed. Current, dock voltage and NTC use the latest
+completed row. Stock 500B keeps two rows (without averaging) so a completed
+scan remains available during a write; LFP keeps eight. Voltage averaging
+excludes a row being overwritten. A snapshot
+that moves while copied is discarded, and persistent snapshot failure also
+expires input freshness. The IRQ branch tracks completion of all five channels.
+
+The fixed -0.20 A Pi/electronics compensation is retained on both branches.
+Charge-counter accounting is unchanged pending confirmation of whether that
+counter should include the electronics' consumption: it currently subtracts
+the offset again after the ADC current correction.
+
 ## Verification and limits
 
 Run as the normal project user:
@@ -103,14 +126,20 @@ python3 firmware/scripts/board_defaults_parity.py
 python3 firmware/scripts/protocol_version_guard.py --check
 python3 firmware/scripts/sync_ros_lib.py --check
 python3 firmware/scripts/test_lfp_charger.py
+python3 firmware/scripts/test_adc_charging.py
 ```
 
 The charger unit harness compiles the production controller with a minimal HAL
 shim, excluding only timer initialization. It exercises bulk ramp/backoff,
 CV entry/debounce, float stability, fallback, disconnect debounce, fixed offset,
-runtime ceilings, and isolation from stock/GUI defaults. It runs with GCC/Clang
+runtime ceilings, invalid-input shutdown, and isolation from stock/GUI defaults. It runs with GCC/Clang
 or `--cc cl` in a Windows MSVC developer prompt. Use Python `-X utf8` on Windows
 for the existing source-generation guards. CI builds the LFP environment too.
+
+The ADC harness compiles production acquisition, error callbacks and charger
+code with injected HAL values/flags. It checks startup, constant signals, frozen
+acquisition, error latching, tick rollover, DMA ring wrap, partial rows and moving
+snapshots for LFP, stock 500B and original 500 configurations.
 
 Builds and unit tests cannot establish electrical stability. Before deployment,
 remove blades and supervise measurement of voltage/current against a meter,
@@ -119,7 +148,6 @@ freshness, bumper response, emergency during reverse, and IMU boot after flash.
 The June history reports hardware tests for charging fixes, but does not establish
 that this September combination has been tested on the mower.
 
-Existing SOC limitations remain: the charge accumulator subtracts the offset
-again after ADC correction, and firmware still transmits battery percentage as
-zero. The ROS battery gauge remains voltage-derived, not an LFP coulomb-counting
+Existing SOC limitations remain: the accounting convention above is unresolved,
+and firmware still transmits battery percentage as zero. The ROS battery gauge remains voltage-derived, not an LFP coulomb-counting
 gauge. This merge preserves the charging work without claiming those are solved.

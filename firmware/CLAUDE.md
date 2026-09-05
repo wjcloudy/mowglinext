@@ -50,7 +50,7 @@ python3 firmware/scripts/package_release.py --build-root firmware/stm32/ros_usbn
   --tag vX.Y.Z --repo mowglinext/mowglinext --out-dir dist
 ```
 
-The native charger unit harness is `python3 firmware/scripts/test_lfp_charger.py` (MSVC: `--cc cl`). It tests the production state machine with HAL stubs. `stm32/ros_usbnode/test/` remains PlatformIO's placeholder and no `pio test` env exists. What actually pins behaviour: `ros2/src/mowgli_hardware/test/test_protocol.cpp` (host mirror; `cd ros2 && make test`), the three guards above, and `gui/pkg/providers/firmware_test.go`. The PI / yaw / anti-dig loops are validated by a manual supervised field procedure only (`stm32/ros_usbnode/src/ros/ros_custom/cpp_main.cpp:765-773`).
+The native harnesses are `python3 firmware/scripts/test_lfp_charger.py` and `python3 firmware/scripts/test_adc_charging.py` (MSVC: `--cc cl`). They test the production charger and ADC acquisition with HAL stubs. `stm32/ros_usbnode/test/` remains PlatformIO's placeholder and no `pio test` env exists. What actually pins behaviour: `ros2/src/mowgli_hardware/test/test_protocol.cpp` (host mirror; `cd ros2 && make test`), the three guards above, and `gui/pkg/providers/firmware_test.go`. The PI / yaw / anti-dig loops are validated by a manual supervised field procedure only (`stm32/ros_usbnode/src/ros/ros_custom/cpp_main.cpp:765-773`).
 
 ## Conventions
 
@@ -88,3 +88,5 @@ This tree **is** the safety authority described in the root CLAUDE.md § *Safety
 - `I_DONT_NEED_MY_FINGERS` (`include/board.h`, template `{{.DisableEmergency}}`) compiles `EmergencyController()` out entirely. It is a bench-only switch; `board_defaults.h` never sets it.
 - Weakening `ANTIDIG_*` to compensate for the host dig detector is explicitly banned by the root "What NOT to Do" — the two cover different failures.
 - **Remove the blades** before any bench work: the custom firmware has no tilt sensing on the bench harness, and a flash reboots the board with motors powered.
+
+Charging ADC faults latch PWM off until reboot; see `stm32/ros_usbnode/LFP.md`. The native ADC fault-injection harness is `scripts/test_adc_charging.py`.

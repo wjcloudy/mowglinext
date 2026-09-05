@@ -214,6 +214,18 @@ void charger_set_charge_limits(float max_voltage, float max_current) {
 void ChargeController(void)
 {                        
   static uint32_t timestamp = 0;
+  /* Invalid/stale acquisition bypasses PWM floors and the dock debounce.
+   * Do not integrate frozen current into the charge counter either. */
+  if (!ADC_ChargingHealthy()) {
+    charger_state = CHARGER_STATE_IDLE;
+    chargecontrol_pwm_val = 0;
+    chargecontrol_is_charging = 0;
+    TIM1->CCR1 = 0;
+#if BOARD_YARDFORCE500B_LFP
+    cv_entry_debounce = 0;
+#endif
+    return;
+  }
   float charge_target = charge_end_voltage;
 #if BOARD_YARDFORCE500B_LFP
   if (charge_target > g_max_charge_voltage) charge_target = g_max_charge_voltage;
@@ -253,7 +265,7 @@ void ChargeController(void)
         /* wait 100ms to read current */
         if( (HAL_GetTick() - timestamp) > 100){
 #if BOARD_YARDFORCE500B_LFP
-          //CLOUDY use a fixed hardware offset instead of auto-zeroing at dock:
+          //CLOUDY retain fixed Pi/electronics compensation instead of auto-zeroing at dock:
           //the Pi/electronics still draw current at the "zero" point, so auto-cal is wrong here.
           charge_current_offset.f = CURRENT_OFFSET;
 #else

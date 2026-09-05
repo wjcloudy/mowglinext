@@ -46,6 +46,8 @@ union FtoU { float f; uint16_t u[2]; };
 static union FtoU ampere_acc, charge_current_offset;
 static float battery_voltage, charge_voltage, chargerInputVoltage;
 static float current, current_without_offset;
+static uint8_t test_adc_healthy = 1;
+static uint8_t ADC_ChargingHealthy(void) { return test_adc_healthy; }
 '''
 
 TEST = r'''
@@ -141,6 +143,15 @@ int main(void) {
     charger_set_charge_limits(1.0f, 0.01f);
     near(g_max_charge_voltage, 24.0f);
     near(g_max_charge_current, 0.1f);
+    dock();
+    float saved_ah = ampere_acc.f;
+    test_adc_healthy = 0;
+    ticks(100);
+    assert(charger_state == CHARGER_STATE_IDLE);
+    assert(chargecontrol_pwm_val == 0 && TIM1->CCR1 == 0);
+    assert(chargecontrol_is_charging == 0);
+    near(ampere_acc.f, saved_ah);
+    puts("PASS: invalid ADC forces PWM off and freezes charge counting");
     puts("PASS: LFP profile, CC backoff, CV debounce/float, undock, runtime limits");
     return 0;
 }
