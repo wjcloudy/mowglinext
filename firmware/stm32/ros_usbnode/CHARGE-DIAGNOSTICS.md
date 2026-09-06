@@ -1,5 +1,9 @@
 # Charging diagnostic firmware for mower .118
 
+For deployed process names, evidence paths, operator actions and the route after
+a failure, see [the .118 diagnostic runbook](DIAGNOSTIC-RUNBOOK-118.md).
+See also [the motor-temperature investigation](TEMPERATURE-INVESTIGATION-118.md).
+
 Build target: `Yardforce500B_LFP_DIAG`, based on DMA LFP c2a0d4f6. This target is
 for the STM32F401VC/500B and 8S LFP profile, not the standard 500 on mower .119.
 It keeps the charge algorithm, 28.5 V / 1.8 A compiled ceilings, -0.20 A offset,
