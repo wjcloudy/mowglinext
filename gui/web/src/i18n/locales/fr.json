@@ -1,4 +1,13 @@
 {
+  "bladeDirection": {
+    "title": "Sens demandé de la lame",
+    "summary": "Sens demandé : {{direction}}",
+    "help": "Commande uniquement ; le firmware ne rapporte pas le sens de rotation réel.",
+    "forward": "Avant",
+    "reverse": "Arrière",
+    "off": "Arrêt",
+    "unknown": "Inconnu"
+  },
   "crossHatch": {
     "areaUnavailable": "Les identifiants des zones sont indisponibles. Actualisez la carte après la mise à jour du serveur GUI.",
     "title": "Prochaine direction par zone",
