@@ -75,6 +75,7 @@ void ADC_Charging_Init(void);
 void ADC_input(void);
 /* False until valid input, or after a latched acquisition fault. */
 uint8_t ADC_ChargingHealthy(void);
+uint8_t ADC_ChargingFaulted(void);
 
 void HAL_ADC_ConvCpltCallback (ADC_HandleTypeDef* hadc);
 

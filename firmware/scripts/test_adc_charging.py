@@ -69,6 +69,13 @@ static void near(float a, float b) { assert(fabsf(a - b) < 0.0001f); }
 static float amps(unsigned raw) { return (raw / 4095.0f * 3.3f - 2.5f) * 100.0f / 12.0f; }
 static void reset(void) {
     adc_charging_fault = adc_scan_seen = adc_input_ready = 0;
+#if BOARD_YARDFORCE500B_LFP
+    charge_protection = (charge_protection_t){ .version=1, .inhibited=1 };
+    charge_pwm_started = 1;
+#if ADC_CHARGING_USES_DMA
+    adc_diag_tc_pending = 0;
+#endif
+#endif
     adc_last_scan_ms = adc_last_input_ms = test_tick = 0;
     test_adc_flags = test_dma_flags = test_start_result = test_counter_moves = 0;
     ADC_Charging_Handle.Instance = &test_adc;
@@ -98,6 +105,9 @@ static void fresh(void) {
     test_tick += 10;
 #if ADC_CHARGING_USES_DMA
     test_dma_flags |= 1u;
+#if BOARD_YARDFORCE500B_LFP
+    DMA2_Stream0_IRQHandler();
+#endif
 #else
     const uint16_t scan[] = {3120, 2200, 3200, 2300, 1200};
     for (unsigned i = 0; i < 5; ++i) {

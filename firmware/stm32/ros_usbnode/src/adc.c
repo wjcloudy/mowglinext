@@ -18,6 +18,7 @@
 #include "perimeter.h"
 #include "adc.h"
 #include <math.h>
+#include "charge_protection.h"
 
 #define ADC_CHARGING_USES_DMA 0
 /******************************************************************************
@@ -90,6 +91,8 @@ static volatile uint32_t adc_last_scan_ms;
 static uint8_t adc_input_ready;
 static uint32_t adc_last_input_ms;
 
+uint8_t ADC_ChargingFaulted(void) { return adc_charging_fault; }
+
 uint8_t ADC_ChargingHealthy(void)
 {
     /* Snapshot the ISR timestamp before reading time, so an interrupt cannot
@@ -109,15 +112,24 @@ uint8_t ADC_ChargingHealthy(void)
         || !(hdma_adc1.Instance->CR & DMA_SxCR_EN))
         adc_charging_fault = 1;
 #endif
-    if ((scan_seen && (uint32_t)(now - last_scan) > ADC_CHARGING_TIMEOUT_MS)
-        || (adc_input_ready && (uint32_t)(now - adc_last_input_ms) > ADC_CHARGING_TIMEOUT_MS))
+    /* CLOUDY: actual acquisition freshness, not foreground scheduling delay. */
+    if (scan_seen && (uint32_t)(now - last_scan) > ADC_CHARGING_TIMEOUT_MS)
         adc_charging_fault = 1;
+#if !BOARD_YARDFORCE500B_LFP
+    if (adc_input_ready && (uint32_t)(now - adc_last_input_ms) > ADC_CHARGING_TIMEOUT_MS)
+        adc_charging_fault = 1;
+#endif
     return adc_input_ready && !adc_charging_fault;
 }
 
 void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
 {
-    if (hadc == &ADC_Charging_Handle) adc_charging_fault = 1;
+    if (hadc == &ADC_Charging_Handle) {
+        adc_charging_fault = 1;
+#if BOARD_YARDFORCE500B_LFP
+        Charger_InputInvalid();
+#endif
+    }
 }
 
 /******************************************************************************
@@ -435,6 +447,11 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         case ADC_CHARGING_CHANNEL_CHARGERINPUTVOLTAGE:
             adc_u16ChargerInputVoltage = l_u16Rawdata;
+#if BOARD_YARDFORCE500B_LFP
+            /* CLOUDY: keep the IRQ sampler; publish input at channel completion
+             * so contact bounce cannot hide behind ADC_input's 11 ms cadence. */
+            Charger_InputSample(l_u16Rawdata, HAL_GetTick());
+#endif
             break;
 
         case ADC_CHARGING_CHANNEL_NTC:
@@ -455,8 +472,12 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 			adc_charging_eChannelSelection = ADC_CHARGING_CHANNEL_CURRENT;
 		adc_charging_SetChannel(adc_charging_eChannelSelection);
 
-        if (HAL_ADC_Start_IT(&ADC_Charging_Handle) != HAL_OK)
+        if (HAL_ADC_Start_IT(&ADC_Charging_Handle) != HAL_OK) {
             adc_charging_fault = 1;
+#if BOARD_YARDFORCE500B_LFP
+            Charger_InputInvalid();
+#endif
+        }
     }
 }
 
