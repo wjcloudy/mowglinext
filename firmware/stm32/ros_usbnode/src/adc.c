@@ -132,7 +132,8 @@ void DMA2_Stream0_IRQHandler(void)
     __DMB();
     uint32_t after = __HAL_DMA_GET_COUNTER(&hdma_adc1);
     /* Never record a half that DMA started overwriting, including a whole
-     * ring wrap while preempted. Each half spans four 1 ms scans. */
+     * ring wrap while preempted. Each half spans four 2 ms scans (TIM2 toggle,
+     * ADC rising edge only). The 4 ms rejection below is conservative. */
     if (!after || ((after > 20u) != (remaining > 20u))
         || __HAL_DMA_GET_FLAG(&hdma_adc1, ht | tc)
         || (uint32_t)(HAL_GetTick() - now) >= 4u) {

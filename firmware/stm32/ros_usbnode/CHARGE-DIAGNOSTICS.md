@@ -10,7 +10,9 @@ PWM/dead-time settings, bumper remap and emergency protections. Protocol remains
 
 The `charge_diag` symbol holds a 21,552-byte versioned RAM record:
 
-- 1024 raw scans: five ADC channels, acquired at the existing nominal 1 kHz.
+- 1024 raw scans: five ADC channels, measured at approximately 500 scans/second
+  on .118 (about two seconds of history). TIM2's 1 ms compare toggles its output;
+  rising-edge-only ADC triggering gives one scan every 2 ms, not every compare.
   DMA half/full interrupts copy four completed scans per batch. The timestamp
   is IRQ service time, not a claim of exact individual conversion time.
 - 128 control updates: actual gap, PWM, charger state, ADC fault, battery/output/
@@ -62,27 +64,35 @@ code. These are software tests, not electrical validation.
 
 ## Flash/reset route
 
-The likely remembered flag is `st-flash --reset`. The official manual says it
-resets before and after flashing:
-https://github.com/stlink-org/stlink/blob/testing/doc/man/st-flash.md
+On .118, `st-flash` 1.7.0 with `--reset --freq=100` erased the application but
+failed in its flash loader with USB timeouts. OpenOCD recovered the board and
+independent readback matched the diagnostic binary exactly. Do not recommend
+that st-flash invocation as the validated route for this mower.
 
-Candidate command after verifying the board identity, backup and binary hash,
-and stopping the ROS2 bridge for the maintenance operation:
+The crucial OpenOCD command is **`itm ports off`**, after Cortex-M target creation
+and before `init`. Port 0 is enabled automatically by target creation, even
+without configuring a TPIU. On .118, merely leaving DBGMCU_CR/TRACE_IOEN clear
+was insufficient: ITM TER=1, TCR=0x810009 and DEMCR=0x1000000 persisted, and the
+bounded debug print stalled long enough to trip WWDG at DRIVEMOTOR_10MS.
+Clearing ITM restored charging and IMU telemetry without a physical power cycle.
+An attachment with `itm ports off` was subsequently checked: TER remained zero.
+See https://openocd.org/doc/html/Architecture-and-Core-Commands.html (ITM commands).
+
+The recovery procedure is captured in `remote_upload/yardforce500b_no_trace.cfg`.
+It avoids TPIU/SWO, pauses watchdogs only while halted, writes/verifies flash and
+resets the CPU with SYSRESETREQ. After verifying board identity, backup and image
+hash, and stopping the ROS2 bridge for maintenance:
 
 ```sh
-sudo st-flash --reset write firmware.bin 0x08000000
+sudo openocd -c "set FIRMWARE /absolute/path/firmware.bin" \
+  -f remote_upload/yardforce500b_no_trace.cfg
 ```
 
-This is a prepared route, not a command run as part of building this artifact.
-Confirm installed st-flash options before use. `--connect-under-reset` is a
-different option for connecting to a difficult target and requires the probe's
-NRST connection; do not assume that wire is present.
-
-Earlier .118 trouble involved the IMU clock on PB3/TRACESWO and OpenOCD trace
-handling. Do not invoke PlatformIO's SWO viewer. A plain reset is not a proven
-repair for an already disturbed IMU. Prefer testing st-flash without enabling
-trace, verify flash readback, then confirm USB telemetry and IMU samples resume
-without a physical cycle. This route has not yet been validated on .118.
+No NRST wiring is required for SYSRESETREQ. Do not invoke the SWO viewer: PB3 is
+also the IMU clock. After flashing, independently verify readback and require
+live IMU, battery/current and recorder counters before completing maintenance.
+The installed diagnostic image remains build commit 1bf1d5b8 / version 1.9.113;
+this later documentation/config change does not change its binary.
 
 ## Read diagnostics without disturbing the MCU
 
@@ -108,8 +118,10 @@ started merely by building this firmware.
 The full dump's header must match before/after readout, be frozen and have even
 sequence counters; otherwise decoding fails. Outputs are `recorder.bin`,
 `decoded.json`, `raw.csv`, `control.csv`, the read configuration and OpenOCD log.
-Read-only attachment was validated with the previous firmware; the new recorder
-address, IRQ timing and freeze behavior still need validation after installation.
+After installation on .118, raw/control counters advanced, missed batches and
+freeze reason stayed zero, and maximum observed control gap was 11 ms. IMU and
+charging telemetry recovered after disabling ITM, without a physical power cycle.
+An actual charge-failure freeze still needs field validation.
 
 Do not enable automatic recovery yet. First capture a failure, then separately
 test one controlled zero-PWM dwell/restart. Zero duty is not equivalent to both
