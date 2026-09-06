@@ -18,6 +18,8 @@
 #include "perimeter.h"
 #include "adc.h"
 #include <math.h>
+#include "charge_diag.h"
+#include "charge_protection.h"
 
 #define ADC_CHARGING_USES_DMA BOARD_YARDFORCE500_VARIANT_B
 /******************************************************************************
@@ -95,6 +97,82 @@ static volatile uint8_t adc_scan_seen;
 static volatile uint32_t adc_last_scan_ms;
 static uint8_t adc_input_ready;
 static uint32_t adc_last_input_ms;
+#if CHARGE_DIAGNOSTICS
+#if !BOARD_YARDFORCE500B_LFP || !BOARD_YARDFORCE500_VARIANT_B
+#error Charge diagnostics require the 500B LFP DMA profile
+#endif
+#endif
+uint8_t ADC_ChargingFaulted(void) { return adc_charging_fault; }
+#if BOARD_YARDFORCE500B_LFP && ADC_CHARGING_USES_DMA
+/* CLOUDY: LFP always uses this IRQ, including non-diagnostic builds. Timestamp
+ * acquisition here so slow foreground processing cannot manufacture a fault. */
+static volatile uint8_t adc_diag_tc_pending;
+
+void DMA2_Stream0_IRQHandler(void)
+{
+    uint32_t ht = __HAL_DMA_GET_HT_FLAG_INDEX(&hdma_adc1);
+    uint32_t tc = __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_adc1);
+    uint32_t flags = (__HAL_DMA_GET_FLAG(&hdma_adc1, ht) ? ht : 0u)
+        | (__HAL_DMA_GET_FLAG(&hdma_adc1, tc) ? tc : 0u);
+    uint32_t now = HAL_GetTick();
+    uint32_t errors = __HAL_DMA_GET_TE_FLAG_INDEX(&hdma_adc1)
+        | __HAL_DMA_GET_DME_FLAG_INDEX(&hdma_adc1) | __HAL_DMA_GET_FE_FLAG_INDEX(&hdma_adc1);
+    if (__HAL_DMA_GET_FLAG(&hdma_adc1, errors) ||
+        __HAL_ADC_GET_FLAG(&ADC_Charging_Handle, ADC_FLAG_OVR)) {
+        adc_charging_fault = 1;
+        Charger_InputInvalid();
+        __HAL_DMA_CLEAR_FLAG(&hdma_adc1, errors);
+    }
+    __HAL_DMA_CLEAR_FLAG(&hdma_adc1, flags);
+    if (flags & tc) {
+        adc_diag_tc_pending = 1;
+        adc_last_scan_ms = now;
+        adc_scan_seen = 1;
+    }
+    if (!flags) return;
+    /* Errors were latched before acknowledging above; do not use HAL's handler
+     * here, which would change the circular scan/rearm behavior. */
+    uint32_t remaining = __HAL_DMA_GET_COUNTER(&hdma_adc1);
+    unsigned offset = remaining > 20u ? 20u : 0u;
+    uint32_t expected = offset ? tc : ht;
+    if ((flags & (ht | tc)) == (ht | tc)) {
+        Charger_InputInvalid(); /* Lost rows cannot establish continuous contact. */
+#if CHARGE_DIAGNOSTICS
+        ChargeDiag_MissedBatch();
+#endif
+    }
+    if (!(flags & expected) || !remaining) {
+        Charger_InputInvalid();
+#if CHARGE_DIAGNOSTICS
+        ChargeDiag_MissedBatch();
+#endif
+        return;
+    }
+    uint16_t samples[20];
+    __DMB();
+    for (unsigned i = 0; i < 20; ++i) samples[i] = adc_inputDmaBuf[offset + i];
+    __DMB();
+    uint32_t after = __HAL_DMA_GET_COUNTER(&hdma_adc1);
+    /* Never record a half that DMA started overwriting, including a whole
+     * ring wrap while preempted. Each half spans four 2 ms scans (TIM2 toggle,
+     * ADC rising edge only). The 4 ms rejection below is conservative. */
+    if (!after || ((after > 20u) != (remaining > 20u))
+        || __HAL_DMA_GET_FLAG(&hdma_adc1, ht | tc)
+        || (uint32_t)(HAL_GetTick() - now) >= 4u) {
+        Charger_InputInvalid();
+#if CHARGE_DIAGNOSTICS
+        ChargeDiag_MissedBatch();
+#endif
+        return;
+    }
+    /* CLOUDY: protection continues even after the recorder freezes. Retain a
+     * low sample followed by high samples within this completed DMA half. */
+    for (unsigned i = 0; i < 4; ++i) Charger_InputSample(samples[i * 5 + 3], now);
+#if CHARGE_DIAGNOSTICS
+    ChargeDiag_RawBatch(now, samples);
+#endif
+}
+#endif
 
 uint8_t ADC_ChargingHealthy(void)
 {
@@ -115,15 +193,23 @@ uint8_t ADC_ChargingHealthy(void)
         || !(hdma_adc1.Instance->CR & DMA_SxCR_EN))
         adc_charging_fault = 1;
 #endif
-    if ((scan_seen && (uint32_t)(now - last_scan) > ADC_CHARGING_TIMEOUT_MS)
-        || (adc_input_ready && (uint32_t)(now - adc_last_input_ms) > ADC_CHARGING_TIMEOUT_MS))
+    if (scan_seen && (uint32_t)(now - last_scan) > ADC_CHARGING_TIMEOUT_MS)
         adc_charging_fault = 1;
+#if !BOARD_YARDFORCE500B_LFP
+    if (adc_input_ready && (uint32_t)(now - adc_last_input_ms) > ADC_CHARGING_TIMEOUT_MS)
+        adc_charging_fault = 1; /* Preserve stock behavior outside this LFP overlay. */
+#endif
     return adc_input_ready && !adc_charging_fault;
 }
 
 void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
 {
-    if (hadc == &ADC_Charging_Handle) adc_charging_fault = 1;
+    if (hadc == &ADC_Charging_Handle) {
+        adc_charging_fault = 1;
+#if BOARD_YARDFORCE500B_LFP
+        Charger_InputInvalid();
+#endif
+    }
 }
 
 /******************************************************************************
@@ -296,7 +382,8 @@ void ADC_Charging_Init(void)
     // CLOUDY: drive the charging ADC by DMA instead of per-conversion interrupts.
     // ADC1 -> DMA2_Stream0 (channel 0), circular; one full channel scan per TIM2 trigger
     // lands in adc_inputDmaBuf[]. ADC_input() polls completion/error flags and
-    // snapshots the ring; no ADC/DMA NVIC is enabled for this path.
+    // snapshots the ring. LFP additionally enables the zero-only contact guard
+    // IRQ below; stock 500B retains the polled path.
     // (STM32f4 has no ADC calibration call.)
     __HAL_RCC_DMA2_CLK_ENABLE();
     hdma_adc1.Instance = DMA2_Stream0;
@@ -317,11 +404,16 @@ void ADC_Charging_Init(void)
     if (HAL_ADC_Start_DMA(&ADC_Charging_Handle, (uint32_t *)&adc_inputDmaBuf[0],
             ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX) != HAL_OK)
         adc_charging_fault = 1;
-    /* HAL starts DMA with interrupts, but this path polls the flags. In
-     * particular, leave ADC OVR pending for the health check to observe. */
+    /* Stock polls the flags. LFP enables the selected protection interrupts
+     * after this reset of HAL defaults. ADC OVR stays visible to health checks. */
     __HAL_ADC_DISABLE_IT(&ADC_Charging_Handle, ADC_IT_OVR);
     __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT | DMA_IT_TC | DMA_IT_TE | DMA_IT_DME);
     __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_FE);
+#if BOARD_YARDFORCE500B_LFP
+    HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+    __HAL_DMA_ENABLE_IT(&hdma_adc1, DMA_IT_HT | DMA_IT_TC | DMA_IT_TE | DMA_IT_DME | DMA_IT_FE);
+#endif
 #endif
     if (HAL_TIM_OC_Start(&TIM2_Handle, TIM_CHANNEL_2) != HAL_OK)
         adc_charging_fault = 1;
@@ -360,8 +452,10 @@ void ADC_Charging_Init(void)
 void ADC_input(void)
 {
     float l_fTmp;
+#if !ADC_CHARGING_USES_DMA || !BOARD_YARDFORCE500B_LFP
     (void)ADC_ChargingHealthy();
     if (adc_charging_fault) return;
+#endif
 #if !ADC_CHARGING_USES_DMA
     if (!adc_scan_seen) return;
 #endif
@@ -369,13 +463,26 @@ void ADC_input(void)
 #if BOARD_YARDFORCE500_VARIANT_B
     /* TC is sticky even though the circular NDTR counter wraps. Equal NDTR
      * readings across 10 ms therefore cannot hide a stopped DMA stream. */
+#if BOARD_YARDFORCE500B_LFP
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint8_t completed = adc_diag_tc_pending;
+    adc_diag_tc_pending = 0;
+    __set_PRIMASK(primask);
+    if (completed)
+#else
     if (__HAL_DMA_GET_FLAG(&hdma_adc1, __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_adc1)))
+#endif
     {
+#if !BOARD_YARDFORCE500B_LFP
         __HAL_DMA_CLEAR_FLAG(&hdma_adc1, __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_adc1)
             | __HAL_DMA_GET_HT_FLAG_INDEX(&hdma_adc1));
         adc_last_scan_ms = HAL_GetTick();
         adc_scan_seen = 1;
+#endif
     }
+    (void)ADC_ChargingHealthy();
+    if (adc_charging_fault) return;
     if (!adc_scan_seen) return; // the entire ring must be initialized first
 
     uint16_t snapshot[ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX];
@@ -398,7 +505,11 @@ void ADC_input(void)
             break;
         }
     }
-    if (!copied) return; // retain previous values; health timeout still applies
+    if (!copied) {
+        if (adc_input_ready && (uint32_t)(HAL_GetTick() - adc_last_input_ms) > ADC_CHARGING_TIMEOUT_MS)
+            adc_charging_fault = 1;
+        return; /* Failed snapshots cannot renew processed-data freshness. */
+    }
     unsigned written = ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX - remaining;
     unsigned complete = written / ADC_CHARGING_CHANNEL_MAX;
     unsigned latest = (complete + ADC_DMA_OVERSAMPLE - 1) % ADC_DMA_OVERSAMPLE;

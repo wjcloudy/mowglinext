@@ -137,6 +137,13 @@ this on .118: the installed st-flash 1.7.0 failed during programming, and OpenOC
 was needed to recover. The default PlatformIO upload command is unchanged;
 use the explicit helper above for this procedure.
 
+## Charging contact-loss protection
+
+The September charging-only overlay stops duty on acquired input loss, requires
+250 ms of stable input before a zero-duty restart, limits repeated restarts,
+and latches failed-output faults. See [CHARGING-MAINTENANCE.md](CHARGING-MAINTENANCE.md)
+for the hooks, constants, branch differences and upstream merge checklist.
+
 ## ADC fault handling
 
 Both branches hold charge PWM at zero until ADC input is valid. A start/rearm
@@ -147,8 +154,8 @@ integrating invalid input. Voltage/current filters start at the first measured
 values so the controller never ramps against a zero-filled startup buffer.
 
 On the DMA branch, ADC overrun, DMA transfer/direct-mode/FIFO errors and a
-disabled stream also latch the fault. Completion flags are polled; no additional
-DMA interrupts are installed. Current, dock voltage and NTC use the latest
+disabled stream also latch the fault. LFP completion/error interrupts provide the contact-loss guard and acquisition
+timestamps; stock 500B still polls its completion flags. Current, dock voltage and NTC use the latest
 completed row. Stock 500B keeps two rows (without averaging) so a completed
 scan remains available during a write; LFP keeps eight. Voltage averaging
 excludes a row being overwritten. A snapshot
