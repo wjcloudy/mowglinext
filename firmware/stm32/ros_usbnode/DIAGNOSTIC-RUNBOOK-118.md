@@ -99,6 +99,9 @@ flashing and why `st-flash --reset` was not the successful route on this mower.
 
 ## Route after capturing a failure
 
+The contact-bounce finding and proposed implementation are now detailed in
+[the charging-only fix plan](CHARGING-FIX-PLAN.md).
+
 1. Preserve and checksum the raw/decoded files, matching ELF, ROS power/status,
    reset cause and timestamps before any recovery.
 2. For reason 1, distinguish a real acquisition failure from the reproduced
