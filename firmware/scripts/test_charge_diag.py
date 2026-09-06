@@ -106,6 +106,18 @@ int main(void) {
         DMA2_Stream0_IRQHandler();
     }
     ADC_input(); assert(ADC_ChargingHealthy() && !ADC_ChargingFaulted());
+    // A contact cooldown must leave both rings live for a later real fault.
+    reset(); clear_diag();
+    for (unsigned i=0; i<30; ++i) fresh();
+    charge_protection.restart_pending=1; charge_protection.window_active=1;
+    charge_protection.restart_window_ms=test_tick; charge_protection.restarts=3;
+    ChargeController();
+    assert(charge_protection.cooldown_active && !charge_protection.fault && !charge_diag.freeze_reason);
+    raw_count=charge_diag.raw_count; controls=charge_diag.control_count;
+    for (unsigned i=0; i<6000; ++i) { fresh(); ChargeController(); }
+    assert(!charge_protection.cooldown_active && !charge_protection.inhibited && TIM1->CCR1==0);
+    assert(!charge_diag.freeze_reason && charge_diag.raw_count>raw_count && charge_diag.control_count>controls);
+    puts("PASS: contact cooldown recovers with live DMA and both diagnostic rings still recording");
     puts("PASS: low/high in one DMA batch cuts PWM, protection survives freeze, fresh IRQ data survives foreground delay");
     puts("PASS: DMA half ordering, late/moving batches, retained error/TC flags, ring wrap, debounce, freeze, tick wrap and PWM unchanged");
     return 0;
