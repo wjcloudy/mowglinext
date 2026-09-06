@@ -220,6 +220,9 @@ void ADC_Charging_Init(void)
 	ADC_TypeDef *Charging_ADC = ADC1;
 #endif
     __HAL_RCC_GPIOA_CLK_ENABLE();
+    // ADC channel 13 is PC3 on both F103 and F401. Configure its port before
+    // acquisition; later TF4 initialization is too late to enable this clock.
+    __HAL_RCC_GPIOC_CLK_ENABLE();
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     /**ADC1 GPIO Configuration
@@ -227,14 +230,15 @@ void ADC_Charging_Init(void)
     PA2     ------> Charge Voltage
     PA3     ------> Battery Voltage
     PA7     ------> Charger Voltage
-    PC2     ------>  Blade NTC
+    PC3     ------>  Blade NTC (ADC channel 13)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_7;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    GPIO_InitStruct.Pin = GPIO_PIN_2;
+    GPIO_InitStruct.Pin = GPIO_PIN_3;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
     /* USER CODE BEGIN ADC1_Init 0 */
@@ -540,7 +544,7 @@ void adc_charging_SetChannel(ADC_Charging_channelSelection_e channel)
         break;
 
     case ADC_CHARGING_CHANNEL_NTC:
-        sConfig.Channel = ADC_CHANNEL_13; // PC2
+        sConfig.Channel = ADC_CHANNEL_13; // PC3 Blade NTC; PC2 is channel 12
         sConfig.Rank = 1;
         sConfig.SamplingTime = adc_SampleTime;
         if (HAL_ADC_ConfigChannel(&ADC_Charging_Handle, &sConfig) != HAL_OK)
