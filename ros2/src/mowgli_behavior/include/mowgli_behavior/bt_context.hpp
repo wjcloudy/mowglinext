@@ -27,8 +27,8 @@
 #include <vector>
 
 #include "geometry_msgs/msg/point32.hpp"
-#include "mowgli_behavior/cross_hatch.hpp"
 #include "mowgli_behavior/blade_direction.hpp"
+#include "mowgli_behavior/cross_hatch.hpp"
 #include "mowgli_behavior/start_blocked_escape.hpp"
 #include "mowgli_interfaces/msg/emergency.hpp"
 #include "mowgli_interfaces/msg/high_level_status.hpp"
