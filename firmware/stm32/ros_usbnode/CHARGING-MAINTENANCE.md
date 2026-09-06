@@ -59,10 +59,20 @@ load. The UI charging flag is cleared while inhibited; the old undock debounce
 constant no longer delays power inhibition.
 
 The first connection after boot is not a retry. Subsequent qualified starts
-allow three attempts in a 60-second window. A fourth attempt latches fault 3;
-the window does not reset on contact bounce. The fault remains until MCU reboot.
-Normal power loss can therefore require operator intervention after repeated
-unstable contacts. Do not silently replace this with unlimited attempts.
+allow three attempts in a 60-second window. A fourth attempt inhibits charging
+for a full 60-second cooldown measured from that blocked attempt. Contact bounce
+cannot shorten or extend the cooldown. On expiry the retry budget is renewed;
+fresh input with at least 250 ms of continuous qualification is still required.
+The recovery counts as the first retry in the new window and starts at zero PWM
+with the usual connected delay and slow ramp. Repeated bursts remain bounded.
+
+This replaces the original permanent fault-3 lockout, which the .118 redock test
+reached in 9.8 seconds. Contact cooldown is not an ADC/output fault and does not
+freeze the recorder, so subsequent real failures can still be captured. Existing
+fault-3 dumps remain decodable. ADC/output faults still require MCU reboot.
+The RAM protection struct is version 2, 68 bytes: the original 14 words retain
+their order, followed by cooldown_active, cooldown_since (tick), and cooldowns
+(cumulative count). Always resolve its address from the installed ELF.
 
 ## Concurrency and sampling limits
 
