@@ -17,6 +17,7 @@
 #include "board.h"
 #include "adc.h"
 #include "charger.h"
+#include "charge_diag.h"
 /******************************************************************************
  * Module Preprocessor Constants
  *******************************************************************************/
@@ -221,6 +222,11 @@ void ChargeController(void)
     chargecontrol_pwm_val = 0;
     chargecontrol_is_charging = 0;
     TIM1->CCR1 = 0;
+#if CHARGE_DIAGNOSTICS
+    ChargeDiag_Control(HAL_GetTick(), 0, 0, ADC_ChargingFaulted(),
+        battery_voltage, charge_voltage, chargerInputVoltage, current,
+        current_without_offset, blade_temperature);
+#endif
 #if BOARD_YARDFORCE500B_LFP
     cv_entry_debounce = 0;
 #endif
@@ -470,6 +476,11 @@ void ChargeController(void)
     }
 #endif
     TIM1->CCR1 = chargecontrol_pwm_val;
+#if CHARGE_DIAGNOSTICS
+    ChargeDiag_Control(HAL_GetTick(), chargecontrol_pwm_val, charger_state,
+        ADC_ChargingFaulted(), battery_voltage, charge_voltage,
+        chargerInputVoltage, current, current_without_offset, blade_temperature);
+#endif
     
 }
 

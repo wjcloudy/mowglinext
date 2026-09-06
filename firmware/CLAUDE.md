@@ -5,6 +5,9 @@ It must NOT own: any ROS topic/TF/pose (`ros2/src/mowgli_hardware`'s `hardware_b
 
 The custom 8S LFP profile and both ADC implementations are documented in [`stm32/ros_usbnode/LFP.md`](stm32/ros_usbnode/LFP.md). `board_defaults.h` selects the profile with `BOARD_YARDFORCE500B_LFP`; its compiled charge limits remain the runtime upper bounds.
 
+The opt-in `Yardforce500B_LFP_DIAG` DMA recorder, native test and non-halting dump
+tool are described in [`stm32/ros_usbnode/CHARGE-DIAGNOSTICS.md`](stm32/ros_usbnode/CHARGE-DIAGNOSTICS.md).
+
 ## Read next
 
 | File | Read it when… |

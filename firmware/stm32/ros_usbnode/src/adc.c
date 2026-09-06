@@ -18,6 +18,7 @@
 #include "perimeter.h"
 #include "adc.h"
 #include <math.h>
+#include "charge_diag.h"
 
 #define ADC_CHARGING_USES_DMA BOARD_YARDFORCE500_VARIANT_B
 /******************************************************************************
@@ -95,6 +96,52 @@ static volatile uint8_t adc_scan_seen;
 static volatile uint32_t adc_last_scan_ms;
 static uint8_t adc_input_ready;
 static uint32_t adc_last_input_ms;
+#if CHARGE_DIAGNOSTICS
+#if !BOARD_YARDFORCE500B_LFP || !BOARD_YARDFORCE500_VARIANT_B
+#error Charge diagnostics require the 500B LFP DMA profile
+#endif
+/* IRQ acknowledges TC; retain its sticky meaning for the existing foreground
+ * health logic. Do not turn diagnostics into an ADC-timeout behavior change. */
+static volatile uint8_t adc_diag_tc_pending;
+uint8_t ADC_ChargingFaulted(void) { return adc_charging_fault; }
+
+void DMA2_Stream0_IRQHandler(void)
+{
+    uint32_t ht = __HAL_DMA_GET_HT_FLAG_INDEX(&hdma_adc1);
+    uint32_t tc = __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_adc1);
+    uint32_t flags = (__HAL_DMA_GET_FLAG(&hdma_adc1, ht) ? ht : 0u)
+        | (__HAL_DMA_GET_FLAG(&hdma_adc1, tc) ? tc : 0u);
+    uint32_t now = HAL_GetTick();
+    __HAL_DMA_CLEAR_FLAG(&hdma_adc1, flags);
+    if (flags & tc) adc_diag_tc_pending = 1;
+    if (!flags) return;
+    if (charge_diag.freeze_reason) return;
+    /* Errors remain pending for ADC_ChargingHealthy; this handler never uses
+     * HAL_DMA_IRQHandler (which would consume those health flags). */
+    uint32_t remaining = __HAL_DMA_GET_COUNTER(&hdma_adc1);
+    unsigned offset = remaining > 20u ? 20u : 0u;
+    uint32_t expected = offset ? tc : ht;
+    if ((flags & (ht | tc)) == (ht | tc)) ChargeDiag_MissedBatch();
+    if (!(flags & expected) || !remaining) {
+        ChargeDiag_MissedBatch();
+        return;
+    }
+    uint16_t samples[20];
+    __DMB();
+    for (unsigned i = 0; i < 20; ++i) samples[i] = adc_inputDmaBuf[offset + i];
+    __DMB();
+    uint32_t after = __HAL_DMA_GET_COUNTER(&hdma_adc1);
+    /* Never record a half that DMA started overwriting, including a whole
+     * ring wrap while preempted. Each half spans four 1 ms scans. */
+    if (!after || ((after > 20u) != (remaining > 20u))
+        || __HAL_DMA_GET_FLAG(&hdma_adc1, ht | tc)
+        || (uint32_t)(HAL_GetTick() - now) >= 4u) {
+        ChargeDiag_MissedBatch();
+        return;
+    }
+    ChargeDiag_RawBatch(now, samples);
+}
+#endif
 
 uint8_t ADC_ChargingHealthy(void)
 {
@@ -322,6 +369,11 @@ void ADC_Charging_Init(void)
     __HAL_ADC_DISABLE_IT(&ADC_Charging_Handle, ADC_IT_OVR);
     __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_HT | DMA_IT_TC | DMA_IT_TE | DMA_IT_DME);
     __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_FE);
+#if CHARGE_DIAGNOSTICS
+    HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+    __HAL_DMA_ENABLE_IT(&hdma_adc1, DMA_IT_HT | DMA_IT_TC);
+#endif
 #endif
     if (HAL_TIM_OC_Start(&TIM2_Handle, TIM_CHANNEL_2) != HAL_OK)
         adc_charging_fault = 1;
@@ -369,10 +421,21 @@ void ADC_input(void)
 #if BOARD_YARDFORCE500_VARIANT_B
     /* TC is sticky even though the circular NDTR counter wraps. Equal NDTR
      * readings across 10 ms therefore cannot hide a stopped DMA stream. */
+#if CHARGE_DIAGNOSTICS
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint8_t completed = adc_diag_tc_pending;
+    adc_diag_tc_pending = 0;
+    __set_PRIMASK(primask);
+    if (completed)
+#else
     if (__HAL_DMA_GET_FLAG(&hdma_adc1, __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_adc1)))
+#endif
     {
+#if !CHARGE_DIAGNOSTICS
         __HAL_DMA_CLEAR_FLAG(&hdma_adc1, __HAL_DMA_GET_TC_FLAG_INDEX(&hdma_adc1)
             | __HAL_DMA_GET_HT_FLAG_INDEX(&hdma_adc1));
+#endif
         adc_last_scan_ms = HAL_GetTick();
         adc_scan_seen = 1;
     }
