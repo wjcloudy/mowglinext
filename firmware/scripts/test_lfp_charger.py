@@ -73,7 +73,7 @@ static void ticks(unsigned n) { while (n--) tick(); }
 static void near(float a, float b) { assert(fabsf(a - b) < 0.0001f); }
 
 static void dock(void) {
-    charge_protection = (charge_protection_t){ .version=1, .inhibited=1 };
+    charge_protection = (charge_protection_t){ .version=2, .inhibited=1 };
     charge_pwm_started = 1;
     charger_set_charge_limits(28.5f, 1.8f);
     charger_set_end_voltage(28.5f);
