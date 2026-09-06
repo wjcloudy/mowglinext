@@ -1,5 +1,12 @@
 # Charging diagnostic firmware for mower .118
 
+**Charging-fix branch:** see [CHARGING-MAINTENANCE.md](CHARGING-MAINTENANCE.md)
+for the implemented input-loss guard, bounded restart, failed-output latch and
+ADC freshness correction. The observation-only behavior and deployment identity
+described below refer to the original `1bf1d5b8` recorder build. New deployments
+must use their own matching manifest/ELF. The recorder ABI remains compatible;
+freeze reason 3 now also identifies an exhausted contact-restart budget.
+
 For deployed process names, evidence paths, operator actions and the route after
 a failure, see [the .118 diagnostic runbook](DIAGNOSTIC-RUNBOOK-118.md).
 See also [the motor-temperature investigation](TEMPERATURE-INVESTIGATION-118.md).

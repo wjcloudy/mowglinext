@@ -37,6 +37,18 @@ void ChargeDiag_MissedBatch(void)
     if (!charge_diag.freeze_reason) ++charge_diag.missed_batches;
 }
 
+void ChargeDiag_Freeze(uint32_t now, uint32_t reason)
+{
+    uint32_t mask = __get_PRIMASK();
+    __disable_irq();
+    if (!charge_diag.freeze_reason) {
+        charge_diag.trigger_tick = now;
+        __DMB();
+        charge_diag.freeze_reason = reason;
+    }
+    __set_PRIMASK(mask);
+}
+
 void ChargeDiag_Control(uint32_t now, uint16_t pwm, uint8_t state, uint8_t fault,
     float battery, float output, float input, float current,
     float current_before_offset, float temperature)

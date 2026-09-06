@@ -27,6 +27,8 @@ typedef struct {
 extern volatile charge_diag_t charge_diag;
 void ChargeDiag_RawBatch(uint32_t now, const uint16_t samples[20]);
 void ChargeDiag_MissedBatch(void);
+/* Foreground only: 1 ADC, 2 failed output, 3 restart budget exhausted. */
+void ChargeDiag_Freeze(uint32_t now, uint32_t reason);
 void ChargeDiag_Control(uint32_t now, uint16_t pwm, uint8_t state, uint8_t fault,
     float battery, float output, float input, float current,
     float current_before_offset, float temperature);

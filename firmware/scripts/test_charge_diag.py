@@ -47,9 +47,9 @@ int main(void) {
     DMA2_Stream0_IRQHandler();
     assert(charge_diag.raw_count == 12 && charge_diag.missed_batches == 3);
     assert(test_dma_flags == 3);
-    // IRQ must not swallow a DMA error alongside a completion.
+    // IRQ must latch errors before acknowledging them (avoid an IRQ storm).
     test_remaining = 20; test_dma_flags = 2 | 16;
-    DMA2_Stream0_IRQHandler(); assert(test_dma_flags == 16);
+    DMA2_Stream0_IRQHandler(); assert(test_dma_flags == 0 && ADC_ChargingFaulted());
     assert(!ADC_ChargingHealthy());
     reset(); clear_diag();
     uint16_t scans[20] = {0};
@@ -87,6 +87,26 @@ int main(void) {
     clear_diag();
     ChargeDiag_Control(900, 0, 0, 1, 26, 1, 28, -.5f, -.7f, 13);
     assert(charge_diag.freeze_reason == 1);
+    // Protection must inspect the ENTIRE DMA half, even after diagnostics freeze.
+    reset(); clear_diag(); fresh();
+    charge_protection.inhibited=0; charge_protection.starts=1;
+    charge_pwm_started=1; test_timer.CCR1=1352;
+    adc_inputDmaBuf[3]=0; // first row low; the last row still has good input
+    test_remaining=20; test_dma_flags=2;
+    DMA2_Stream0_IRQHandler();
+    assert(charge_protection.inhibited && test_timer.CCR1==0);
+    ChargeDiag_Freeze(test_tick,3);
+    charge_protection.inhibited=0; test_timer.CCR1=1352;
+    test_remaining=20; test_dma_flags=2;
+    DMA2_Stream0_IRQHandler(); assert(charge_protection.inhibited && test_timer.CCR1==0);
+    // A slow foreground poll must not fault when IRQ acquisition stayed fresh.
+    reset(); fresh();
+    for (unsigned i=0; i<5; ++i) {
+        test_tick+=8; test_remaining=40; test_dma_flags=1;
+        DMA2_Stream0_IRQHandler();
+    }
+    ADC_input(); assert(ADC_ChargingHealthy() && !ADC_ChargingFaulted());
+    puts("PASS: low/high in one DMA batch cuts PWM, protection survives freeze, fresh IRQ data survives foreground delay");
     puts("PASS: DMA half ordering, late/moving batches, retained error/TC flags, ring wrap, debounce, freeze, tick wrap and PWM unchanged");
     return 0;
 }
@@ -102,8 +122,6 @@ def main():
                       'void adc_charging_SetChannel(ADC_Charging_channelSelection_e channel)']:
         source = adc.remove_function(source, signature)
     test = adc.TEST.replace('int main(void)', 'int baseline_main(void)')
-    test = test.replace('    test_dma_flags |= 1u;',
-                        '    test_dma_flags |= 1u; DMA2_Stream0_IRQHandler();')
     test = test.replace('    adc_charging_fault =', '    adc_diag_tc_pending = 0;\n    adc_charging_fault =')
     with tempfile.TemporaryDirectory(prefix='charge-diag-') as directory:
         out = Path(directory)

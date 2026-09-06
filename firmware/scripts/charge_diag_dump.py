@@ -32,7 +32,7 @@ def decode(blob):
     if len(blob) != SIZE:
         raise ValueError('Wrong dump length')
     h = header(blob)
-    if h['freeze_reason'] not in (1, 2) or h['raw_seq'] & 1 or h['control_seq'] & 1:
+    if h['freeze_reason'] not in (1, 2, 3) or h['raw_seq'] & 1 or h['control_seq'] & 1:
         raise ValueError('Recorder is live or being written; capture after freeze')
     def rows(count, capacity, start, fmt, keys):
         return [dict(zip(keys, fmt.unpack_from(blob, start + (i % capacity) * fmt.size)))

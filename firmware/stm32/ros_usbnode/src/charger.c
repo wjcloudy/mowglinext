@@ -18,6 +18,7 @@
 #include "adc.h"
 #include "charger.h"
 #include "charge_diag.h"
+#include "charge_protection.h"
 /******************************************************************************
  * Module Preprocessor Constants
  *******************************************************************************/
@@ -52,6 +53,99 @@ static CHARGER_STATE_e charger_state = CHARGER_STATE_IDLE;
 static float charge_end_voltage=BAT_CHARGE_CUTOFF_VOLTAGE ;
 #if BOARD_YARDFORCE500B_LFP
 static uint16_t cv_entry_debounce = 0; //CLOUDY consecutive CC cycles with battery_voltage >= trip
+volatile charge_protection_t charge_protection = { .version = 1, .inhibited = 1 };
+static uint8_t charge_pwm_started;
+static uint32_t charger_last_rise_ms, charger_started_ms, output_suspect_since;
+static uint8_t output_suspect;
+
+/* CLOUDY: loss detection is an acquisition-side, zero-only override. Never
+ * release here: a low row followed by high rows in one DMA batch must still
+ * force the foreground state machine through a new zero-duty startup. */
+void Charger_InputInvalid(void)
+{
+    if (!charge_protection.inhibited && charge_protection.starts) {
+        ++charge_protection.losses;
+        charge_protection.restart_pending = 1;
+    }
+    charge_protection.inhibited = 1;
+    charge_protection.qualified = 0;
+    if (charge_pwm_started) TIM1->CCR1 = 0;
+}
+
+void Charger_InputSample(uint16_t raw, uint32_t now)
+{
+    if (charge_protection.input_seen &&
+        (uint32_t)(now - charge_protection.last_input_ms) > CHARGE_INPUT_FRESH_MS)
+        Charger_InputInvalid();
+    charge_protection.input_seen = 1;
+    charge_protection.last_input_ms = now;
+    charge_protection.raw_input = raw;
+    if (raw <= CHARGE_INPUT_LOSS_RAW) {
+        Charger_InputInvalid();
+    } else if (charge_protection.inhibited) {
+        if (raw < CHARGE_INPUT_RECOVER_RAW) charge_protection.qualified = 0;
+        else if (!charge_protection.qualified) {
+            charge_protection.stable_since = now;
+            charge_protection.qualified = 1;
+        }
+    }
+}
+
+/* Called with interrupts masked, just like the final PWM commit. Elapsed time
+ * and fresh raw samples qualify restart, not filtered voltage or call counts.
+ * Faults deliberately latch until MCU reboot: no automatic OCP retry. */
+static uint8_t charger_allow_power(uint32_t now)
+{
+    if (!charge_protection.input_seen ||
+        (uint32_t)(now - charge_protection.last_input_ms) > CHARGE_INPUT_FRESH_MS)
+        Charger_InputInvalid();
+    if (charge_protection.fault) return 0;
+    if (!charge_protection.inhibited) return 1;
+    if (!charge_protection.qualified ||
+        (uint32_t)(now - charge_protection.stable_since) < CHARGE_INPUT_STABLE_MS)
+        return 0;
+    if (charge_protection.restart_pending) {
+        if (!charge_protection.window_active ||
+            (uint32_t)(now - charge_protection.restart_window_ms) >= CHARGE_RESTART_WINDOW_MS) {
+            charge_protection.restart_window_ms = now;
+            charge_protection.restarts = 0;
+            charge_protection.window_active = 1;
+        }
+        if (charge_protection.restarts >= CHARGE_RESTART_LIMIT) {
+            charge_protection.fault = CHARGE_FAULT_RESTART_LIMIT;
+            return 0;
+        }
+        ++charge_protection.restarts;
+    }
+    charge_protection.restart_pending = 0;
+    charge_protection.inhibited = 0;
+    ++charge_protection.starts;
+    return 2; /* New qualified connection: discard the previous PWM/state. */
+}
+
+static uint16_t charger_backoff_step(float over)
+{
+    return over > 0.5f ? 16 : over > 0.25f ? 6 : over > 0.1f ? 2 : 1;
+}
+
+static void charger_reduce_pwm(uint16_t step)
+{
+    /* The normal regulating floor must NEVER raise startup/zero duty. */
+    uint16_t floor = chargecontrol_pwm_val >= MIN_PWM_VALUE ? MIN_PWM_VALUE : 0;
+    chargecontrol_pwm_val = chargecontrol_pwm_val > floor + step
+        ? chargecontrol_pwm_val - step : floor;
+}
+
+static void charger_increase_pwm(void)
+{
+    uint32_t now = HAL_GetTick();
+    /* Protection may run faster than regulation. Never multiply ramp rate or
+     * catch up missed increments after a delayed foreground update. */
+    if ((uint32_t)(now - charger_last_rise_ms) >= 11u && chargecontrol_pwm_val < MAX_PWM_VALUE) {
+        ++chargecontrol_pwm_val;
+        charger_last_rise_ms = now;
+    }
+}
 #endif
 
 /* Runtime charge ceiling (PKT_ID_SET_SAFETY_LIMITS). Seeded with the compile-time
@@ -189,6 +283,9 @@ void charger_set_charge_limits(float max_voltage, float max_current) {
   TIM1->CCR1 = 0;  
   HAL_TIM_PWM_Start(&TIM1_Handle, TIM_CHANNEL_1);
   HAL_TIMEx_PWMN_Start(&TIM1_Handle, TIM_CHANNEL_1);
+#if BOARD_YARDFORCE500B_LFP
+  charge_pwm_started = 1; /* ADC is initialized first; its hook must not start TIM1. */
+#endif
   DB_TRACE(" * Charge Controler PWM Timers initialized\r\n");
 }
 
@@ -229,6 +326,8 @@ void ChargeController(void)
 #endif
 #if BOARD_YARDFORCE500B_LFP
     cv_entry_debounce = 0;
+    Charger_InputInvalid();
+    if (ADC_ChargingFaulted()) charge_protection.fault = CHARGE_FAULT_ADC;
 #endif
     return;
   }
@@ -239,21 +338,32 @@ void ChargeController(void)
       ? g_max_charge_current : FLOAT_CV_CURRENT;
 #endif
 
-  /*charger disconnected force idle state*/
+  /* CLOUDY charging-only overlay: dock debounce must never retain PWM across
+   * contact loss. Keep the acquire/release and final register commit paired. */
 #if BOARD_YARDFORCE500B_LFP
-  /* CLOUDY: debounce the undock detection. A CC current overshoot (or a noisy charger-input
-     reading) can momentarily sag chargerInputVoltage below MIN_DOCKED_VOLTAGE; without a
-     debounce that instantly forces IDLE -> PWM 0 -> CONNECTED re-cal, breaking the charge for
-     no reason. Require the input to stay low for UNDOCK_DEBOUNCE_CYCLES before declaring it. */
-  static uint16_t undock_debounce = 0;
-  if (chargerInputVoltage < MIN_DOCKED_VOLTAGE) {
-    if (undock_debounce < UNDOCK_DEBOUNCE_CYCLES) undock_debounce++;
-  } else {
-    undock_debounce = 0;
-  }
-  if (undock_debounce >= UNDOCK_DEBOUNCE_CYCLES) {
+  uint32_t irq_mask = __get_PRIMASK();
+  __disable_irq();
+  uint8_t allowed = charger_allow_power(HAL_GetTick());
+  __set_PRIMASK(irq_mask);
+  if (!allowed) {
+#if CHARGE_DIAGNOSTICS
+    ChargeDiag_Control(HAL_GetTick(), chargecontrol_pwm_val, charger_state,
+        ADC_ChargingFaulted(), battery_voltage, charge_voltage, chargerInputVoltage,
+        current, current_without_offset, blade_temperature);
+    if (charge_protection.fault) ChargeDiag_Freeze(HAL_GetTick(), charge_protection.fault);
+#endif
     charger_state = CHARGER_STATE_IDLE;
+    chargecontrol_pwm_val = chargecontrol_is_charging = 0;
+    TIM1->CCR1 = 0;
     cv_entry_debounce = 0;
+    output_suspect = 0;
+    goto charge_accounting; /* No TF4 cycling; valid off-dock current still counts. */
+  }
+  if (allowed == 2) {
+    charger_state = CHARGER_STATE_CONNECTED;
+    chargecontrol_pwm_val = 0;
+    cv_entry_debounce = output_suspect = 0;
+    timestamp = charger_started_ms = charger_last_rise_ms = HAL_GetTick();
   }
 #else
   if(( chargerInputVoltage < MIN_DOCKED_VOLTAGE) ){
@@ -290,30 +400,18 @@ void ChargeController(void)
 
     case CHARGER_STATE_CHARGING_CC:
 #if BOARD_YARDFORCE500B_LFP
-        // CLOUDY asymmetric CC regulation: ramp UP gently (single step, +/-0.1A deadband) so a
-        // small duty change on the LFP's low ESR can't overshoot the current, but back OFF FAST
-        // (proportional to the overshoot) when current runs high. The earlier symmetric single
-        // step backed off only -1/cycle (10ms), so a current spike at high PWM lingered above
-        // this board's hardware overcurrent lockout long enough to LATCH it (charge then dies
-        // until a redock). The proportional backoff claws PWM down hard on a real spike, matching
-        // the reference build that runs 1395 trip-free. Floored at MIN_PWM_VALUE so CC never
-        // slams PWM to zero - it ramps down to the floor and hands off to CV / IDLE.
+        // CLOUDY: retain asymmetric CC control (slow rise, proportional fall).
+        // Hardware OCP remains a hypothesis, not something this loop can prove
+        // or prevent at switching timescales. The contact guard bypasses the
+        // regulating floor; reductions must never raise a startup duty below it.
         if ((current > (g_max_charge_current + 0.1f)) || (battery_voltage > charge_target))
         {
-            uint16_t step = 1;
-            float over = current - g_max_charge_current;   // <=0 when backing off for the CV knee
-            if (over > 0.5f)       step = 16;            // hard overcurrent: dump PWM before the OCP latches
-            else if (over > 0.25f) step = 6;
-            else if (over > 0.1f)  step = 2;
-            if (chargecontrol_pwm_val > (uint16_t)(MIN_PWM_VALUE + step))
-                chargecontrol_pwm_val -= step;
-            else
-                chargecontrol_pwm_val = MIN_PWM_VALUE;
+            charger_reduce_pwm(charger_backoff_step(current - g_max_charge_current));
         }
         if ((battery_voltage < charge_target) && (current < (g_max_charge_current - 0.1f))
             && (chargecontrol_pwm_val < MAX_PWM_VALUE))
         {
-            chargecontrol_pwm_val++;
+            charger_increase_pwm();
         }
 
         //CLOUDY switch to CV on the actual battery voltage (not the charge-rail voltage),
@@ -375,18 +473,20 @@ void ChargeController(void)
         {
           //CLOUDY only push more current while we are below the float-current target
           if (current < float_current_limit) {
-            chargecontrol_pwm_val++;
+            charger_increase_pwm();
           }
         }
         if ((battery_voltage > (cv_target + CV_VOLTAGE_DEADBAND) && (chargecontrol_pwm_val > MIN_PWM_VALUE)) || (charge_voltage > (g_max_charge_voltage) && (chargecontrol_pwm_val > MIN_PWM_VALUE)))
         {
-          chargecontrol_pwm_val--;
+          if (current <= float_current_limit) charger_reduce_pwm(1);
         }
 
         //CLOUDY fixed float/CV current limit (was g_max_charge_current/10), floored at MIN_PWM_VALUE
-        if ((current > float_current_limit) && chargecontrol_pwm_val > MIN_PWM_VALUE)
+        if (current > float_current_limit)
         {
-            chargecontrol_pwm_val--;
+            /* Same proportional priority as CC; do not spend 16 foreground
+             * cycles removing 16 counts during a float-current excursion. */
+            charger_reduce_pwm(charger_backoff_step(current - float_current_limit));
         }
 
         /* battery full ? */
@@ -448,6 +548,9 @@ void ChargeController(void)
         break;
     }
     
+#if BOARD_YARDFORCE500B_LFP
+charge_accounting:
+#endif
     ampere_acc.f += ((current - charge_current_offset.f)/(100*60*60));
 #if BOARD_YARDFORCE500B_LFP
     if(ampere_acc.f >= BATTERY_CAPACITY)ampere_acc.f = BATTERY_CAPACITY;
@@ -475,7 +578,42 @@ void ChargeController(void)
         chargecontrol_pwm_val = 1350;
     }
 #endif
+#if BOARD_YARDFORCE500B_LFP
+    /* Output and input are separate ADC rails. A healthy dock input does not
+     * establish delivered charge. Retain pre-shutdown PWM in the recorder. */
+    uint32_t now = HAL_GetTick();
+    uint8_t failed_output = (charger_state == CHARGER_STATE_CHARGING_CC ||
+        charger_state == CHARGER_STATE_CHARGING_CV) && chargecontrol_pwm_val >= 1200 &&
+        (uint32_t)(now - charger_started_ms) >= 2000u && chargerInputVoltage >= 22.0f &&
+        battery_voltage > 20.0f && charge_voltage < battery_voltage * 0.5f && current < 0.0f;
+    if (failed_output) {
+        if (!output_suspect) { output_suspect = 1; output_suspect_since = now; }
+        if ((uint32_t)(now - output_suspect_since) >= 250u) {
+#if CHARGE_DIAGNOSTICS
+            ChargeDiag_Control(now, chargecontrol_pwm_val, charger_state, ADC_ChargingFaulted(),
+                battery_voltage, charge_voltage, chargerInputVoltage, current,
+                current_without_offset, blade_temperature);
+            ChargeDiag_Freeze(now, CHARGE_FAULT_OUTPUT);
+#endif
+            charge_protection.fault = CHARGE_FAULT_OUTPUT;
+            Charger_InputInvalid();
+        }
+    } else output_suspect = 0;
+
+    /* The input IRQ can interrupt all calculations above. Test the inhibit
+     * again under the SAME IRQ mask as the write, so no stale high-duty write
+     * can undo its zero-only override. Do not remove this on upstream merges. */
+    irq_mask = __get_PRIMASK();
+    __disable_irq();
+    if (charge_protection.inhibited || charge_protection.fault) {
+        chargecontrol_pwm_val = chargecontrol_is_charging = 0;
+        charger_state = CHARGER_STATE_IDLE;
+    }
     TIM1->CCR1 = chargecontrol_pwm_val;
+    __set_PRIMASK(irq_mask);
+#else
+    TIM1->CCR1 = chargecontrol_pwm_val;
+#endif
 #if CHARGE_DIAGNOSTICS
     ChargeDiag_Control(HAL_GetTick(), chargecontrol_pwm_val, charger_state,
         ADC_ChargingFaulted(), battery_voltage, charge_voltage,
