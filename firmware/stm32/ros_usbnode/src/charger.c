@@ -53,7 +53,7 @@ static CHARGER_STATE_e charger_state = CHARGER_STATE_IDLE;
 static float charge_end_voltage=BAT_CHARGE_CUTOFF_VOLTAGE ;
 #if BOARD_YARDFORCE500B_LFP
 static uint16_t cv_entry_debounce = 0; //CLOUDY consecutive CC cycles with battery_voltage >= trip
-volatile charge_protection_t charge_protection = { .version = 1, .inhibited = 1 };
+volatile charge_protection_t charge_protection = { .version = 2, .inhibited = 1 };
 static uint8_t charge_pwm_started;
 static uint32_t charger_last_rise_ms, charger_started_ms, output_suspect_since;
 static uint8_t output_suspect;
@@ -93,13 +93,25 @@ void Charger_InputSample(uint16_t raw, uint32_t now)
 
 /* Called with interrupts masked, just like the final PWM commit. Elapsed time
  * and fresh raw samples qualify restart, not filtered voltage or call counts.
- * Faults deliberately latch until MCU reboot: no automatic OCP retry. */
+ * ADC/output faults latch until MCU reboot; contact retries only rate-limit. */
 static uint8_t charger_allow_power(uint32_t now)
 {
     if (!charge_protection.input_seen ||
         (uint32_t)(now - charge_protection.last_input_ms) > CHARGE_INPUT_FRESH_MS)
         Charger_InputInvalid();
     if (charge_protection.fault) return 0;
+    /* CLOUDY: manual redocking/bounce must not strand a healthy charger until
+     * reboot. Exhausting the contact budget starts a full off-time instead.
+     * Contact changes cannot shorten or restart this timer. Fresh/stable input
+     * below still gates release; no saved duty is reused on cooldown expiry.
+     * This is NOT an automatic retry of an ADC or failed-output fault. */
+    if (charge_protection.cooldown_active) {
+        if ((uint32_t)(now - charge_protection.cooldown_since) < CHARGE_RESTART_COOLDOWN_MS)
+            return 0;
+        charge_protection.cooldown_active = 0;
+        charge_protection.window_active = 0;
+        charge_protection.restarts = 0;
+    }
     if (!charge_protection.inhibited) return 1;
     if (!charge_protection.qualified ||
         (uint32_t)(now - charge_protection.stable_since) < CHARGE_INPUT_STABLE_MS)
@@ -112,7 +124,9 @@ static uint8_t charger_allow_power(uint32_t now)
             charge_protection.window_active = 1;
         }
         if (charge_protection.restarts >= CHARGE_RESTART_LIMIT) {
-            charge_protection.fault = CHARGE_FAULT_RESTART_LIMIT;
+            charge_protection.cooldown_active = 1;
+            charge_protection.cooldown_since = now;
+            ++charge_protection.cooldowns;
             return 0;
         }
         ++charge_protection.restarts;

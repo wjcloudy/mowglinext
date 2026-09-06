@@ -12,12 +12,14 @@
 #define CHARGE_INPUT_FRESH_MS 30u
 #define CHARGE_RESTART_WINDOW_MS 60000u
 #define CHARGE_RESTART_LIMIT 3u
+#define CHARGE_RESTART_COOLDOWN_MS 60000u /* All PWM off, then fresh input qualification. */
 enum { CHARGE_FAULT_NONE, CHARGE_FAULT_ADC, CHARGE_FAULT_OUTPUT,
-       CHARGE_FAULT_RESTART_LIMIT };
+       CHARGE_FAULT_RESTART_LIMIT }; /* 3 reserved for older, latched recordings. */
 typedef struct {
     uint32_t version, inhibited, fault, input_seen, qualified;
     uint32_t stable_since, last_input_ms, raw_input, losses, starts;
     uint32_t restart_window_ms, restarts, window_active, restart_pending;
+    uint32_t cooldown_active, cooldown_since, cooldowns; /* RAM ABI v2 append-only. */
 } charge_protection_t;
 extern volatile charge_protection_t charge_protection;
 /* ADC writer: every completed input sample, including historical DMA rows.

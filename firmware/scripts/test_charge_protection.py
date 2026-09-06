@@ -47,9 +47,54 @@ int main(void) {
         stable(251); ChargeController();
         if (attempt<3) { assert(!charge_protection.fault); ticks(11); }
     }
-    assert(charge_protection.fault==CHARGE_FAULT_RESTART_LIMIT && TIM1->CCR1==0);
-    stable(61000); ChargeController(); assert(TIM1->CCR1==0 && charge_protection.fault);
-    puts("PASS: three contact-recovery attempts allowed; fourth latches, time alone cannot clear fault");
+    assert(!charge_protection.fault && charge_protection.cooldown_active && TIM1->CCR1==0);
+    assert(charge_protection.cooldowns==1 && charge_protection.restarts==3);
+    stable(59999); ChargeController(); assert(TIM1->CCR1==0 && charge_protection.cooldown_active);
+    stable(1); ChargeController();
+    assert(!charge_protection.cooldown_active && !charge_protection.inhibited);
+    assert(charger_state==CHARGER_STATE_CONNECTED && TIM1->CCR1==0 && charge_protection.restarts==1);
+    ticks(10); assert(TIM1->CCR1==0);
+    tick(); assert(TIM1->CCR1==1);
+    puts("PASS: fourth contact restart pauses 60 seconds, then resumes from zero without reboot");
+
+    // A second burst is bounded too; bounce cannot shorten or extend cooldown.
+    for (unsigned attempt=0; attempt<3; ++attempt) {
+        Charger_InputSample(0,test_tick); ChargeController();
+        stable(251); ChargeController();
+        if (attempt<2) ticks(11);
+    }
+    assert(charge_protection.cooldown_active && charge_protection.cooldowns==2);
+    unsigned cooldown_start=charge_protection.cooldown_since;
+    stable(59900); Charger_InputSample(0,test_tick); ChargeController();
+    assert(charge_protection.cooldown_since==cooldown_start && TIM1->CCR1==0);
+    stable(100); ChargeController(); assert(charge_protection.inhibited && TIM1->CCR1==0);
+    stable(150); ChargeController(); assert(charge_protection.inhibited);
+    stable(1); ChargeController(); assert(!charge_protection.inhibited && TIM1->CCR1==0);
+    puts("PASS: repeated bursts remain bounded; expiry still requires 250 ms of fresh stable input");
+
+    // Expiry without fresh samples must not energize the charger.
+    dock(); Charger_InputSample(0,test_tick); ChargeController();
+    charge_protection.cooldown_active=1; charge_protection.cooldown_since=test_tick;
+    test_tick+=60000; ChargeController(); assert(charge_protection.inhibited && TIM1->CCR1==0);
+    stable(251); ChargeController(); assert(!charge_protection.inhibited && TIM1->CCR1==0);
+
+    // Unsigned elapsed time must work across the 32-bit millisecond wrap.
+    dock(); test_tick=UINT32_MAX-100;
+    Charger_InputSample(0,test_tick); ChargeController();
+    charge_protection.cooldown_active=1; charge_protection.cooldown_since=test_tick;
+    stable(59999); ChargeController(); assert(charge_protection.cooldown_active && TIM1->CCR1==0);
+    stable(1); ChargeController(); assert(!charge_protection.inhibited && TIM1->CCR1==0);
+    puts("PASS: cooldown expiry rejects stale input and survives tick wrap");
+
+    // Neither genuine fault is cleared by contact-cooldown expiry.
+    for (unsigned fault=CHARGE_FAULT_ADC; fault<=CHARGE_FAULT_OUTPUT; ++fault) {
+        dock(); Charger_InputSample(0,test_tick); ChargeController();
+        charge_protection.cooldown_active=1; charge_protection.cooldown_since=test_tick;
+        charge_protection.fault=fault;
+        stable(61000); ChargeController();
+        assert(charge_protection.fault==fault && TIM1->CCR1==0 && charge_protection.inhibited);
+    }
+    puts("PASS: cooldown never clears ADC or failed-output faults");
 
     dock(); chargecontrol_pwm_val=1352; current=1.8f; tick();
     test_tick+=31; ChargeController(); assert(TIM1->CCR1==0 && charge_protection.inhibited);
