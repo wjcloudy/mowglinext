@@ -1,6 +1,6 @@
 # PR 540 updater screenshots
 
-All 39 current screenshots were regenerated on 7 September 2026 for the simplified
+All 41 current screenshots were regenerated on 7 September 2026 for the simplified
 installed/available release UI, running version footer and complete notification captures.
 Reproduce: `cd gui/web && npx playwright test tests/e2e/host-updater.spec.ts --workers=2`.
 
@@ -36,3 +36,10 @@ base of the custom branch and selects its newer GUI build. Dev base plus GUI
 from another branch is unsupported and is not depicted as installable.
 
 All 39 screenshots refreshed with Review update / Examiner la mise à jour wording.
+
+Advanced date refresh: all 41 screenshots regenerated. Installed image Built dates
+and release Published dates are separate, formatted with local time and timezone.
+Component/updater dropdowns include publication times and wrap on mobile. Added
+desktop/mobile dated dev dropdown examples. The third dev example uses verified
+upstream a8447afc4d554fc70141f2a12ea0f3e30c15955c (2026-09-06T18:36:53Z).
+Installed-image build dates and deployment publication dates are simulated.
