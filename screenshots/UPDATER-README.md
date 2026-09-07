@@ -23,3 +23,6 @@ on the Home page (desktop 1440x1000, mobile 390x844). They simulate an upstream
 Production v1.3.0 deployment notice and updater notice, not live availability.
 The mobile panel is kept within the viewport; Open Updates navigates to settings
 without checking remotely or installing. Total current PR screenshots: 32.
+
+All 32 current screenshots were refreshed after the Simple-mode wording change:
+Running / After update. Follow selected release remains an Advanced selector.
