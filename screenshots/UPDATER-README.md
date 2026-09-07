@@ -16,3 +16,10 @@ selectors, empty release lists, membership add/remove/keep/local and custom bran
 
 The older live-update-checks files are historical captures of the previous manual
 comparison screen and are not linked as current screenshots by PR 540.
+
+
+Four additional notification screenshots show the unread badge and opened bell
+on the Home page (desktop 1440x1000, mobile 390x844). They simulate an upstream
+Production v1.3.0 deployment notice and updater notice, not live availability.
+The mobile panel is kept within the viewport; Open Updates navigates to settings
+without checking remotely or installing. Total current PR screenshots: 32.
