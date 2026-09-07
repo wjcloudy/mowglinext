@@ -34,3 +34,5 @@ used for illustrative build timestamps). No claim that these branches publish
 compatible updater assets is made. The one-component example keeps the installed
 base of the custom branch and selects its newer GUI build. Dev base plus GUI
 from another branch is unsupported and is not depicted as installable.
+
+All 39 screenshots refreshed with Review update / Examiner la mise à jour wording.
