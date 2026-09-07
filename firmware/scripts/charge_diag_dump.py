@@ -12,7 +12,14 @@ import time
 HEADER = struct.Struct('<12I')
 RAW = struct.Struct('<I6H')
 CONTROL = struct.Struct('<IIHBB6fI')
-SIZE = 21552
+SIZES = {1: 21552, 2: 29688}
+SIZE = SIZES[2]
+CONTEXT = struct.Struct('<3f6IHBB')
+DETAIL = struct.Struct('<IIHBB6fI3f6IHBBI')
+CONTROL_KEYS = ('tick', 'gap_ms', 'pwm', 'state', 'adc_fault', 'battery', 'output',
+                'input', 'current', 'current_before_offset', 'temperature', 'missed_batches')
+CONTEXT_KEYS = ('target', 'current_limit', 'float_target', 'ccr1', 'arr', 'bdtr',
+                'ccer', 'losses', 'starts', 'cv_count', 'inhibited', 'protection_fault')
 KEYS = ('magic', 'version', 'raw_capacity', 'control_capacity', 'raw_count',
         'control_count', 'freeze_reason', 'trigger_tick', 'missed_batches',
         'max_gap_ms', 'raw_seq', 'control_seq')
@@ -22,17 +29,18 @@ def header(blob):
     if len(blob) < HEADER.size:
         raise ValueError('Truncated header')
     h = dict(zip(KEYS, HEADER.unpack_from(blob)))
-    if (h['magic'], h['version'], h['raw_capacity'], h['control_capacity']) != (
-            0x43484447, 1, 1024, 128):
+    if h['version'] not in SIZES or (h['magic'], h['raw_capacity'], h['control_capacity']) != (
+            0x43484447, 1024, 128):
         raise ValueError('Wrong diagnostic firmware address or unsupported ABI')
     return h
 
 
 def decode(blob):
-    if len(blob) != SIZE:
-        raise ValueError('Wrong dump length')
     h = header(blob)
-    if h['freeze_reason'] not in (1, 2, 3) or h['raw_seq'] & 1 or h['control_seq'] & 1:
+    if len(blob) != SIZES[h['version']]:
+        raise ValueError('Wrong dump length')
+    reasons = (1, 2, 3, 4) if h['version'] == 2 else (1, 2, 3)
+    if h['freeze_reason'] not in reasons or h['raw_seq'] & 1 or h['control_seq'] & 1:
         raise ValueError('Recorder is live or being written; capture after freeze')
     def rows(count, capacity, start, fmt, keys):
         return [dict(zip(keys, fmt.unpack_from(blob, start + (i % capacity) * fmt.size)))
@@ -43,15 +51,32 @@ def decode(blob):
     for r in raw:
         r['current_A_before_offset'] = (r['adc_current'] / 4095 * 3.3 - 2.5) * 100 / 12
     control = rows(h['control_count'], 128, HEADER.size + 1024 * RAW.size, CONTROL,
-                   ('tick', 'gap_ms', 'pwm', 'state', 'adc_fault', 'battery', 'output',
-                    'input', 'current', 'current_before_offset', 'temperature', 'missed_batches'))
-    return {'header': h, 'raw': raw, 'control': control}
+                   CONTROL_KEYS)
+    data = {'header': h, 'raw': raw, 'control': control}
+    if h['version'] == 2:
+        offset = SIZES[1]
+        extra_keys = ('slow_capacity', 'event_capacity', 'slow_count', 'event_count',
+                      'early_armed', 'early_since', 'early_suspect', 'early_first_tick')
+        h.update(zip(extra_keys, struct.unpack_from('<8I', blob, offset)))
+        if (h['slow_capacity'], h['event_capacity']) != (64, 32):
+            raise ValueError('Wrong detail ring capacities')
+        offset += 32
+        data['context'] = dict(zip(CONTEXT_KEYS, CONTEXT.unpack_from(blob, offset)))
+        offset += CONTEXT.size
+        for name, capacity in (('slow', 64), ('events', 32)):
+            count = h['slow_count' if name == 'slow' else 'event_count']
+            data[name] = rows(count, capacity, offset, DETAIL,
+                              CONTROL_KEYS + CONTEXT_KEYS + ('reason',))
+            offset += capacity * DETAIL.size
+    return data
 
 
 def save_decoded(blob, directory):
     data = decode(blob)
     (directory / 'decoded.json').write_text(json.dumps(data, indent=2) + '\n')
-    for key in ('raw', 'control'):
+    for key in ('raw', 'control', 'slow', 'events'):
+        if key not in data:
+            continue
         with (directory / (key + '.csv')).open('w', newline='') as f:
             if data[key]:
                 writer = csv.DictWriter(f, fieldnames=data[key][0])
@@ -61,7 +86,7 @@ def save_decoded(blob, directory):
 
 
 def capture(address, directory, watch):
-    if address % 4 or not (0x20000000 <= address <= 0x2000C000 - SIZE):
+    if address % 4 or not (0x20000000 <= address <= 0x20010000 - HEADER.size):
         raise ValueError('Recorder must fit the STM32F401VC SRAM range')
     directory = directory.resolve()
     if not re.fullmatch(r'[A-Za-z0-9_./-]+', str(directory)):
@@ -94,9 +119,12 @@ init
     while True:
         read_regions([('header.bin', HEADER.size)])
         h = header((directory / 'header.bin').read_bytes())
+        size = SIZES[h['version']]
+        if address + size > 0x20010000:
+            raise ValueError('Recorder exceeds STM32F401VC 64 KiB SRAM')
         print(json.dumps(h), flush=True)
         if h['freeze_reason'] and not ((h['raw_seq'] | h['control_seq']) & 1):
-            read_regions([('before.bin', HEADER.size), ('recorder.bin', SIZE), ('after.bin', HEADER.size)])
+            read_regions([('before.bin', HEADER.size), ('recorder.bin', size), ('after.bin', HEADER.size)])
             blob = (directory / 'recorder.bin').read_bytes()
             if not ((directory / 'before.bin').read_bytes() == blob[:HEADER.size]
                     == (directory / 'after.bin').read_bytes()):

@@ -191,6 +191,27 @@ void charger_set_charge_limits(float max_voltage, float max_current) {
   g_max_charge_current = charger_clamp_current(max_current);
 }
 
+#if CHARGE_DIAGNOSTICS
+/* CLOUDY: observation-only context for the near-full/output-loss investigation.
+ * CCR1 is the committed compare value (possibly preceding this control call);
+ * pwm is the foreground request. Neither measures the actual gate waveform. */
+static void charger_record(uint32_t now, uint16_t pwm, uint8_t state, uint8_t fault)
+{
+    float target = charge_end_voltage < g_max_charge_voltage ? charge_end_voltage : g_max_charge_voltage;
+    charge_diag_context_t context = {
+        .target = target, .current_limit = g_max_charge_current,
+        .float_target = target < MAX_FLOAT_CV_VOLTAGE ? target : MAX_FLOAT_CV_VOLTAGE,
+        .ccr1 = TIM1->CCR1, .arr = TIM1->ARR, .bdtr = TIM1->BDTR, .ccer = TIM1->CCER,
+        .losses = charge_protection.losses, .starts = charge_protection.starts,
+        .cv_count = cv_entry_debounce, .inhibited = charge_protection.inhibited,
+        .protection_fault = charge_protection.fault
+    };
+    ChargeDiag_Context(&context);
+    ChargeDiag_Control(now, pwm, state, fault, battery_voltage, charge_voltage,
+        chargerInputVoltage, current, current_without_offset, blade_temperature);
+}
+#endif
+
 /******************************************************************************
  * Function Prototypes
  *******************************************************************************/
@@ -334,9 +355,7 @@ void ChargeController(void)
     chargecontrol_is_charging = 0;
     TIM1->CCR1 = 0;
 #if CHARGE_DIAGNOSTICS
-    ChargeDiag_Control(HAL_GetTick(), 0, 0, ADC_ChargingFaulted(),
-        battery_voltage, charge_voltage, chargerInputVoltage, current,
-        current_without_offset, blade_temperature);
+    charger_record(HAL_GetTick(), 0, 0, ADC_ChargingFaulted());
 #endif
 #if BOARD_YARDFORCE500B_LFP
     cv_entry_debounce = 0;
@@ -361,9 +380,7 @@ void ChargeController(void)
   __set_PRIMASK(irq_mask);
   if (!allowed) {
 #if CHARGE_DIAGNOSTICS
-    ChargeDiag_Control(HAL_GetTick(), chargecontrol_pwm_val, charger_state,
-        ADC_ChargingFaulted(), battery_voltage, charge_voltage, chargerInputVoltage,
-        current, current_without_offset, blade_temperature);
+    charger_record(HAL_GetTick(), chargecontrol_pwm_val, charger_state, ADC_ChargingFaulted());
     if (charge_protection.fault) ChargeDiag_Freeze(HAL_GetTick(), charge_protection.fault);
 #endif
     charger_state = CHARGER_STATE_IDLE;
@@ -604,9 +621,7 @@ charge_accounting:
         if (!output_suspect) { output_suspect = 1; output_suspect_since = now; }
         if ((uint32_t)(now - output_suspect_since) >= 250u) {
 #if CHARGE_DIAGNOSTICS
-            ChargeDiag_Control(now, chargecontrol_pwm_val, charger_state, ADC_ChargingFaulted(),
-                battery_voltage, charge_voltage, chargerInputVoltage, current,
-                current_without_offset, blade_temperature);
+            charger_record(now, chargecontrol_pwm_val, charger_state, ADC_ChargingFaulted());
             ChargeDiag_Freeze(now, CHARGE_FAULT_OUTPUT);
 #endif
             charge_protection.fault = CHARGE_FAULT_OUTPUT;
@@ -629,9 +644,7 @@ charge_accounting:
     TIM1->CCR1 = chargecontrol_pwm_val;
 #endif
 #if CHARGE_DIAGNOSTICS
-    ChargeDiag_Control(HAL_GetTick(), chargecontrol_pwm_val, charger_state,
-        ADC_ChargingFaulted(), battery_voltage, charge_voltage,
-        chargerInputVoltage, current, current_without_offset, blade_temperature);
+    charger_record(HAL_GetTick(), chargecontrol_pwm_val, charger_state, ADC_ChargingFaulted());
 #endif
     
 }

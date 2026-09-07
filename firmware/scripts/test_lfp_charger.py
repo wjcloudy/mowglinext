@@ -31,7 +31,7 @@ def without_timer_init(source):
 SHIM = r'''
 #include <stdint.h>
 typedef int TIM_HandleTypeDef;
-static struct { uint16_t CCR1; } test_timer;
+static struct { uint32_t CCR1, ARR, BDTR, CCER; } test_timer;
 #define TIM1 (&test_timer)
 static uint32_t test_tick;
 #define HAL_GetTick() test_tick

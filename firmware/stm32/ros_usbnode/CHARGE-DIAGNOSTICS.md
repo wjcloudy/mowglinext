@@ -1,11 +1,20 @@
 # Charging diagnostic firmware for mower .118
 
+**Current recorder (ABI 2):** see [CHARGING-EARLY-CAPTURE.md](CHARGING-EARLY-CAPTURE.md)
+for the 7 September failure evidence, earlier trigger, longer history and
+maximum-duty investigation. The sections below describe the original ABI 1
+deployment and its validated no-trace flashing procedure. ABI 2 uses a new
+record size and matching ELF address. Leave the old .118 watcher paused;
+prefer a single capture after failure, rather than the historical `--watch`
+procedure below. Contact-budget exhaustion now starts a recoverable cooldown
+and does not freeze the recorder (reason 3 is retained for old dumps).
+
 **Charging-fix branch:** see [CHARGING-MAINTENANCE.md](CHARGING-MAINTENANCE.md)
 for the implemented input-loss guard, bounded restart, failed-output latch and
 ADC freshness correction. The observation-only behavior and deployment identity
 described below refer to the original `1bf1d5b8` recorder build. New deployments
-must use their own matching manifest/ELF. The recorder ABI remains compatible;
-freeze reason 3 now also identifies an exhausted contact-restart budget.
+must use their own matching manifest/ELF. The updated decoder supports old ABI 1
+and new ABI 2 dumps.
 
 For deployed process names, evidence paths, operator actions and the route after
 a failure, see [the .118 diagnostic runbook](DIAGNOSTIC-RUNBOOK-118.md).
