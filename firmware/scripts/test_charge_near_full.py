@@ -14,6 +14,9 @@ int main(void) {
     assert(charger_state==CHARGER_STATE_CHARGING_CC);
     assert(chargecontrol_pwm_val==MAX_PWM_VALUE && !charge_protection.fault);
     assert(cv_entry_debounce==0);
+    // A value above the new ceiling must also be clamped on the next update.
+    chargecontrol_pwm_val=1395; tick();
+    assert(chargecontrol_pwm_val==1390 && TIM1->CCR1==1390);
     puts("REPRO: near-full voltage below 28.5 V remains in CC at maximum duty despite negligible current");
 
     dock(); current=0.2f;
@@ -41,11 +44,11 @@ int main(void) {
     puts("REPRO: redocking a previously floating pack starts a new bulk cycle");
 
     // TIM1 upcounter: ARR=1400 gives 1401 counts. With CKD=DIV1 and DTG=40,
-    // max duty leaves only 6 counts for OC1N, less than the 40-count delay.
+    // trial max duty leaves 11 counts for OC1N, less than the 40-count delay.
     // RM0368 section 12.3.11: a pulse shorter than dead time is suppressed.
     assert(1401u-MAX_PWM_VALUE < 40u);
     assert(1401u-1350u > 40u);
-    puts("REVIEW: configured 1395 cap suppresses the complementary pulse; stock 1350 leaves 11 counts after dead time");
+    puts("REVIEW: trial 1390 cap still suppresses the complementary pulse; stock 1350 leaves 11 counts after dead time");
     return 0;
 }
 '''

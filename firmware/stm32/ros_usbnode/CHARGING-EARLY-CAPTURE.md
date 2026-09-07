@@ -1,6 +1,15 @@
 # Early charging capture: .118, 7 September 2026
 
-This diagnostic extends the DMA `Yardforce500B_LFP_DIAG` image installed from
+**1390 trial update:** following the observation-only 1.9.123 deployment, the
+user selected a five-count reduction from 1395 to 1390 to preserve near-full
+headroom. This revision changes only the LFP maximum PWM, retaining ABI 2 and
+all voltage/current/offset/restart settings. It still suppresses the
+complementary pulse (11 counts before 40-count dead time); it is a controlled
+peak-duty experiment, not a fix for pulse suppression. Compare charging
+stability and reachable battery voltage. The findings and 1395 reproductions
+below describe the original incident/build; current tests use the 1390 ceiling.
+
+The original observation-only diagnostic extends the DMA `Yardforce500B_LFP_DIAG` image installed from
 `a84ecfe5` (1.9.122). It changes observation only, with no changes to charge
 limits, PWM regulation, restart policy, ADC acquisition, motors or protocol.
 It retains that base's temperature, blade-reversal and I2C-recovery fixes.
@@ -51,7 +60,7 @@ This follows the complementary-output timing in
 It makes sustained maximum duty a concrete suspect. It does **not** establish
 gate-driver bootstrap requirements, actual transistor waveforms or an
 overcurrent trip. Those need driver/circuit evidence or scope measurements.
-This image deliberately retains 1395 to observe the existing failure; any
+The original 1.9.123 image deliberately retained 1395 to observe the existing failure; any
 lower-cap experiment should be a separately identified build and checked for
 adequate charging headroom. Do not raise the cap or remove dead time.
 
