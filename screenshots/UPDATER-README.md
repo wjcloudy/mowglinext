@@ -10,3 +10,11 @@ Custom combination / GUI override / review: desktop 1440x1400, mobile 390x844.
 Mobile Advanced screenshots scroll to the relevant controls. Review animations
 are settled before capture. These screenshots illustrate the UI, not hardware
 acceptance or completed upstream publication.
+
+
+Release-owned stack review: `host-updater-stack-review-{desktop,mobile}.png`.
+These simulate upstream production v1.2.0 to v1.3.0 with a required navigation
+helper added, a legacy helper retired, GPS retained, LiDAR disabled by installer
+selection, and MQTT kept local. Releases, services and image identities are
+illustrative fixtures, not claims about published upstream builds or hardware.
+The mobile modal keeps installation/cancellation visible while details scroll.
