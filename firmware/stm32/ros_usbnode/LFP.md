@@ -38,7 +38,7 @@ rendering a stock configuration cannot turn the LFP build into a Li-ion profile.
 | Dock input threshold / disconnect debounce | 22.0 V / 20 cycles (~200 ms) |
 | CC-to-CV debounce / return hysteresis | 50 cycles (~500 ms) / 2.0 V |
 | CV deadband | +/-0.2 V |
-| PWM floor / ceiling | 39 / 1395 (timer period 1400) |
+| PWM floor / ceiling | 39 / 1390 (timer period 1400; 7 September peak-duty trial, formerly 1395) |
 | Battery / charge-rail IIR weights | 0.05 / 0.10 |
 
 Bulk PWM rises one count at a time and backs off by 1/2/6/16 counts according
