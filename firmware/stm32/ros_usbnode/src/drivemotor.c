@@ -374,38 +374,58 @@ void DRIVEMOTOR_App_10ms(void) {
             {
                 bump_started = now; //CLOUDY start the bump debounce timer
             }
-            switch (main_eOpenmowerStatus)
+            /*CLOUDY A bump with the charger rail already live IS the dock: on this
+             *machine the charge pins are mounted ON the bumper, so contact and
+             *rail assert together. Hold a stop and let the charge current
+             *establish instead of reversing back out of the cradle.
+             *
+             *This CANNOT be gated on OPENMOWER_STATUS_DOCKING. That value is
+             *never assigned by anything: the ROS1 mower_msgs/HighLevelStatus
+             *SUBSTATE byte that used to select it was dropped when the ROS2
+             *COBS protocol replaced it (pkt_hl_state_t carries current_mode
+             *only, and HL_MODE_* has no docking member), so an auto-dock
+             *arrives here as OPENMOWER_STATUS_MOWING and took the 100 ms
+             *collision reverse straight out of the dock.
+             *
+             *This only overrides the message going out THIS tick --
+             *drivemotor_eState stays DRIVEMOTOR_RUN, so normal cmd_vel drive
+             *resumes on the very next tick once the bumper opens or the rail
+             *drops. Off the dock chargerInputVoltage is ~0, so the collision
+             *behaviour below is reached unchanged. */
+            if (chargerInputVoltage > MIN_DOCKED_VOLTAGE)
             {
-            case OPENMOWER_STATUS_MOWING:
-                if (now - bump_started >= BUMP_MILLIS_WHILE_MOWING)
+                drivemotor_prepareMsg(0, 0, 0, 0);
+            }
+            else
+            {
+                switch (main_eOpenmowerStatus)
                 {
-                    /*hit something, back off a little */
-                    drivemotor_eState = DRIVEMOTOR_BACKWARD;
-                    l_u32Timestamp = HAL_GetTick();
-                }
-                break;
-            case OPENMOWER_STATUS_DOCKING:
-                /* Get voltage from dock, stop the mower*/
-                if (chargerInputVoltage > MIN_DOCKED_VOLTAGE)
-                {
-                    drivemotor_prepareMsg(0, 0, 0, 0);
-                }
-                else
-                { /*hit something, back off a little */
+                case OPENMOWER_STATUS_MOWING:
+                    if (now - bump_started >= BUMP_MILLIS_WHILE_MOWING)
+                    {
+                        /*hit something, back off a little */
+                        drivemotor_eState = DRIVEMOTOR_BACKWARD;
+                        l_u32Timestamp = HAL_GetTick();
+                    }
+                    break;
+                case OPENMOWER_STATUS_DOCKING:
+                    /* Unreachable today (see above); kept so the intended
+                     * docking debounce still applies if HL_MODE_DOCKING is
+                     * ever added to the protocol. The charger-rail case is
+                     * already handled by the guard above. */
                     if (now - bump_started >= BUMP_MILLIS_WHILE_DOCKING)
                     {
                         drivemotor_eState = DRIVEMOTOR_BACKWARD;
                         l_u32Timestamp = HAL_GetTick();
                     }
+                    break;
+                case OPENMOWER_STATUS_UNDOCKING:
+                case OPENMOWER_STATUS_IDLE:
+                case OPENMOWER_STATUS_RECORD:
+                default:
+                    /* nothing to do in these modes*/
+                    break;
                 }
-
-                break;
-            case OPENMOWER_STATUS_UNDOCKING:
-            case OPENMOWER_STATUS_IDLE:
-            case OPENMOWER_STATUS_RECORD:
-            default:
-                /* nothing to do in these modes*/
-                break;
             }
         }
         else

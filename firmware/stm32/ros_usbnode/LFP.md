@@ -76,8 +76,21 @@ No packet change is needed; the current v6 host and firmware must be paired.
 ## Custom hardware and startup
 
 - Blue wheel-lift input remains the front bumper; it is intentionally excluded
-  from wheel-lift emergency reporting. Bump debounce is 100 ms while mowing,
-  500 ms while docking, followed by a one-second reverse. The event is still
+  from wheel-lift emergency reporting. A bump taken while the charger input is
+  already above `MIN_DOCKED_VOLTAGE` is treated as dock contact: the outgoing
+  drive message is held at zero for that tick so the charge current can
+  establish, instead of reversing back out of the cradle. That guard runs ahead
+  of the mode switch, because `OPENMOWER_STATUS_DOCKING` is never assigned --
+  the ROS1 `mower_msgs/HighLevelStatus` SUBSTATE byte that used to select it
+  was dropped when the ROS2 COBS protocol replaced it (`pkt_hl_state_t` carries
+  `current_mode` only), so an auto-dock arrives here as
+  `OPENMOWER_STATUS_MOWING` and used to take the 100 ms collision reverse
+  straight out of the dock. Off the dock the charger input is ~0 and the
+  existing collision behaviour is reached unchanged: 100 ms debounce while
+  mowing (500 ms in the still-unreachable docking case), followed by a
+  one-second reverse. The guard only overrides that tick's message;
+  `drivemotor_eState` stays `DRIVEMOTOR_RUN`, so normal cmd_vel drive resumes
+  as soon as the bumper opens or the rail drops. The event is still
   firmware-local and is not reported to Nav2. Current upstream emergency aborts
   during reverse and settle are retained.
 - Onboard LIS3DH tilt threshold remains 0x2C with the 500 ms trip timeout.
