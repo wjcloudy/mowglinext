@@ -23,7 +23,7 @@ jobs:
   # firmware (what CI builds / what prebuilt binaries ship) and the GUI-rendered
   # firmware can never silently drift apart on a safety value.
   defaults-parity:
-    name: board_defaults single-source guard
+    name: Board defaults and blade reversal regressions
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -37,6 +37,9 @@ jobs:
       - name: Exercise ADC freshness and charger fault cutoff
         run: python3 firmware/scripts/test_adc_charging.py
 
+      - name: Test blade direction and stopped reversal on both board variants
+        run: python3 firmware/scripts/test_blade_reverse.py
+
   build:
     runs-on: ubuntu-latest
     strategy:
@@ -46,6 +49,7 @@ jobs:
           - Yardforce500B
           - Yardforce500B_LFP
           - Yardforce500B_LFP_DEBUG
+          - Yardforce500_COASTDOWN_VALIDATION
     steps:
       - uses: actions/checkout@v6
 
