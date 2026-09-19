@@ -90,3 +90,7 @@ This tree **is** the safety authority described in the root CLAUDE.md § *Safety
 - **Remove the blades** before any bench work: the custom firmware has no tilt sensing on the bench harness, and a flash reboots the board with motors powered.
 
 Charging ADC faults latch PWM off until reboot; see `stm32/ros_usbnode/LFP.md`. The native ADC fault-injection harness is `scripts/test_adc_charging.py`.
+
+## Sensor recovery ownership
+
+Onboard LIS3DH I2C1 transactions and recovery belong to I2C_Onboard_Service in the main loop. Interrupt callbacks use health/tilt snapshots only. Failed/stale readings inhibit motion and detected faults stay latched after recovery until explicit release. See [I2C-RECOVERY.md](stm32/ros_usbnode/I2C-RECOVERY.md); test both recovery paths with firmware/scripts/test_soft_i2c_recovery.py and test_onboard_i2c_recovery.py. The external IMU uses a separate software-I2C bus.
