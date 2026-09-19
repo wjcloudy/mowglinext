@@ -9,7 +9,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -22,6 +22,7 @@ find_package(rclcpp REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(nav2_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(mowgli_interfaces REQUIRED)
 
@@ -31,6 +32,10 @@ find_package(mowgli_interfaces REQUIRED)
 # name.  If found, the MOWGLI_HAS_MOSQUITTO compile definition enables the
 # MosquittoMqttClient implementation in mqtt_bridge_node.cpp.
 # ---------------------------------------------------------------------------
+
+option(MOWGLI_REQUIRE_MOSQUITTO
+  "Fail the configure step when libmosquitto is missing instead of falling back to StubMqttClient (CI and the release image set this so the shipped client is what gets compiled)"
+  OFF)
 
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
@@ -48,6 +53,11 @@ endif()
 
 if(MOSQUITTO_FOUND)
   message(STATUS "libmosquitto found — MosquittoMqttClient will be compiled.")
+elseif(MOWGLI_REQUIRE_MOSQUITTO)
+  message(FATAL_ERROR
+    "libmosquitto NOT found and MOWGLI_REQUIRE_MOSQUITTO=ON — the real "
+    "MosquittoMqttClient would be silently replaced by StubMqttClient and "
+    "never compiled. Install with: sudo apt-get install libmosquitto-dev")
 else()
   message(STATUS
     "libmosquitto NOT found — mqtt_bridge_node will use StubMqttClient. "
@@ -70,13 +80,14 @@ target_include_directories(mowgli_monitoring_core
     $<INSTALL_INTERFACE:include>
 )
 
-ament_target_dependencies(mowgli_monitoring_core
-  rclcpp
-  diagnostic_msgs
-  sensor_msgs
-  nav_msgs
-  geometry_msgs
-  mowgli_interfaces
+target_link_libraries(mowgli_monitoring_core
+  ${rclcpp_TARGETS}
+  ${diagnostic_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${nav2_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 if(MOSQUITTO_FOUND)
@@ -98,13 +109,14 @@ target_link_libraries(diagnostics_node
   mowgli_monitoring_core
 )
 
-ament_target_dependencies(diagnostics_node
-  rclcpp
-  diagnostic_msgs
-  sensor_msgs
-  nav_msgs
-  geometry_msgs
-  mowgli_interfaces
+target_link_libraries(diagnostics_node
+  ${rclcpp_TARGETS}
+  ${diagnostic_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${nav2_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -119,13 +131,14 @@ target_link_libraries(mqtt_bridge_node
   mowgli_monitoring_core
 )
 
-ament_target_dependencies(mqtt_bridge_node
-  rclcpp
-  diagnostic_msgs
-  sensor_msgs
-  nav_msgs
-  geometry_msgs
-  mowgli_interfaces
+target_link_libraries(mqtt_bridge_node
+  ${rclcpp_TARGETS}
+  ${diagnostic_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${nav2_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -172,13 +185,41 @@ if(BUILD_TESTING)
     mowgli_monitoring_core
   )
 
-  ament_target_dependencies(test_diagnostics
-    rclcpp
-    diagnostic_msgs
-    sensor_msgs
-    nav_msgs
-    geometry_msgs
-    mowgli_interfaces
+  target_link_libraries(test_diagnostics
+    ${rclcpp_TARGETS}
+    ${diagnostic_msgs_TARGETS}
+    ${sensor_msgs_TARGETS}
+    ${nav_msgs_TARGETS}
+    ${nav2_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
+  )
+
+  # ROS-free: exercises the shared reduction header on its own.
+  ament_add_gtest(test_path_tracking_stats
+    test/test_path_tracking_stats.cpp
+  )
+
+  target_link_libraries(test_path_tracking_stats
+    ${mowgli_interfaces_TARGETS}
+  )
+
+  ament_add_gtest(test_mqtt_bridge
+    test/test_mqtt_bridge.cpp
+  )
+
+  target_link_libraries(test_mqtt_bridge
+    mowgli_monitoring_core
+  )
+
+  target_link_libraries(test_mqtt_bridge
+    ${rclcpp_TARGETS}
+    ${diagnostic_msgs_TARGETS}
+    ${sensor_msgs_TARGETS}
+    ${nav_msgs_TARGETS}
+    ${nav2_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
   )
 endif()
 

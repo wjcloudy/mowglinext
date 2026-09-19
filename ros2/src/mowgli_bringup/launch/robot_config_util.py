@@ -22,6 +22,7 @@
 # Older FULL installed configs keep working unchanged (every key overrides its
 # identical template default; a no-op merge).
 
+import math
 import copy
 import os
 import sys
@@ -62,6 +63,329 @@ DEFAULT_TOOL_WIDTH_M = 0.18
 # HALF-track: an arc of radius <= track/2 needs the inner wheel to stop or
 # reverse, which is the swath-end carving in issue #499.
 DEFAULT_WHEEL_TRACK_M = 0.325
+
+# ---------------------------------------------------------------------------
+# Chassis footprint geometry
+# ---------------------------------------------------------------------------
+#
+# The Nav2 footprint and everything derived from it must follow the chassis
+# dimensions, because those are operator-editable in the GUI (Settings ->
+# Hardware). Before 2026-09-05 the footprint was built inline in
+# navigation.launch.py while the local-costmap inflation floor that depends on
+# it was a hardcoded literal, so the two silently drifted apart: the floor's
+# own comment justified 0.58 with a circumscribed radius of "~0.572 m", which
+# is what you get with chassis_length 0.54 — a value the template abandoned on
+# 2026-04-26. The floor had been describing a chassis that no longer existed,
+# and was below the real radius (0.586 m) even at the old chassis_width 0.40.
+#
+# These helpers are pure so both call sites read the same geometry and a test
+# can pin it.
+
+# Costmap planning clearance added around the physical chassis.
+CHASSIS_FOOTPRINT_MARGIN_M = 0.05
+
+DEFAULT_CHASSIS_LENGTH_M = 0.60
+DEFAULT_CHASSIS_WIDTH_M = 0.45
+DEFAULT_CHASSIS_CENTER_X_M = 0.18
+
+
+def chassis_footprint(params, margin=CHASSIS_FOOTPRINT_MARGIN_M):
+    """Nav2 footprint extents in base_link, as (front_x, rear_x, half_width).
+
+    `params` is the merged robot config. Missing keys fall back to the
+    in-package template values, so a sparse installed config still yields the
+    shipped chassis rather than zeros.
+    """
+    params = params or {}
+    length = float(params.get("chassis_length", DEFAULT_CHASSIS_LENGTH_M))
+    width = float(params.get("chassis_width", DEFAULT_CHASSIS_WIDTH_M))
+    center_x = float(params.get("chassis_center_x", DEFAULT_CHASSIS_CENTER_X_M))
+    return (
+        center_x + length / 2.0 + margin,
+        center_x - length / 2.0 - margin,
+        width / 2.0 + margin,
+    )
+
+
+def chassis_half_width(params, margin=CHASSIS_FOOTPRINT_MARGIN_M):
+    """Half-width of the Nav2 footprint, i.e. how far the BODY reaches sideways.
+
+    This is the distance every collision check in the stack measures against:
+    the costmap footprint, collision_monitor's polygons and FTC's footprint
+    clearance model all use `chassis_width / 2 + margin`. The coverage planner
+    must inset obstacles and the recorded boundary by at least this much, or it
+    plans a centreline the body cannot follow without touching.
+
+    DERIVED, never a literal: `chassis_width` is operator-editable in the GUI.
+    A hardcoded copy is exactly what broke on 2026-09-16 — the chassis went
+    0.40 m -> 0.45 m, the footprint followed, and `coverage_server.robot_width`
+    stayed at a hardcoded 0.40, so every plan routed the centre 0.20 m from
+    obstacles while the body reached 0.225 m. The robot then drove 2.5 cm into
+    a mapped tree while tracking its path to within 2 cm.
+    """
+    _front, _rear, half_width = chassis_footprint(params, margin)
+    return half_width
+
+
+def chassis_circumscribed_radius(params, margin=CHASSIS_FOOTPRINT_MARGIN_M):
+    """Radius of the smallest circle centred on base_link enclosing the footprint.
+
+    Nav2's inflation layer degrades footprint-cost semantics below this radius,
+    and FTC's obstacle-deviation detector (cost threshold 253) assumes the
+    inscribed band exists — so it is the floor for the local-costmap
+    inflation_radius, not a nicety.
+    """
+    front, rear, half_width = chassis_footprint(params, margin)
+    return math.hypot(max(abs(front), abs(rear)), half_width)
+
+
+# --- Obstacle margins: count the body EXACTLY ONCE per consumer --------------
+#
+# A drawn map obstacle is kept away from by three consumers, and each one has
+# its OWN body model. Growing the obstacle by "the body" for a consumer that
+# already models the body counts it twice; that is what made the robot
+# un-plannable on its own coverage line (37 s transit timeouts, a whole first
+# headland skipped, START_OCCUPIED next to drawn obstacles, 2026-09-16/17).
+#
+#   consumer                     its body model             so the obstacle grows by
+#   ---------------------------  -------------------------  --------------------------
+#   Smac 2D (transit planner)    NONE. Point check: the     keepout_obstacle_margin()
+#                                centre cell >= INSCRIBED.  = the WHOLE half-width,
+#                                The global plugin order    painted into the keepout
+#                                is [.., inflation_layer,   mask by map_server, and
+#                                keepout_filter], so the    NOT inflated on top.
+#                                keepout mask is NOT
+#                                inflated.
+#   coverage_server (F2C)        NONE. It plans a           planning_obstacle_margin()
+#                                CENTRELINE.                (the two demands below).
+#   FTC (coverage controller)    the footprint polygon,     nothing: it reads the raw
+#                                expanded laterally by      LOCAL-costmap lethal cells.
+#                                obstacle_clearance_margin.
+#
+# Both margins are DERIVED from the live chassis (operator-editable in the GUI);
+# a literal copy is exactly what went stale on 2026-09-16.
+
+# How far FTC is allowed to wander off its line in steady state. Field
+# 2026-09-16: FTC tracks the coverage path to +/-0.02 m; 0.05 m leaves margin
+# for a transient without FTC's own clearance model tripping on the plan.
+FTC_TRACKING_SLACK_M = 0.05
+
+# FTC clamps obstacle_clearance_margin to this band (navigation.launch.py
+# injects the clamped value); the planning floor must use the SAME number FTC
+# will actually run with.
+FTC_CLEARANCE_MARGIN_MIN_M = 0.0
+FTC_CLEARANCE_MARGIN_MAX_M = 0.50
+DEFAULT_FTC_CLEARANCE_MARGIN_M = 0.05
+
+# global_costmap.resolution in nav2_params_base.yaml. Single-sourced here
+# because full_system.launch.py (map_server) does not load the Nav2 params;
+# test_nav2_params.py pins the yaml equal to this so the two cannot drift.
+GLOBAL_COSTMAP_RESOLUTION_M = 0.08
+
+# Both obstacle margins are clamped to this by their consumers
+# (coverage_server and map_server re-clamp to the same band).
+OBSTACLE_MARGIN_MAX_M = 1.0
+
+
+def ftc_obstacle_clearance_margin(params):
+    """obstacle_clearance_margin as FTC will actually run it (clamped)."""
+    requested = float((params or {}).get(
+        "obstacle_clearance_margin", DEFAULT_FTC_CLEARANCE_MARGIN_M))
+    return min(FTC_CLEARANCE_MARGIN_MAX_M,
+               max(FTC_CLEARANCE_MARGIN_MIN_M, requested))
+
+
+def keepout_raster_slack(global_resolution=GLOBAL_COSTMAP_RESOLUTION_M):
+    """Worst-case distance the keepout band gains when Smac reads it.
+
+    map_server marks a MASK cell lethal when its centre is within the margin;
+    KeepoutFilter copies the mask cell under each GLOBAL cell centre; Smac then
+    tests the global cell the robot's centre falls in. The robot can therefore
+    be blocked up to half a global-cell diagonal + half a mask-cell diagonal
+    beyond the nominal band. One full global-cell diagonal bounds that for any
+    mask no coarser than the global costmap (mask 0.05 m, global 0.08 m).
+    """
+    return float(global_resolution) * math.sqrt(2.0)
+
+
+def planning_obstacle_margin_floor(
+        params, global_resolution=GLOBAL_COSTMAP_RESOLUTION_M):
+    """Least distance coverage may plan its CENTRELINE from a drawn obstacle.
+
+    The max of two derived demands:
+      * the controller: FTC demands footprint half-width +
+        obstacle_clearance_margin between its line and any lethal cell, and it
+        tracks to within FTC_TRACKING_SLACK_M. A plan closer than that makes
+        FTC fight its own plan along every obstacle (field: WEDGED bursts of 70
+        and 160 per minute exactly along obstacles, zero elsewhere).
+      * transit plannability: a robot standing ON its coverage line must not
+        read as START_OCCUPIED, so the line must clear the keepout band's base
+        (the body half-width — the keepout is not inflated) by the
+        rasterisation slack.
+    """
+    half_width = chassis_half_width(params)
+    controller_demand = (
+        half_width + ftc_obstacle_clearance_margin(params) + FTC_TRACKING_SLACK_M)
+    transit_demand = half_width + keepout_raster_slack(global_resolution)
+    # Rounded UP to the millimetre so the template / GUI-schema default can be
+    # written exactly (the transit demand carries a sqrt(2)); the 1e-9 guards
+    # a value that is already a whole millimetre against float noise.
+    floor = max(controller_demand, transit_demand)
+    return math.ceil(floor * 1000.0 - 1e-9) / 1000.0
+
+
+def planning_obstacle_margin(
+        params, global_resolution=GLOBAL_COSTMAP_RESOLUTION_M):
+    """coverage_server.obstacle_margin: the operator's value, floored + clamped.
+
+    An operator may ask for MORE room around obstacles, never less than the
+    floor.
+    """
+    floor = planning_obstacle_margin_floor(params, global_resolution)
+    requested = float((params or {}).get("obstacle_margin", floor))
+    return min(OBSTACLE_MARGIN_MAX_M, max(floor, requested))
+
+
+def keepout_obstacle_margin(
+        params, global_resolution=GLOBAL_COSTMAP_RESOLUTION_M):
+    """map_server.keepout_obstacle_margin: lethal band around drawn obstacles.
+
+    Base = chassis_half_width: the WHOLE body for Smac 2D, which models none of
+    it and (with inflation_layer ahead of keepout_filter) gets no inflation on
+    top of the mask. Counted once.
+
+    When the operator RAISES obstacle_margin (a root zone the LiDAR cannot see)
+    the keepout follows it, so transits keep off the same ground — but always
+    one rasterisation slack inside the coverage line, so a robot on that line
+    stays plannable by construction.
+    """
+    half_width = chassis_half_width(params)
+    follow = (planning_obstacle_margin(params, global_resolution)
+              - keepout_raster_slack(global_resolution))
+    return min(OBSTACLE_MARGIN_MAX_M, max(0.0, half_width, follow))
+
+
+def dig_skip_radius(params):
+    """behavior_tree_node.dig_skip_radius_m: coverage poses skipped around a dig.
+
+    A wheel-slip dig is NOT stamped into the keepout mask any more — a keepout
+    under the robot refused every plan from its own pose (START_OCCUPIED,
+    2026-09-10 and 2026-09-17). What keeps the robot from re-digging the same
+    hole (issue #500) is FollowStrip skipping every coverage pose within this
+    radius of a recorded dig point for the rest of the session
+    (mowgli_behavior/dig_skip.hpp).
+
+    = chassis circumscribed radius: for a base_link pose inside that circle
+    SOME part of the body — a drive wheel, or a front caster that then blocks
+    the robot — can be over the hole, whatever the heading. DERIVED, never a
+    literal (chassis_length / chassis_width / chassis_center_x are
+    operator-editable). It is deliberately NOT dig_proposal_radius(): that is
+    the size of the HOLE an operator may accept; this is "which poses put the
+    chassis over that hole" — a body-sized question.
+    """
+    return chassis_circumscribed_radius(params)
+
+
+DEFAULT_DIG_SENSITIVITY = "medium"
+
+# hardware_bridge wheel-slip dig detector presets (mowgli_hardware/dig_detector.hpp
+# + dig_escalation.hpp). ONE operator knob instead of five coupled numbers: what
+# counts as a dig depends on the ground — tall or wet grass and sandy soil make
+# a healthy robot slip far more than a short dry lawn does, and the detector
+# then stops, reverses and finally escalates to DIG_OBSTRUCTION on ground the
+# robot was in fact crossing.
+#
+#   window_s            sustained evidence needed before latching
+#   min_wheel_dist      worst-wheel travel the window must contain [m]
+#   progress_fraction   latch when observed travel < this fraction of it
+#   escalate_count      same-spot latches that stop the mission
+#
+# "medium" IS the compiled default of every one of those parameters
+# (test_robot_config_util.py pins that against hardware_bridge_node.cpp), so a
+# robot that never touches the knob behaves exactly as before it existed.
+# "low" still catches every dig on record (0.33-0.40 m of tyre for 0.01-0.03 m
+# of chassis in 1.2 s, i.e. under 10 % progress, sustained) but no longer
+# latches on a slipping pivot or a slow push through thick grass. "off" stops
+# the HOST detector only: the firmware anti-dig (blocked wheels) is untouched.
+DIG_SENSITIVITY_PRESETS = {
+    "off": {"enabled": False},
+    "low": {"enabled": True, "window_s": 2.5, "min_wheel_dist": 0.35,
+            "progress_fraction": 0.15, "escalate_count": 5},
+    "medium": {"enabled": True, "window_s": 1.2, "min_wheel_dist": 0.15,
+               "progress_fraction": 0.35, "escalate_count": 3},
+    "high": {"enabled": True, "window_s": 0.8, "min_wheel_dist": 0.10,
+             "progress_fraction": 0.50, "escalate_count": 3},
+}
+
+
+def resolve_dig_sensitivity(params):
+    """The configured dig_sensitivity level, normalised; unknown -> the default.
+
+    YAML 1.1 reads a bare `off` as boolean False (and `on` as True), so a
+    hand-edited `dig_sensitivity: off` must still mean "off" rather than fall
+    back to the default and silently keep the detector running.
+    """
+    raw = params.get("dig_sensitivity", DEFAULT_DIG_SENSITIVITY)
+    if raw is False:
+        return "off"
+    level = str(raw).strip().lower()
+    if level not in DIG_SENSITIVITY_PRESETS:
+        print(
+            f"[robot_config_util] WARNING: dig_sensitivity={raw!r} is not one of "
+            f"{sorted(DIG_SENSITIVITY_PRESETS)}; using {DEFAULT_DIG_SENSITIVITY!r}."
+        )
+        return DEFAULT_DIG_SENSITIVITY
+    return level
+
+
+def dig_detector_params(params):
+    """hardware_bridge parameters for the configured dig_sensitivity level."""
+    preset = DIG_SENSITIVITY_PRESETS[resolve_dig_sensitivity(params)]
+    if not preset["enabled"]:
+        return {"dig_detect_enabled": False}
+    return {
+        "dig_detect_enabled": True,
+        "dig_window_s": float(preset["window_s"]),
+        "dig_min_wheel_dist": float(preset["min_wheel_dist"]),
+        "dig_progress_fraction": float(preset["progress_fraction"]),
+        "dig_escalate_count": int(preset["escalate_count"]),
+    }
+
+
+DEFAULT_WHEEL_RADIUS_M = 0.10
+DEFAULT_WHEEL_WIDTH_M = 0.04
+
+
+def dig_proposal_radius(params):
+    """map_server.dig_proposal_radius: size of a wheel-slip dig PROPOSAL.
+
+    The proposal is the PHYSICAL dig, not the chassis. What digs is the two
+    drive wheels: one rut under each tyre, at the dig point (base_link = the
+    drive-axle centre) +/- wheel_track/2. The detector reports neither which
+    wheel slipped nor the heading, so the proposal is the smallest disc centred
+    on the dig point that covers BOTH contact patches whatever the heading:
+
+        lateral reach = wheel_track/2 + wheel_width/2   (outer tyre edge)
+        along reach   = wheel_radius/2                  (contact-patch half
+                        chord of a tyre sunk ~13 % of its radius into the rut)
+        radius        = hypot(lateral, along)           -> 0.189 m shipped
+
+    map_server then adds half the DigEvent's map_distance (the chassis crept
+    that far while slipping, so the ruts are that much longer) and floors the
+    result (kMinDigProposalRadiusM) so the hole stays selectable in the GUI.
+
+    It must NOT contain the body: when an accepted proposal is applied the
+    keepout band (chassis half-width) and coverage obstacle_margin are added
+    around it — the body counted exactly once. The old 0.60 m chassis-length
+    box only existed because the polygon used to be stamped as a session
+    keepout; it blanked out a large patch of lawn on every accept.
+    """
+    params = params or {}
+    track = float(params.get("wheel_track", DEFAULT_WHEEL_TRACK_M))
+    width = float(params.get("wheel_width", DEFAULT_WHEEL_WIDTH_M))
+    radius = float(params.get("wheel_radius", DEFAULT_WHEEL_RADIUS_M))
+    return math.hypot(track / 2.0 + width / 2.0, radius / 2.0)
+
 
 
 def deep_merge(base, override):
@@ -314,9 +638,9 @@ def check_turn_geometry(min_turn_radius, connector_turn_radius, wheel_track,
 
     WARNINGS ONLY — never an exception — and that is load-bearing:
 
-      1. the CURRENTLY SHIPPED defaults trip check A (min_turning_radius 0.15 <=
-         half-track 0.1625), so raising would refuse to start navigation on every
-         existing robot, turning a lawn-quality defect into a total outage;
+      1. installed robots may still carry the old min_turning_radius 0.15 value,
+         which trips check A against the 0.1625 m half-track; rejecting it would
+         turn a lawn-quality warning into a total outage during an upgrade;
       2. neither condition is a safety hazard at launch. The firmware remains the
          sole blade-safety authority and still owns the e-stop; what these degrade
          is mowing QUALITY, and a robot that refuses to mow is strictly worse than
@@ -347,9 +671,9 @@ def check_turn_geometry(min_turn_radius, connector_turn_radius, wheel_track,
             "{:+.3f} m/s while the outer runs {:.3f} m/s — a reversing inner wheel "
             "carves the lawn at swath ends (issue #499). Raise "
             "mowgli_robot.yaml.min_turning_radius above {:.4f} m — but note that "
-            "at the shipped headland apron the coverage server fits an arc at only "
-            "~1 join in 32 anyway ('PlanCoverage connectors:'), so this alone will "
-            "not change the swath-end turns.".format(
+            "with the old two-pass headland apron the coverage server fitted an "
+            "arc at only ~1 join in 32 ('PlanCoverage connectors:'), so update the "
+            "headland pass count together with this radius.".format(
                 r_floor, wheel_track, half_track, v_in, v_out, half_track))
     # Planner/controller consistency: the tightest arc FTC can COMMAND at the turn
     # speed is turn_speed / max_cmd_vel_ang. An arc tighter than that saturates the
@@ -369,3 +693,58 @@ def check_turn_geometry(min_turn_radius, connector_turn_radius, wheel_track,
                 planned_tightest, r_floor, connector_turn_radius, turn_speed,
                 max_cmd_vel_ang, r_commandable))
     return warnings
+
+
+# Blade-load slowdown defaults, mirrored from the mowgli_robot.yaml template so
+# navigation.launch.py's belt-and-suspenders fallbacks and the FTC struct agree.
+DEFAULT_BLADE_LOAD_RPM_FULL = 2500.0
+DEFAULT_BLADE_LOAD_RPM_MIN = 1800.0
+DEFAULT_BLADE_LOAD_MIN_SPEED_RATIO = 0.4
+# The slowest feed as a fraction of mowing_speed. Below this the robot would
+# effectively park with the blade grinding one spot; FTC additionally floors
+# the slowed speed at stall_crawl_speed (ftc_blade_load.hpp), so the ratio
+# floor here is a sanity clamp on operator input, not the real motion floor.
+BLADE_LOAD_MIN_SPEED_RATIO_FLOOR = 0.1
+
+
+def derive_blade_load_params(enabled, rpm_full, rpm_min, min_speed_ratio):
+    """FollowCoveragePath.blade_load_* from the operator's mowgli_robot.yaml keys.
+
+    Returns ``(params, warnings)`` — ``params`` is the dict of the four
+    FollowCoveragePath keys to inject, ``warnings`` a list of human-readable
+    strings the caller prints (empty when nothing was clamped or disabled).
+
+    The FTC decision (ftc_blade_load.hpp) already fails open on a degenerate
+    ramp (rpm_full <= rpm_min), so nothing here is load-bearing for safety;
+    the point is to SAY so at launch instead of letting an operator enable a
+    slowdown that silently never engages. Two clamps:
+      * ``min_speed_ratio`` into [BLADE_LOAD_MIN_SPEED_RATIO_FLOOR, 1.0] — a
+        ratio above 1 would SPEED UP under load, and 0 would stop the robot on
+        the spot with the blade spinning.
+      * an inverted or flat ramp disables the feature (with a warning) rather
+        than injecting thresholds FTC would ignore.
+    """
+    warnings = []
+    is_enabled = str(enabled).strip().lower() in TRUE_TOKENS
+    full = float(rpm_full)
+    low = float(rpm_min)
+    ratio = min(1.0, max(BLADE_LOAD_MIN_SPEED_RATIO_FLOOR, float(min_speed_ratio)))
+    if ratio != float(min_speed_ratio):
+        warnings.append(
+            "WARN: blade_load_min_speed_ratio={} is outside [{}, 1.0] — clamped to {}. "
+            "Above 1.0 the slowdown would SPEED UP a bogged blade; near 0 it would "
+            "park the robot with the blade grinding one spot.".format(
+                min_speed_ratio, BLADE_LOAD_MIN_SPEED_RATIO_FLOOR, ratio))
+    if is_enabled and not full > low:
+        warnings.append(
+            "WARN: blade_load_slowdown_enabled but blade_load_rpm_full={} is not above "
+            "blade_load_rpm_min={} — the ramp is empty, so the slowdown could never "
+            "engage. DISABLED for this launch; fix the thresholds in mowgli_robot.yaml "
+            "(read the no-load RPM off Diagnostics first).".format(rpm_full, rpm_min))
+        is_enabled = False
+    return ({
+        "blade_load_slowdown_enabled": is_enabled,
+        "blade_load_rpm_full": full,
+        "blade_load_rpm_min": low,
+        "blade_load_min_speed_ratio": ratio,
+    }, warnings)

@@ -10,12 +10,17 @@ controller_server:
       # Collision sim: project the carrot forward, abort if the path
       # to the carrot hits an obstacle. 1.0 s look-ahead at 0.3 m/s
       # = 30 cm projected; collision_monitor handles the close-range case.
-      use_collision_detection: true
+      primary_controller:
+        use_collision_detection: true
 
 global_costmap:
   global_costmap:
     ros__parameters:
-      plugins: ["obstacle_layer", "keepout_filter", "inflation_layer"]
+      # ORDER IS LOAD-BEARING: inflation_layer BEFORE keepout_filter, so the
+      # keepout mask (recorded boundary + drawn obstacles) is NOT inflated —
+      # only the LiDAR obstacle_layer cells are. See the global_costmap block in
+      # nav2_params_base.yaml; test_nav2_params.py pins this in both variants.
+      plugins: ["obstacle_layer", "inflation_layer", "keepout_filter"]
 
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"

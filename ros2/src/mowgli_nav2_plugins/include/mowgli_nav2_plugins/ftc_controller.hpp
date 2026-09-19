@@ -31,15 +31,17 @@
 #include <nav2_core/goal_checker.hpp>
 #include <nav2_costmap_2d/costmap_2d.hpp>
 #include <nav2_costmap_2d/costmap_2d_ros.hpp>
+#include <nav2_ros_common/lifecycle_node.hpp>
 #include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp_lifecycle/lifecycle_node.hpp>
-#include <tf2/LinearMath/Quaternion.h>  // No .hpp equivalent for LinearMath
+#include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2_eigen/tf2_eigen.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.hpp>
 
+#include "mowgli_interfaces/msg/status.hpp"
+#include "mowgli_nav2_plugins/ftc_blade_load.hpp"
 #include "mowgli_nav2_plugins/ftc_reverse_escape.hpp"
 #include "mowgli_nav2_plugins/obstacle_deviation.hpp"
 #include "mowgli_nav2_plugins/oscillation_detector.hpp"
@@ -69,7 +71,7 @@ public:
 
   // ── nav2_core::Controller interface ──────────────────────────────────────
 
-  void configure(const rclcpp_lifecycle::LifecycleNode::WeakPtr& parent,
+  void configure(const nav2::LifecycleNode::WeakPtr& parent,
                  std::string name,
                  std::shared_ptr<tf2_ros::Buffer> tf,
                  std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros) override;
@@ -78,12 +80,14 @@ public:
   void activate() override;
   void deactivate() override;
 
-  void setPlan(const nav_msgs::msg::Path& path) override;
+  void newPathReceived(const nav_msgs::msg::Path& path) override;
 
   geometry_msgs::msg::TwistStamped computeVelocityCommands(
       const geometry_msgs::msg::PoseStamped& pose,
       const geometry_msgs::msg::Twist& velocity,
-      nav2_core::GoalChecker* goal_checker) override;
+      nav2_core::GoalChecker* goal_checker,
+      const nav_msgs::msg::Path& transformed_global_plan,
+      const geometry_msgs::msg::PoseStamped& global_goal) override;
 
   void setSpeedLimit(const double& speed_limit, const bool& percentage) override;
 
@@ -134,6 +138,18 @@ private:
   // Latest measured forward speed (odom feedback), cached from
   // computeVelocityCommands so update_control_point can detect a stall.
   double last_measured_fwd_speed_{0.0};
+  // True while the blade-load slowdown is holding the carrot's target speed
+  // below the path speed: set in update_control_point, read in
+  // calculate_velocity_commands to let the commanded speed follow the slowed
+  // carrot under the min_speed_mps floor. See ftc_blade_load.hpp.
+  bool is_blade_limited_{false};
+  // Last applied blade-load scale (1.0 = not limiting); kept for the
+  // limit-engaged/released log lines.
+  double blade_load_scale_{1.0};
+
+  /// Apply the blade-load slowdown (Config::blade_load_*) to a carrot target
+  /// speed, reading the latest blade telemetry under blade_mutex_.
+  double applyBladeLoad(double target_speed);
 
   // ── PID state ────────────────────────────────────────────────────────────
 
@@ -209,6 +225,19 @@ private:
   /// max_lateral_deviation to find clearance.
   void updateLateralDeviation(double dt);
 
+  /// Whole-profile avoidance (ftc_offset_lattice.hpp): plans the lateral offset
+  /// over the horizon and sets target_lateral_deviation_. Returns false when it
+  /// engaged the reverse-escape / wait fallback and the caller must return.
+  bool planOffsetLattice(std::size_t carrot_idx,
+                         const BoundaryGuard& guard,
+                         const std::vector<geometry_msgs::msg::Point>& footprint,
+                         double dt);
+
+  /// Plan poses [first, last) expressed in the local costmap frame.
+  bool planWindowInCostmapFrame(std::size_t first,
+                                std::size_t last,
+                                std::vector<geometry_msgs::msg::PoseStamped>& out);
+
   /// Apply lateral_deviation_ to current_control_point_ in-place.
   void applyLateralDeviationToCarrot();
 
@@ -218,6 +247,11 @@ private:
   /// still waiting, never returns false on the throw path (the throw
   /// unwinds the stack instead).
   bool waitOrThrowForObstacle(const std::string& reason);
+
+  /// Freeze the virtual carrot and reset PID history while an obstacle hold
+  /// owns the output. This prevents the controller from accumulating a large
+  /// catch-up error and derivative kick behind a zero-velocity command.
+  void holdObstacleMotion();
 
   /// Bounded reverse-escape gate for the WEDGED case. Called from
   /// updateLateralDeviation instead of waitOrThrowForObstacle when the skirt
@@ -265,24 +299,32 @@ private:
   // obstacle_wait_timeout_s seconds; if the costmap clears in that
   // window the controller resumes, otherwise it throws as before.
   // IMPORTANT: only clear obstacle_wait_start_/obstacle_waiting_ once a
-  // candidate has been CONFIRMED workable (post max_lateral_deviation
-  // check) or the debounced clear-hold below has elapsed — clearing it the
-  // moment a candidate side is merely *found* let the two wait call-sites
-  // hand each other fresh 5s windows on every chooseDeviationSide flip-flop
-  // near a marginal gap, deferring the abort indefinitely (field: observed
-  // ~40s stall with cmd_vel pinned at zero, vs. the intended 5s cap).
+  // candidate has remained workable continuously for obstacle_clear_hold_s.
+  // Clearing it on one good scan creates a stop/go loop; clearing it when a
+  // side is merely found lets the two wait call-sites hand each other fresh
+  // timeout windows near a marginal gap.
   std::optional<rclcpp::Time> obstacle_wait_start_;
   bool obstacle_waiting_{false};
-  /// When the nominal path first read CLEAR — during an active AVOIDANCE
-  /// episode (is_avoiding_) OR during a not-yet-avoiding WAIT
-  /// (obstacle_waiting_). Shared by both: the skirt / the wait is held
-  /// until the path has stayed clear CONTINUOUSLY for
-  /// config_.obstacle_clear_hold_s (debounces the window-edge flicker —
-  /// observation_persistence:0 costmap re-marking a cell — that caused the
-  /// ±step left-right flap in the avoidance case and the same-symptom
-  /// indefinite-wait stall in the waiting case). Reset whenever the
-  /// obstacle re-appears or on a new plan.
+  /// Continuous time for which a valid skirt has existed while
+  /// obstacle_waiting_ is active. A blocked tick resets it to zero.
+  double obstacle_followable_time_{0.0};
+  /// True from the first hard hold until the path has remained followable
+  /// while moving for obstacle_clear_hold_s. During this probation the angular
+  /// command is slew-limited and a reappearing obstacle keeps the original
+  /// wait timeout instead of opening a fresh stop/restart episode.
+  bool obstacle_recovery_active_{false};
+  /// Last angular command emitted while recovering, used by ClampCommandSlew.
+  double last_recovery_angular_cmd_{0.0};
+  /// When the nominal path first read CLEAR during an active AVOIDANCE
+  /// episode. The skirt is held until the nominal path has stayed clear
+  /// continuously for obstacle_clear_hold_s. Obstacle-wait recovery has its
+  /// own followable-duration counter because a valid offset path may exist
+  /// while the nominal path remains blocked.
   std::optional<rclcpp::Time> avoidance_clear_start_;
+  /// Since when the lattice has been asking for a SMALLER offset than applied.
+  std::optional<rclcpp::Time> lattice_return_start_;
+  /// Since when the free plan has been asking for the side opposite to the committed one.
+  std::optional<rclcpp::Time> lattice_switch_start_;
 
   // ── Oscillation detection ─────────────────────────────────────────────────
 
@@ -299,7 +341,7 @@ private:
 
   // ── ROS2 infrastructure ───────────────────────────────────────────────────
 
-  rclcpp_lifecycle::LifecycleNode::WeakPtr node_;
+  nav2::LifecycleNode::WeakPtr node_;
   rclcpp::Logger logger_{rclcpp::get_logger("FTCController")};
   rclcpp::Clock::SharedPtr clock_;
 
@@ -322,6 +364,22 @@ private:
   std::string boundary_frame_;  ///< frame_id of the global costmap (e.g. "map").
   std::mutex boundary_mutex_;
 
+  // ── Blade-load slowdown telemetry (blade_load_slowdown_enabled) ───────────
+  //
+  // hardware_bridge republishes the STM32's 4 Hz blade-controller report in
+  // /hardware_bridge/status (mower_esc_status = is_active, mower_motor_rpm,
+  // blade_status_stamp = time of the last DIRECT blade report — NOT the
+  // message stamp, which refreshes on every mainboard packet even when the
+  // blade stream has died). update_control_point reads the trio under
+  // blade_mutex_ and scales the carrot speed by the RPM sag; a stale stamp
+  // fails OPEN (no slowdown). Written by the subscription callback on the
+  // controller_server executor, read on the control-loop thread.
+  rclcpp::Subscription<mowgli_interfaces::msg::Status>::SharedPtr blade_status_sub_;
+  std::mutex blade_mutex_;
+  bool blade_active_{false};
+  double blade_rpm_{0.0};
+  rclcpp::Time blade_status_time_{0, 0, RCL_ROS_TIME};
+
   std::string plugin_name_;
 
   // Publishers (lifecycle-aware)
@@ -334,7 +392,7 @@ private:
   // ── Parameters ────────────────────────────────────────────────────────────
 
   /// Declare all ROS2 parameters and populate the local config struct.
-  void declareParameters(const rclcpp_lifecycle::LifecycleNode::SharedPtr& node);
+  void declareParameters(const nav2::LifecycleNode::SharedPtr& node);
 
   /// Parameter-change callback registered with the node.
   rcl_interfaces::msg::SetParametersResult onParameterChange(
@@ -351,6 +409,10 @@ private:
     double speed_slow{0.2};
     double speed_angular{20.0};
     double acceleration{1.0};
+    /// Angular acceleration limit (rad/s^2) after an obstacle hard hold. This
+    /// applies until the resumed path has remained stable for
+    /// obstacle_clear_hold_s. 0 disables the limiter.
+    double obstacle_restart_angular_acceleration{1.0};
     double min_speed_mps{0.15};
 
     // Anti-wheelspin / traction control. When the carrot commands a forward
@@ -363,6 +425,23 @@ private:
     double stall_speed_ratio{0.35};
     double stall_grace_s{0.6};
     double stall_crawl_speed{0.08};
+
+    // Blade-load slowdown. When the blade motor's reported RPM sags under
+    // load (thick / wet grass), scale the carrot's target speed down on a
+    // linear ramp from 1.0 at blade_load_rpm_full to blade_load_min_speed_ratio
+    // at blade_load_rpm_min, floored at stall_crawl_speed, so the blade gets
+    // time to chew through instead of stalling or leaving an uncut strip.
+    // Fail-open: an inactive blade or telemetry older than
+    // blade_load_telemetry_max_age_s never slows the robot. Operator knobs
+    // flow from mowgli_robot.yaml (GUI Mowing section) via
+    // navigation.launch.py; OFF by default because the no-load RPM differs per
+    // blade motor and the thresholds must be read off the Diagnostics page
+    // first. See ftc_blade_load.hpp.
+    bool blade_load_slowdown_enabled{false};
+    double blade_load_rpm_full{2500.0};
+    double blade_load_rpm_min{1800.0};
+    double blade_load_min_speed_ratio{0.4};
+    double blade_load_telemetry_max_age_s{1.0};
 
     // PID longitudinal
     double kp_lon{1.0};
@@ -402,6 +481,8 @@ private:
     double max_goal_angle_error{10.0};
     double goal_timeout{5.0};
     double max_follow_distance{1.0};
+    /// Max longitudinal carrot lead (m); <= 0 derives it (ftc_carrot_lead.hpp).
+    double carrot_max_lead{-1.0};
 
     // Options
     bool forward_only{true};
@@ -493,18 +574,6 @@ private:
     /// (near-edge swaths legitimately run inside the keepout margin). When
     /// false, behaves exactly as before.
     bool confine_deviation_to_zone{true};
-    /// Zone-MASK the obstacle DETECTION checks (issue #517): a lethal cell in
-    /// the local obstacle costmap that is ALSO lethal in the global keepout
-    /// costmap (out-of-zone / keepout hole) is NOT an obstacle for the
-    /// deviation logic — the coverage path was planned to pass beside it and
-    /// never enters it. Field 2026-09-02: 71 "lateral deviation needed > max"
-    /// strip aborts per mow, all at row ends against the hedge the boundary
-    /// was recorded along / the tree in a keepout hole. Only effective when
-    /// confine_deviation_to_zone is true AND the global costmap has been
-    /// received (the same BoundaryGuard is reused); otherwise the old
-    /// behaviour. In-zone obstacles are unaffected; collision_monitor stays
-    /// the real-time guard.
-    bool ignore_obstacles_outside_zone{true};
 
     /// Model the robot as its actual rectangular chassis FOOTPRINT (from
     /// costmap_ros_->getRobotFootprint()) for obstacle detection and the
@@ -536,6 +605,16 @@ private:
     /// (works with the half-width line model AND the footprint model). Default
     /// true. Set false to restore the prior skirt-anything behaviour.
     bool require_clear_exit{true};
+    /// Whole-profile avoidance planner instead of the single-offset search.
+    bool use_offset_lattice{false};
+    /// How far ahead of the carrot the offset profile is planned (m).
+    double avoidance_horizon_m{2.5};
+    /// Steepest lateral change per metre of path the profile may ask for.
+    double avoidance_max_slope{1.0};
+    /// Path length by which a skirt must be in place BEFORE the obstacle (m).
+    double avoidance_reaction_m{0.5};
+    /// Only a blockage closer than this makes the robot WEDGED (m).
+    double avoidance_min_horizon_m{1.0};
 
     /// Bounded reverse-escape for the WEDGED case (both sides of an obstacle
     /// blocked, or the skirt needed exceeds max_lateral_deviation). Before

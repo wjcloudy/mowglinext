@@ -1,14 +1,14 @@
-# Mowgli Docker — v3 (ROS2 Kilted)
+# Mowgli Docker — v3 (ROS2 Lyrical)
 
 Docker Compose deployment for the **Mowgli** open-source robot mower.
 v3 is a ground-up rewrite: the ROS1 Noetic stack has been replaced by a
-single `mowgli_ros2` container running **ROS2 Kilted**, Nav2, the
+single `mowgli_ros2` container running **ROS2 Lyrical**, Nav2, the
 `fusion_graph` GTSAM factor-graph localizer, and a full behavior-tree
 coverage planner.
 
 ## What changed from v2
 
-| v2 (ROS1 Noetic) | v3 (ROS2 Kilted) |
+| v2 (ROS1 Noetic) | v3 (ROS2 Lyrical) |
 |---|---|
 | `roscore` | Removed — DDS has no master |
 | `rosserial` | Removed — hardware bridge is inside `mowgli_ros2` |
@@ -180,7 +180,7 @@ ships; the full installer writes many more (`GNSS_*`, `LIDAR_TYPE`,
 | Variable | Default | Description |
 |---|---|---|
 | `COMPOSE_PROJECT_NAME` | `install` | Compose project name — prefixes the `mowgli_maps` named volume. Keep it stable; renaming it orphans the persisted map data |
-| `ENABLE_MQTT` | `false` | Compose the `mowgli-mqtt` broker. Honoured by `stack.sh` only — the full installer always includes it |
+| `ENABLE_MQTT` | `false` | Compose the `mowgli-mqtt` broker container. Honoured by `stack.sh` only — the full installer always includes it. This only controls whether the *bundled* broker is present; it does NOT start `mqtt_bridge_node` (the ROS2-side bridge) — that is GUI Settings → MQTT's `mqtt_enabled` toggle (`mowgli_robot.yaml`, deliberately independent so the bridge can point at an external broker without the bundled one running at all). See [`docs/MQTT_CONTROL.md`](../docs/MQTT_CONTROL.md) |
 | `ENABLE_WATCHTOWER` | `false` | Compose `mowgli-watchtower`. `stack.sh` only, same as above |
 | `ROS_DOMAIN_ID` | `0` | DDS domain ID — must be the same across all containers |
 | `MOWER_IP` | `10.0.0.161` | Informational only — printed by the login MOTD, read by nothing else |
@@ -257,7 +257,6 @@ defaults in; the tables below give the template value for reference.
 | `mower_model` | `YardForce500` | Hardware model — determines URDF and firmware expectations |
 | `wheel_radius` | `0.04475` | Wheel radius in metres |
 | `wheel_track` | `0.325` | Lateral distance between wheel centres (metres) |
-| `ticks_per_revolution` | `84` | Encoder ticks per full wheel revolution. The scale the bridge actually uses is `ticks_per_meter` (default `399.0`), calibrated per robot |
 | `chassis_center_x` | `0.18` | Longitudinal offset from axle to chassis centre (metres) |
 | `blade_radius` | `0.09` | Cutting disc radius (metres) |
 | `tool_width` | `0.18` | Effective cut width used for coverage path spacing (metres) |
@@ -278,7 +277,6 @@ defaults in; the tables below give the template value for reference.
 |---|---|---|
 | `mowing_speed` | `0.2` | Mowing speed in m/s |
 | `transit_speed` | `0.2` | Transit-to-area speed in m/s |
-| `path_spacing` | `0.18` | **Deprecated / informational** — no node reads it. Swath spacing is `tool_width − swath_overlap` |
 | `swath_overlap` | `0.02` | How much adjacent coverage swaths overlap (metres) — the live swath-spacing knob |
 | `headland_width` | `0.18` | **Inert** — the behavior tree derives the headland from `chassis_width` and overrides this in the coverage goal |
 | `num_headland_passes` | `2` | Concentric perimeter rings before the inner field. `<0` = none, `0` = auto |
@@ -388,7 +386,7 @@ sidecar source at `tools/motor/`. This is required by the MowgliNext GUI Drive
 Motor assistant, which launches:
 
 ```bash
-source /opt/ros/kilted/setup.bash
+source /opt/ros/lyrical/setup.bash
 source /ros2_ws/install/setup.bash
 ros2 run mowgli_tools tune_drive_pid --help
 ```
@@ -574,7 +572,7 @@ Check the live fix quality from inside the container:
 
 ```bash
 docker exec mowgli-gps bash -c "
-  source /opt/ros/kilted/setup.bash
+  source /opt/ros/lyrical/setup.bash
   ros2 topic echo /gps/fix --once"
 ```
 
@@ -665,7 +663,7 @@ Confirm the LiDAR is publishing:
 
 ```bash
 docker exec mowgli-ros2 bash -c "
-  source /opt/ros/kilted/setup.bash
+  source /opt/ros/lyrical/setup.bash
   source /ros2_ws/install/setup.bash
   ros2 topic info /scan"
 ```
@@ -678,7 +676,7 @@ Also confirm the TF chain from `base_link` to `lidar_link` is complete:
 
 ```bash
 docker exec mowgli-ros2 bash -c "
-  source /opt/ros/kilted/setup.bash
+  source /opt/ros/lyrical/setup.bash
   source /ros2_ws/install/setup.bash
   ros2 run tf2_tools view_frames"
 ```
@@ -698,7 +696,7 @@ Diagnostics → Fusion Graph):
 
 ```bash
 docker exec mowgli-ros2 bash -c "
-  source /opt/ros/kilted/setup.bash
+  source /opt/ros/lyrical/setup.bash
   source /ros2_ws/install/setup.bash
   ros2 service call /fusion_graph_node/save_graph std_srvs/srv/Trigger"
 ```
@@ -721,7 +719,7 @@ arrives:
 
 ```bash
 docker exec mowgli-ros2 bash -c "
-  source /opt/ros/kilted/setup.bash
+  source /opt/ros/lyrical/setup.bash
   source /ros2_ws/install/setup.bash
   timeout 5 ros2 topic echo /hardware_bridge/status --once"
 ```
@@ -761,13 +759,13 @@ docker exec -it mowgli-ros2 bash
 
 # List all active ROS2 nodes
 docker exec mowgli-ros2 bash -c "
-  source /opt/ros/kilted/setup.bash
+  source /opt/ros/lyrical/setup.bash
   source /ros2_ws/install/setup.bash
   ros2 node list"
 
 # List all active topics
 docker exec mowgli-ros2 bash -c "
-  source /opt/ros/kilted/setup.bash
+  source /opt/ros/lyrical/setup.bash
   source /ros2_ws/install/setup.bash
   ros2 topic list"
 

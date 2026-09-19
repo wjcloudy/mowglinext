@@ -46,7 +46,7 @@ from launch_ros.substitutions import FindPackageShare
 # file). Deep-merges the SPARSE installed mowgli_robot.yaml over the in-package
 # template defaults, so a missing key falls through to its versioned default.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from robot_config_util import load_robot_params  # noqa: E402
+from robot_config_util import dig_detector_params, load_robot_params  # noqa: E402
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -96,7 +96,10 @@ def generate_launch_description() -> LaunchDescription:
     chassis_height   = float(robot_params.get("chassis_height", 0.19))
     chassis_mass_kg  = float(robot_params.get("chassis_mass_kg", 8.76))
     chassis_center_x = float(robot_params.get("chassis_center_x", 0.18))
-    wheel_radius     = float(robot_params.get("wheel_radius", 0.093))
+    # 0.1 m: keep this fallback equal to the mowgli_robot.yaml template default
+    # AND to mowgli.urdf.xacro's own <xacro:arg> default. It used to be 0.093
+    # while the template said 0.04475 — three numbers for one wheel.
+    wheel_radius     = float(robot_params.get("wheel_radius", 0.1))
     wheel_width      = float(robot_params.get("wheel_width", 0.04))
     wheel_track      = float(robot_params.get("wheel_track", 0.325))
     wheel_x_offset   = float(robot_params.get("wheel_x_offset", 0.0))
@@ -110,7 +113,9 @@ def generate_launch_description() -> LaunchDescription:
     lidar_z   = str(robot_params.get("lidar_z", 0.30))
     lidar_yaw = str(robot_params.get("lidar_yaw", 0.0))
     imu_x     = str(robot_params.get("imu_x", 0.18))
-    imu_y     = str(robot_params.get("imu_y", 0.0))
+    # -0.195: keep equal to the mowgli_robot.yaml template default AND the
+    # xacro <xacro:arg> default (IMU is right of the wheelbase centre).
+    imu_y     = str(robot_params.get("imu_y", -0.195))
     imu_z     = str(robot_params.get("imu_z", 0.095))
     imu_roll  = str(robot_params.get("imu_roll", 0.0))
     imu_pitch = str(robot_params.get("imu_pitch", 0.0))
@@ -196,11 +201,18 @@ def generate_launch_description() -> LaunchDescription:
             # Allow command-line override of the serial port.
             {"serial_port": serial_port},
             {"use_sim_time": use_sim_time},
+            # Forward configured charge ceilings; firmware enforces its board limits.
+            {"max_charge_voltage": float(robot_params.get("max_charge_voltage", 29.4))},
+            {"max_charge_current": float(robot_params.get("max_charge_current", 1.2))},
             # Pass dock pose from robot config for dock position anchoring
             {"dock_pose_x": float(robot_params.get("dock_pose_x", 0.0))},
             {"dock_pose_y": float(robot_params.get("dock_pose_y", 0.0))},
             {"dock_pose_yaw": float(robot_params.get("dock_pose_yaw", 0.0))},
             {"imu_yaw": float(robot_params.get("imu_yaw", 0.0))},
+            # Wheel-slip dig detector: ONE operator knob (dig_sensitivity:
+            # off|low|medium|high) expanded into the detector + escalation
+            # parameters by robot_config_util; "medium" == the compiled defaults.
+            dig_detector_params(robot_params),
             # Wheel odometry kinematics — single source of truth in
             # mowgli_robot.yaml. hardware_bridge uses ticks_per_meter for
             # host-side odometry and also re-sends it to the STM32 so the
@@ -210,14 +222,20 @@ def generate_launch_description() -> LaunchDescription:
             {"ticks_per_meter": float(robot_params.get("ticks_per_meter", 300.0))},
             # Drive-motor wheel-velocity PID + feedforward, pushed to the STM32
             # firmware so the GUI can retune the per-wheel loop without
-            # reflashing. Fallback defaults match the mowgli_bringup template.
-            {"wheel_pid_kp": float(robot_params.get("wheel_pid_kp", 0.2))},
-            {"wheel_pid_ki": float(robot_params.get("wheel_pid_ki", 0.092))},
-            {"wheel_pid_kd": float(robot_params.get("wheel_pid_kd", 0.01))},
+            # reflashing. Fallback defaults match the mowgli_bringup template
+            # (firmware PWM units, field-validated 2026-09-15; guarded by
+            # test_drive_pid_defaults.py together with the bridge's declared
+            # defaults).
+            {"wheel_pid_kp": float(robot_params.get("wheel_pid_kp", 10.0))},
+            {"wheel_pid_ki": float(robot_params.get("wheel_pid_ki", 2000.0))},
+            {"wheel_pid_kd": float(robot_params.get("wheel_pid_kd", 0.0))},
             {"wheel_pid_integral_limit": float(robot_params.get(
-                "wheel_pid_integral_limit", 15.0))},
+                "wheel_pid_integral_limit", 45.0))},
             {"wheel_pid_pwm_per_mps": float(robot_params.get(
                 "wheel_pid_pwm_per_mps", 282.135))},
+            # Motor stiction estimate the wheel_pid_* set must be able to
+            # bridge; hardware_bridge refuses to push a set that cannot.
+            {"deadband_pwm": float(robot_params.get("deadband_pwm", 40.0))},
             # IMU calibration tuning (operator-tunable via the GUI).
             {"imu_cal_samples": int(robot_params.get("imu_cal_samples", 200))},
             {"imu_cal_persist_path": str(robot_params.get(

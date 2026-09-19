@@ -9,14 +9,14 @@
 # /home/ubuntu/mowglinext/docker/logs/mow_sessions, which is NOT mounted inside
 # the container — always redirect with --output-dir, or bind-mount docker/logs/):
 docker exec -d mowgli-ros2 bash -c '
-  source /opt/ros/kilted/setup.bash && source /ros2_ws/install/setup.bash && \
+  source /opt/ros/lyrical/setup.bash && source /ros2_ws/install/setup.bash && \
   python3 /ros2_ws/scripts/mow_session_monitor.py \
     --session 2026-04-29-fusion-graph-tuning-v1 \
     --output-dir /ros2_ws/maps'
 
 # Interactively from inside the container (Ctrl-C to stop + write summary):
 docker exec -it mowgli-ros2 bash -c '
-  source /opt/ros/kilted/setup.bash && source /ros2_ws/install/setup.bash && \
+  source /opt/ros/lyrical/setup.bash && source /ros2_ws/install/setup.bash && \
   python3 /ros2_ws/scripts/mow_session_monitor.py --session <name> \
     --output-dir /ros2_ws/maps'
 ```
@@ -34,7 +34,7 @@ The `--output-dir /ros2_ws/maps` redirects to the named `install_mowgli_maps` Do
 - `cmd_vel_nav` (Nav2 output) + `cmd_vel` (post-safety, what reaches motors)
 - Nav2 `/plan` length, next pose, goal pose, distance-to-goal
 - LiDAR scan health (valid point count, min range)
-- **Yaw-source attribution** (`yaw_sources`): COG yaw (`/imu/cog_heading`), fusion_graph's own yaw (`/imu/fg_yaw`), and each one's delta against the fused yaw — `cog_minus_fusion_deg ≈ ±180°` is the 180°-flip / lever-arm signature. Plus four `/fusion_graph/diagnostics` keys: `cov_yawyaw`, `gyro_bias_z_rad_per_s`, `gps_rejects_wrongfix`, `cog_flip_recoveries`. The node also publishes `total_nodes` / `loop_closures` / `scan_matches_ok|fail`, but the monitor does **not** record them — read those live off `/fusion_graph/diagnostics`.
+- **Yaw-source attribution** (`yaw_sources`): COG yaw (`/imu/cog_heading`), fusion_graph's own yaw (`/imu/fg_yaw`), and each one's delta against the fused yaw — `cog_minus_fusion_deg ≈ ±180°` is the 180°-flip / lever-arm signature. Plus four `/fusion_graph/diagnostics` keys: `cov_yawyaw`, `gyro_bias_z_rad_per_s`, `gps_rejects_wrongfix`, `cog_flip_recoveries`. The node also publishes graph, tiled-map and LiDAR-anchor counters; inspect those live on `/fusion_graph/diagnostics` when diagnosing fallback CPU or factor activity.
 - **Cross-source consistency** (`cross_checks`): `fusion ↔ gps` distance and `wheel ↔ gyro` yaw drift
 - **RTK covariance-drop health**: on every RTK-Fixed GPS arrival, confirm `/odometry/filtered_map` cov drops to σ≤~3 cm within 300 ms — surfaced as `cross_checks.rtk_cov_check.{arrivals,ok,violations}` per sample and rolled into a `rtk_cov_check.verdict` ("healthy" / "intermittent" / "gate_rejecting" / "no_rtk" / "insufficient_data") in the summary.
 

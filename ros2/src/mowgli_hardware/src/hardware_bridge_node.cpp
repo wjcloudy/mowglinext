@@ -26,17 +26,22 @@
  *   ~/status        mowgli_interfaces/msg/Status
  *   ~/emergency     mowgli_interfaces/msg/Emergency
  *   ~/power         mowgli_interfaces/msg/Power
+ *   ~/cmd_vel_applied geometry_msgs/msg/TwistStamped (command encoded for STM32)
  *   ~/imu/data_raw  sensor_msgs/msg/Imu
  *   ~/wheel_odom    nav_msgs/msg/Odometry
  *   ~/dock_heading  sensor_msgs/msg/Imu  (dock yaw while charging, remapped → /gnss/heading)
  *   /battery_state  sensor_msgs/msg/BatteryState  (for opennav_docking)
  *
  * Subscribed topics:
- *   ~/cmd_vel      geometry_msgs/msg/Twist  → LlCmdVel packet to STM32
+ *   ~/cmd_vel      geometry_msgs/msg/TwistStamped → slew limit → LlCmdVel packet to STM32
  *
  * Services:
  *   ~/mower_control  mowgli_interfaces/srv/MowerControl
  *   ~/emergency_stop mowgli_interfaces/srv/EmergencyStop
+ *   ~/reboot_board    std_srvs/srv/Trigger
+ *   ~/set_firmware_debug std_srvs/srv/SetBool
+ *   ~/clear_dig_escalation std_srvs/srv/Trigger  (operator override, distance-gated — see
+ * dig_escalation.hpp)
  *
  * Parameters:
  *   serial_port      (string,  default "/dev/mowgli")
@@ -44,6 +49,9 @@
  *   heartbeat_rate   (double,  default 4.0 Hz  → 250 ms period)
  *   publish_rate     (double,  default 100.0 Hz → 10 ms period)
  *   high_level_rate  (double,  default 2.0 Hz   → 500 ms period)
+ *   cmd_vel_{linear,angular}_{accel,decel}_limit (double, startup-only)
+ *   deadband_pwm     (double,  default 40.0 PWM, startup-only — motor stiction
+ *                     estimate the wheel_pid_* set must be able to bridge)
  */
 
 #include <chrono>
@@ -60,16 +68,23 @@
 
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
+#include "mowgli_hardware/battery_state_semantics.hpp"
 #include "mowgli_hardware/blade_gate.hpp"
+#include "mowgli_hardware/blade_telemetry.hpp"
 #include "mowgli_hardware/clock_fit.hpp"
+#include "mowgli_hardware/cmd_vel_slew.hpp"
+#include "mowgli_hardware/cmd_vel_validation.hpp"
 #include "mowgli_hardware/dig_detector.hpp"
 #include "mowgli_hardware/dig_escalation.hpp"
+#include "mowgli_hardware/drive_gain_sanity.hpp"
 #include "mowgli_hardware/gnss_hardware_status.hpp"
 #include "mowgli_hardware/imu_liveness.hpp"
 #include "mowgli_hardware/ll_datatypes.hpp"
 #include "mowgli_hardware/odometry_publisher.hpp"
 #include "mowgli_hardware/packet_handler.hpp"
 #include "mowgli_hardware/serial_port.hpp"
+#include "mowgli_hardware/timer_period.hpp"
+#include "mowgli_interfaces/update_maintenance.hpp"
 
 // High-level mode constants — must match HighLevelStatus.msg and the
 // HL_MODE_* defines in firmware/mowgli_protocol.h. Declared locally to
@@ -91,6 +106,14 @@ static constexpr double kMinRuntimeWheelKd = 0.0;
 static constexpr double kMaxRuntimeWheelKd = 500.0;
 static constexpr double kMinRuntimeWheelIntegralLimit = 0.0;
 static constexpr double kMaxRuntimeWheelIntegralLimit = 255.0;
+// Template defaults for the firmware wheel PI (mowgli_bringup
+// config/mowgli_robot.yaml, field-validated 2026-09-15). Must stay in lockstep
+// with the template and mowgli.launch.py — guarded by
+// mowgli_bringup/test/test_drive_pid_defaults.py, which regexes these lines.
+static constexpr double kTemplateWheelPidKp = 10.0;
+static constexpr double kTemplateWheelPidKi = 2000.0;
+static constexpr double kTemplateWheelPidKd = 0.0;
+static constexpr double kTemplateWheelPidIntegralLimit = 45.0;
 // Firmware gyro yaw-rate loop (Option C) — mirrors the firmware's own
 // pid_constrain() ranges (Firmware-2, task #33 report) so an out-of-range
 // host value is rejected here instead of being silently re-clamped on the
@@ -123,6 +146,7 @@ static const char* high_level_mode_name(const uint8_t mode)
 
 #include "mowgli_interfaces/gnss_observation_freshness.hpp"
 #include "mowgli_interfaces/gnss_status_utils.hpp"
+#include "mowgli_interfaces/msg/absolute_pose.hpp"
 #include "mowgli_interfaces/msg/dig_event.hpp"
 #include "mowgli_interfaces/msg/emergency.hpp"
 #include "mowgli_interfaces/msg/gnss_status.hpp"
@@ -309,6 +333,7 @@ public:
       : Node("hardware_bridge", options), odometry_publisher_(*this)
   {
     declare_parameters();
+    validate_startup_parameters();
     create_publishers();
     create_subscribers();
     create_services();
@@ -335,8 +360,33 @@ private:
   {
     serial_port_path_ = declare_parameter<std::string>("serial_port", "/dev/mowgli");
     baud_rate_ = declare_parameter<int>("baud_rate", 115200);
-    heartbeat_rate_ = declare_parameter<double>("heartbeat_rate", 4.0);
-    publish_rate_ = declare_parameter<double>("publish_rate", 100.0);
+    // These values are consumed only while constructing the timers and
+    // kinematics, so ROS must reject runtime updates. Invalid startup values
+    // are checked explicitly below; descriptors cannot express finite-only or
+    // an open strictly-positive interval without a misleading pseudo-bound.
+    auto startup_double = [this](const std::string& name,
+                                 double default_val,
+                                 const std::string& description) -> double
+    {
+      rcl_interfaces::msg::ParameterDescriptor desc;
+      desc.description = description;
+      desc.read_only = true;
+      return declare_parameter<double>(name, default_val, desc);
+    };
+    auto timer_rate = [&startup_double](const std::string& name,
+                                        double default_val,
+                                        TimerRateRange preferred_range) -> double
+    {
+      return startup_double(
+          name,
+          default_val,
+          "Finite startup-only timer cadence in Hz with a representable period of at least 1 ns. "
+          "Usable values outside the preferred [" +
+              std::to_string(preferred_range.minimum_hz) + ", " +
+              std::to_string(preferred_range.maximum_hz) + "] Hz range are clamped at startup.");
+    };
+    heartbeat_rate_ = timer_rate("heartbeat_rate", 4.0, kHeartbeatRateRange);
+    publish_rate_ = timer_rate("publish_rate", 100.0, kPublishRateRange);
     // Serial-link watchdog: if no bytes arrive for this long while the port is
     // open, treat the link as dead and reopen it. The STM32 streams status
     // (~4 Hz) + odom (~20 Hz) + IMU (~50-100 Hz) continuously whenever it is
@@ -345,8 +395,13 @@ private:
     // OS leaves the stale fd "open" (reads just return nothing), so without
     // this the bridge would sit forever writing into a dead fd. Reopening
     // re-resolves /dev/mowgli to the new ttyACM.
-    serial_rx_timeout_s_ = declare_parameter<double>("serial_rx_timeout_s", 2.0);
-    high_level_rate_ = declare_parameter<double>("high_level_rate", 2.0);
+    // Zero intentionally disables the RX watchdog; non-finite and negative
+    // values have no useful or safe watchdog meaning.
+    serial_rx_timeout_s_ = startup_double(
+        "serial_rx_timeout_s",
+        2.0,
+        "Finite non-negative startup-only RX watchdog timeout in seconds; zero disables it.");
+    high_level_rate_ = timer_rate("high_level_rate", 2.0, kHighLevelRateRange);
     dock_x_ = declare_parameter<double>("dock_pose_x", 0.0);
     dock_y_ = declare_parameter<double>("dock_pose_y", 0.0);
     dock_yaw_ = declare_parameter<double>("dock_pose_yaw", 0.0);
@@ -358,7 +413,11 @@ private:
     // centre drive-wheel distance; ticks_per_meter is the runtime encoder
     // scale used by this bridge for host-side odometry and re-sent to the
     // STM32 so the firmware wheel PI / odom share the same tuned value.
-    wheel_track_ = declare_parameter<double>("wheel_track", 0.325);
+    wheel_track_ =
+        startup_double("wheel_track",
+                       0.325,
+                       "Finite startup-only wheel track in metres. Values outside the firmware "
+                       "range [0.15, 0.60] are clamped at startup.");
     // Helper for declaring doubles with a floating_point_range descriptor so
     // ros2 param set rejects out-of-bounds values at the framework level before
     // the set-parameters callback fires. Ranges mirror the firmware validation.
@@ -396,23 +455,61 @@ private:
     play_clear_ms_ = declare_parameter<int>("play_button_clear_emergency_ms", 2000);
     // Drive-motor wheel-velocity PID gains + feedforward. Pushed to the STM32
     // firmware (PACKET_ID_LL_SET_DRIVE_PID) so the GUI can retune the per-wheel
-    // loop without reflashing. Fallback defaults match the mowgli_bringup
-    // template (pre-calibration field defaults; a per-robot auto-tune overrides
-    // them). Live-tunable via the set-parameters callback below; the firmware
-    // re-clamps every value. The floating_point_range on these parameters
-    // mirrors the firmware validation bounds so ros2 param set rejects
-    // out-of-range values at the framework level before the callback fires.
-    wheel_pid_kp_ = bounded_double("wheel_pid_kp", 0.2, kMinRuntimeWheelKp, kMaxRuntimeWheelKp);
-    wheel_pid_ki_ = bounded_double("wheel_pid_ki", 0.092, kMinRuntimeWheelKi, kMaxRuntimeWheelKi);
-    wheel_pid_kd_ = bounded_double("wheel_pid_kd", 0.01, kMinRuntimeWheelKd, kMaxRuntimeWheelKd);
+    // loop without reflashing. The firmware applies them UNSCALED in PWM units
+    // (kp PWM/(m/s), ki PWM/(m/s·s), integral_limit PWM). Fallback defaults
+    // match the mowgli_bringup template (field-validated 2026-09-15; a
+    // per-robot auto-tune overrides them). Live-tunable via the set-parameters
+    // callback below; the firmware re-clamps every value. The
+    // floating_point_range on these parameters mirrors the firmware validation
+    // bounds so ros2 param set rejects out-of-range values at the framework
+    // level before the callback fires.
+    wheel_pid_kp_ = bounded_double("wheel_pid_kp", 10.0, kMinRuntimeWheelKp, kMaxRuntimeWheelKp);
+    wheel_pid_ki_ = bounded_double("wheel_pid_ki", 2000.0, kMinRuntimeWheelKi, kMaxRuntimeWheelKi);
+    wheel_pid_kd_ = bounded_double("wheel_pid_kd", 0.0, kMinRuntimeWheelKd, kMaxRuntimeWheelKd);
     wheel_pid_integral_limit_ = bounded_double("wheel_pid_integral_limit",
-                                               15.0,
+                                               45.0,
                                                kMinRuntimeWheelIntegralLimit,
                                                kMaxRuntimeWheelIntegralLimit);
     wheel_pid_pwm_per_mps_ = bounded_double("wheel_pid_pwm_per_mps",
                                             282.135,
                                             kMinRuntimePwmPerMps,
                                             kMaxRuntimePwmPerMps);
+    // Stiction gate for the set above (mowgli_hardware/drive_gain_sanity.hpp).
+    // The old template (kp 0.2 / ki 0.092 / integral_limit 15) capped the
+    // firmware loop at ~24 PWM at the 0.03 m/s an inner arc wheel is asked
+    // for — under the ~40 PWM static-friction deadband, so that wheel never
+    // turned. Such a set is replaced on the wire by the template gains (see
+    // send_drive_pid); the bridge is not a config writer: it logs, it does not
+    // fix the file.
+    deadband_pwm_ = startup_double(
+        "deadband_pwm",
+        40.0,
+        "Startup-only estimate of the drive motors' static-friction deadband in PWM. "
+        "wheel_pid_integral_limit + wheel_pid_kp*0.03 + wheel_pid_pwm_per_mps*0.03 must reach "
+        "it, or the template gains are sent to the firmware in its place.");
+    drive_gains_below_deadband_ = !DriveGainsBridgeDeadband(wheel_pid_kp_,
+                                                            wheel_pid_integral_limit_,
+                                                            wheel_pid_pwm_per_mps_,
+                                                            deadband_pwm_);
+    if (drive_gains_below_deadband_)
+    {
+      RCLCPP_ERROR(
+          get_logger(),
+          "wheel_pid_* gains cannot bridge the motor deadband: integral_limit %.3f + kp %.3f*0.03 "
+          "+ pwm_per_mps %.3f*0.03 = %.1f PWM < deadband_pwm %.1f. Sending the template gains "
+          "kp %.1f / ki %.1f / kd %.1f / integral_limit %.1f to the firmware instead (the "
+          "configured values are left untouched). Fix mowgli_robot.yaml: delete the overriding "
+          "keys to fall back to those defaults.",
+          wheel_pid_integral_limit_,
+          wheel_pid_kp_,
+          wheel_pid_pwm_per_mps_,
+          DriveGainsBridgePwm(wheel_pid_kp_, wheel_pid_integral_limit_, wheel_pid_pwm_per_mps_),
+          deadband_pwm_,
+          kTemplateWheelPidKp,
+          kTemplateWheelPidKi,
+          kTemplateWheelPidKd,
+          kTemplateWheelPidIntegralLimit);
+    }
     // Firmware gyro yaw-rate loop (Option C, task #33/#34 — replaces the
     // removed host-side angular_rate_controller.hpp). Pushed to the STM32 via
     // PACKET_ID_LL_SET_YAW_PID (see send_yaw_pid()). Defaults are the
@@ -435,6 +532,24 @@ private:
     // Default 0.05 (was a hardcoded 0.15) — the PX4 PID firmware can track
     // slow setpoints now. Live-tunable via the callback below.
     min_linear_vel_ = bounded_double("min_linear_vel", 0.05, 0.0, 1.0);
+    cmd_vel_linear_accel_limit_ = startup_double(
+        "cmd_vel_linear_accel_limit",
+        0.30,
+        "Finite strictly-positive startup-only linear command acceleration limit in m/s^2.");
+    cmd_vel_linear_decel_limit_ = startup_double(
+        "cmd_vel_linear_decel_limit",
+        0.60,
+        "Finite strictly-positive startup-only non-zero linear command deceleration limit in "
+        "m/s^2; an explicit zero remains immediate.");
+    cmd_vel_angular_accel_limit_ = startup_double(
+        "cmd_vel_angular_accel_limit",
+        1.0,
+        "Finite strictly-positive startup-only angular command acceleration limit in rad/s^2.");
+    cmd_vel_angular_decel_limit_ = startup_double(
+        "cmd_vel_angular_decel_limit",
+        2.0,
+        "Finite strictly-positive startup-only non-zero angular command deceleration limit in "
+        "rad/s^2; an explicit zero remains immediate.");
     min_lin_vel_cb_handle_ = add_on_set_parameters_callback(
         [this](const std::vector<rclcpp::Parameter>& params)
         {
@@ -576,6 +691,33 @@ private:
           {
             return result;
           }
+          // Any drive-PID change re-sends the whole SET_DRIVE_PID packet, so
+          // the gains it would carry must be able to bridge the motor
+          // deadband (see deadband_pwm_ in declare_parameters).
+          if (drive_pid_changed && !DriveGainsBridgeDeadband(next_wheel_pid_kp,
+                                                             next_wheel_pid_integral_limit,
+                                                             next_wheel_pid_pwm_per_mps,
+                                                             deadband_pwm_))
+          {
+            result.successful = false;
+            result.reason = "wheel_pid_* gains cannot bridge the motor deadband: integral_limit " +
+                            std::to_string(next_wheel_pid_integral_limit) + " + kp " +
+                            std::to_string(next_wheel_pid_kp) + "*0.03 + pwm_per_mps " +
+                            std::to_string(next_wheel_pid_pwm_per_mps) + "*0.03 = " +
+                            std::to_string(DriveGainsBridgePwm(next_wheel_pid_kp,
+                                                               next_wheel_pid_integral_limit,
+                                                               next_wheel_pid_pwm_per_mps)) +
+                            " PWM < deadband_pwm " + std::to_string(deadband_pwm_) +
+                            " (template defaults: kp " + std::to_string(kTemplateWheelPidKp) +
+                            ", ki " + std::to_string(kTemplateWheelPidKi) + ", integral_limit " +
+                            std::to_string(kTemplateWheelPidIntegralLimit) + ")";
+            return result;
+          }
+          if (drive_pid_changed)
+          {
+            // A set that passes the gate supersedes a startup refusal.
+            drive_gains_below_deadband_ = false;
+          }
           min_linear_vel_ = next_min_linear_vel;
           ticks_per_meter_ = next_ticks_per_meter;
           wheel_pid_kp_ = next_wheel_pid_kp;
@@ -681,16 +823,31 @@ private:
     // RTK-Float the map pose cannot distinguish slip from GNSS noise, and a
     // false dig would hard-stop a perfectly healthy robot mid-mow.
     dig_cfg_.max_pos_sigma = declare_parameter<double>("dig_max_pos_sigma", 0.10);
-    dig_gnss_timeout_s_ = declare_parameter<double>("dig_gnss_timeout_s", 2.0);
+    // Zero freshness windows would permanently stand the detector down, and a
+    // zero escape timeout would suppress its reverse manoeuvre. Require each
+    // dig timeout to be strictly positive instead.
+    dig_gnss_timeout_s_ = startup_double(
+        "dig_gnss_timeout_s",
+        2.0,
+        "Finite strictly-positive startup-only dig GNSS freshness timeout in seconds.");
     dig_cfg_.max_yaw_rate = declare_parameter<double>("dig_max_yaw_rate", 0.20);
-    dig_gyro_timeout_s_ = declare_parameter<double>("dig_gyro_timeout_s", 0.5);
+    dig_gyro_timeout_s_ = startup_double(
+        "dig_gyro_timeout_s",
+        0.5,
+        "Finite strictly-positive startup-only dig gyro freshness timeout in seconds.");
     dig_escape_cfg_.reverse_speed = declare_parameter<double>("dig_reverse_speed", 0.12);
     dig_escape_cfg_.reverse_dist = declare_parameter<double>("dig_reverse_dist", 0.30);
-    dig_escape_cfg_.timeout_s = declare_parameter<double>("dig_reverse_timeout_s", 4.0);
-    dig_monitor_rate_ = declare_parameter<double>("dig_monitor_rate", 10.0);
+    dig_escape_cfg_.timeout_s =
+        startup_double("dig_reverse_timeout_s",
+                       4.0,
+                       "Finite strictly-positive startup-only dig reverse timeout in seconds.");
+    dig_monitor_rate_ = timer_rate("dig_monitor_rate", 10.0, kDigMonitorRateRange);
     // Fused pose older than this is treated as absent (detector stands down)
     // rather than compared against stale coordinates.
-    dig_pose_timeout_s_ = declare_parameter<double>("dig_pose_timeout_s", 1.0);
+    dig_pose_timeout_s_ = startup_double(
+        "dig_pose_timeout_s",
+        1.0,
+        "Finite strictly-positive startup-only dig pose freshness timeout in seconds.");
     dig_cfg_.enabled = dig_detect_enabled_;
 
     // ── Repeat-dig escalation (see mowgli_hardware/dig_escalation.hpp) ─────
@@ -707,6 +864,21 @@ private:
     dig_escalate_cfg_.radius_m = declare_parameter<double>("dig_escalate_radius_m", 0.50);
     dig_escalate_cfg_.window_s = declare_parameter<double>("dig_escalate_window_s", 60.0);
     dig_escalate_cfg_.min_count = declare_parameter<int>("dig_escalate_count", 3);
+    // How far the chassis must move past the escalation anchor before
+    // ~/clear_dig_escalation accepts an operator override (see
+    // on_clear_dig_escalation). Independently tunable from dig_escalate_radius_m
+    // above — that radius clusters LATCHES into "the same spot" for deciding
+    // whether to escalate at all; this distance is how far clear of that spot
+    // counts as proof the operator actually freed the chassis, which a site
+    // with a lot of open room around the obstruction may want set wider than
+    // the clustering radius. Floored at 0.30 m regardless of what is
+    // configured: below that, "moved" is barely outside the position noise a
+    // stationary RTK-Fixed fix already carries, so accepting it would let the
+    // override rubber-stamp a chassis that never actually left the
+    // obstruction — exactly what issue #500's seventeen-latch wedge showed
+    // the per-event response cannot self-correct.
+    dig_escalate_clear_distance_m_ =
+        std::max(0.30, declare_parameter<double>("dig_escalate_clear_distance_m", 0.50));
 
     RCLCPP_INFO(get_logger(),
                 "Parameters: serial_port=%s baud_rate=%d heartbeat_rate=%.1f Hz "
@@ -718,12 +890,53 @@ private:
                 high_level_rate_);
   }
 
+  void validate_startup_parameters()
+  {
+    auto normalize_timer = [this](const char* name, double& requested, TimerRateRange range)
+    {
+      const double effective = normalize_operational_timer_rate(requested, range);
+      if (effective != requested)
+      {
+        RCLCPP_WARN(get_logger(),
+                    "%s requested %.17g Hz is outside the preferred range; using %.17g Hz",
+                    name,
+                    requested,
+                    effective);
+        requested = effective;
+      }
+    };
+    normalize_timer("heartbeat_rate", heartbeat_rate_, kHeartbeatRateRange);
+    normalize_timer("publish_rate", publish_rate_, kPublishRateRange);
+    normalize_timer("high_level_rate", high_level_rate_, kHighLevelRateRange);
+    normalize_timer("dig_monitor_rate", dig_monitor_rate_, kDigMonitorRateRange);
+    const double effective_wheel_track = normalize_runtime_wheel_track(wheel_track_);
+    if (effective_wheel_track != wheel_track_)
+    {
+      RCLCPP_WARN(get_logger(),
+                  "wheel_track requested %.17g m is outside the firmware range; using %.17g m",
+                  wheel_track_,
+                  effective_wheel_track);
+      wheel_track_ = effective_wheel_track;
+    }
+    require_finite_nonnegative_timeout(serial_rx_timeout_s_, "serial_rx_timeout_s");
+    require_finite_positive(dig_gnss_timeout_s_, "dig_gnss_timeout_s");
+    require_finite_positive(dig_gyro_timeout_s_, "dig_gyro_timeout_s");
+    require_finite_positive(dig_escape_cfg_.timeout_s, "dig_reverse_timeout_s");
+    require_finite_positive(dig_pose_timeout_s_, "dig_pose_timeout_s");
+    require_finite_positive(cmd_vel_linear_accel_limit_, "cmd_vel_linear_accel_limit");
+    require_finite_positive(cmd_vel_linear_decel_limit_, "cmd_vel_linear_decel_limit");
+    require_finite_positive(cmd_vel_angular_accel_limit_, "cmd_vel_angular_accel_limit");
+    require_finite_positive(cmd_vel_angular_decel_limit_, "cmd_vel_angular_decel_limit");
+  }
+
   void create_publishers()
   {
     pub_status_ = create_publisher<mowgli_interfaces::msg::Status>("~/status", rclcpp::QoS(10));
     pub_emergency_ =
         create_publisher<mowgli_interfaces::msg::Emergency>("~/emergency", rclcpp::QoS(10));
     pub_power_ = create_publisher<mowgli_interfaces::msg::Power>("~/power", rclcpp::QoS(10));
+    pub_cmd_vel_applied_ =
+        create_publisher<geometry_msgs::msg::TwistStamped>("~/cmd_vel_applied", rclcpp::QoS(10));
     // RELIABLE, not SensorDataQoS — robot_localization's EKF nodes
     // subscribe RELIABLE and refuse BEST_EFFORT publishers with
     // "incompatible QoS policy", which starves the filter of IMU/wheel data.
@@ -812,6 +1025,31 @@ private:
           dig_gnss_rtk_fixed_ = mowgli_interfaces::gnss_status_utils::BehaviorTreeRtkFixed(*msg);
         });
 
+    // Independent RTK position used only to veto false dig detections. The
+    // fused map pose remains the primary reference, but it can lag when the
+    // graph rejects an otherwise valid fix. A fresh raw RTK displacement then
+    // proves that the chassis moved and prevents a harmful stop + reverse.
+    sub_gps_absolute_pose_ = create_subscription<mowgli_interfaces::msg::AbsolutePose>(
+        "/gps/absolute_pose",
+        rclcpp::QoS(10),
+        [this](mowgli_interfaces::msg::AbsolutePose::ConstSharedPtr msg)
+        {
+          const bool is_fixed =
+              msg->source == mowgli_interfaces::msg::AbsolutePose::SOURCE_GPS &&
+              (msg->flags & mowgli_interfaces::msg::AbsolutePose::FLAG_GPS_RTK_FIXED) != 0u;
+          const double x = msg->pose.pose.position.x;
+          const double y = msg->pose.pose.position.y;
+          if (!is_fixed || !std::isfinite(x) || !std::isfinite(y))
+          {
+            have_dig_gnss_pose_ = false;
+            return;
+          }
+          last_dig_gnss_pose_x_ = x;
+          last_dig_gnss_pose_y_ = y;
+          last_dig_gnss_pose_time_ = now();
+          have_dig_gnss_pose_ = true;
+        });
+
     // Mirror the behavior tree's high-level state to the firmware so it
     // knows when to accept cmd_vel (mode != IDLE).
     sub_hl_status_ = create_subscription<mowgli_interfaces::msg::HighLevelStatus>(
@@ -838,9 +1076,9 @@ private:
                        msg->state_name.c_str());
         });
 
-    // GNSS-anchored fused pose — the ONLY signal on this robot independent
-    // of the wheels, and therefore the only one that can witness a dig.
-    // SensorDataQoS to match fusion_graph's publisher.
+    // GNSS-anchored fused pose is the dig detector's primary reference and
+    // the map-frame location used for an event. SensorDataQoS matches the
+    // fusion_graph publisher.
     sub_filtered_map_ = create_subscription<nav_msgs::msg::Odometry>(
         "/odometry/filtered_map",
         rclcpp::SensorDataQoS(),
@@ -884,6 +1122,20 @@ private:
                std::shared_ptr<std_srvs::srv::SetBool::Response> res)
         {
           on_set_firmware_debug(req, res);
+        });
+
+    // Operator override for a latched repeat-dig escalation (see
+    // dig_escalated_'s doc comment) when driving to the dock is not the
+    // practical recovery — e.g. the dock is unreachable from here, or the
+    // operator has already freed the chassis by hand. Succeeds only once the
+    // chassis has moved past dig_escalate_clear_distance_m_ from the anchor;
+    // see on_clear_dig_escalation.
+    srv_clear_dig_escalation_ = create_service<std_srvs::srv::Trigger>(
+        "~/clear_dig_escalation",
+        [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+               std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+        {
+          on_clear_dig_escalation(req, res);
         });
   }
 
@@ -936,17 +1188,17 @@ private:
   void create_timers()
   {
     // Serial read / packet dispatch.
-    const auto read_period_ms = std::chrono::milliseconds(static_cast<int>(1000.0 / publish_rate_));
-    timer_read_ = create_wall_timer(read_period_ms,
+    const auto read_period = timer_period_from_rate_hz(publish_rate_);
+    timer_read_ = create_wall_timer(read_period,
                                     [this]()
                                     {
                                       read_serial_tick();
                                     });
 
     // Heartbeat.
-    const auto hb_period_ms = std::chrono::milliseconds(static_cast<int>(1000.0 / heartbeat_rate_));
+    const auto hb_period = timer_period_from_rate_hz(heartbeat_rate_);
     timer_heartbeat_ =
-        create_wall_timer(hb_period_ms,
+        create_wall_timer(hb_period,
                           [this]()
                           {
                             // On startup, send emergency release for the first few
@@ -992,9 +1244,8 @@ private:
                           });
 
     // High-level state.
-    const auto hl_period_ms =
-        std::chrono::milliseconds(static_cast<int>(1000.0 / high_level_rate_));
-    timer_high_level_ = create_wall_timer(hl_period_ms,
+    const auto hl_period = timer_period_from_rate_hz(high_level_rate_);
+    timer_high_level_ = create_wall_timer(hl_period,
                                           [this]()
                                           {
                                             send_high_level_state();
@@ -1007,9 +1258,8 @@ private:
     // still sitting in the hole it dug).
     if (dig_detect_enabled_)
     {
-      const auto dig_period_ms =
-          std::chrono::milliseconds(static_cast<int>(1000.0 / std::max(1.0, dig_monitor_rate_)));
-      timer_dig_monitor_ = create_wall_timer(dig_period_ms,
+      const auto dig_period = timer_period_from_rate_hz(dig_monitor_rate_);
+      timer_dig_monitor_ = create_wall_timer(dig_period,
                                              [this]()
                                              {
                                                dig_monitor_tick();
@@ -1356,6 +1606,15 @@ private:
       msg.firmware_version = fw_version_str_;
       msg.firmware_protocol_version = fw_protocol_version_;
       msg.firmware_compatible = fw_compatible_;
+      // Repeat-dig escalation (see dig_escalated_'s doc comment). Distance is
+      // live so the GUI can show progress toward the ~/clear_dig_escalation
+      // threshold without its own odometry subscription.
+      msg.dig_escalated = dig_escalated_;
+      msg.dig_escalated_distance_m =
+          dig_escalated_ ? static_cast<float>(std::hypot(last_map_pose_x_ - dig_escalation_x_,
+                                                         last_map_pose_y_ - dig_escalation_y_))
+                         : 0.0F;
+      msg.dig_escalated_required_distance_m = static_cast<float>(dig_escalate_clear_distance_m_);
       pub_status_->publish(msg);
     }
 
@@ -1473,7 +1732,7 @@ private:
       // 0.0 when not charging so hasStoppedCharging() detects the
       // transition after undocking.
       msg.current = is_charging_ ? std::abs(pkt.charging_current) : 0.0f;
-      msg.percentage = static_cast<float>(pkt.batt_percentage) / 100.0f;
+      msg.percentage = battery_percentage_from_firmware(pkt.batt_percentage);
       msg.power_supply_status =
           is_charging_ ? sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_CHARGING
                        : sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_DISCHARGING;
@@ -2283,6 +2542,11 @@ private:
 
   void send_blade_command(uint8_t on, uint8_t dir)
   {
+    if (mowgli_interfaces::updateMaintenanceActive())
+    {
+      on = 0;
+      mow_enabled_ = false;
+    }
     LlCmdBlade pkt{};
     pkt.type = PACKET_ID_LL_CMD_BLADE;
     pkt.blade_on = on;
@@ -2313,13 +2577,40 @@ private:
     {
       return;
     }
+    // Startup gate failed (declare_parameters logged the values): push the
+    // template gains instead of the configured set. Withholding the packet
+    // would also withhold ticks_per_meter and leave the firmware on its
+    // compile-time gains (Kp 30 / Ki 5000 / clamp 100), which have never run
+    // together with the firmware yaw-rate loop; the template set is the
+    // field-validated one. The configured values are NOT modified — the
+    // bridge is not a config writer — so every (re)send keeps saying so.
+    const bool substitute = drive_gains_below_deadband_;
+    const double kp = substitute ? kTemplateWheelPidKp : wheel_pid_kp_;
+    const double ki = substitute ? kTemplateWheelPidKi : wheel_pid_ki_;
+    const double kd = substitute ? kTemplateWheelPidKd : wheel_pid_kd_;
+    const double integral_limit =
+        substitute ? kTemplateWheelPidIntegralLimit : wheel_pid_integral_limit_;
+    if (substitute)
+    {
+      RCLCPP_ERROR_THROTTLE(get_logger(),
+                            *get_clock(),
+                            60000,
+                            "Configured wheel_pid_* set is below deadband_pwm %.1f — sending the "
+                            "template gains kp %.1f / ki %.1f / kd %.1f / integral_limit %.1f "
+                            "instead (see startup error; fix mowgli_robot.yaml)",
+                            deadband_pwm_,
+                            kp,
+                            ki,
+                            kd,
+                            integral_limit);
+    }
     LlSetDrivePid pkt{};
     pkt.type = PACKET_ID_LL_SET_DRIVE_PID;
     pkt.ticks_per_meter = static_cast<float>(ticks_per_meter_);
-    pkt.kp = static_cast<float>(wheel_pid_kp_);
-    pkt.ki = static_cast<float>(wheel_pid_ki_);
-    pkt.kd = static_cast<float>(wheel_pid_kd_);
-    pkt.integral_limit = static_cast<float>(wheel_pid_integral_limit_);
+    pkt.kp = static_cast<float>(kp);
+    pkt.ki = static_cast<float>(ki);
+    pkt.kd = static_cast<float>(kd);
+    pkt.integral_limit = static_cast<float>(integral_limit);
     pkt.pwm_per_mps = static_cast<float>(wheel_pid_pwm_per_mps_);
     if (send_raw_packet(reinterpret_cast<const uint8_t*>(&pkt),
                         sizeof(LlSetDrivePid) - sizeof(uint16_t)))
@@ -2335,10 +2626,10 @@ private:
                   "Sent drive params: ticks_per_meter=%.3f kp=%.3f ki=%.3f kd=%.3f "
                   "integral_limit=%.3f pwm_per_mps=%.3f",
                   ticks_per_meter_,
-                  wheel_pid_kp_,
-                  wheel_pid_ki_,
-                  wheel_pid_kd_,
-                  wheel_pid_integral_limit_,
+                  kp,
+                  ki,
+                  kd,
+                  integral_limit,
                   wheel_pid_pwm_per_mps_);
     }
   }
@@ -2523,7 +2814,7 @@ private:
     blade_rpm_ = static_cast<float>(pkt.rpm);
     blade_status_time_ = now();
     blade_temperature_ = pkt.temperature;
-    blade_esc_current_ = static_cast<float>(pkt.power_watts);
+    blade_esc_current_ = blade_current_amps(pkt);
   }
 
   // ---------------------------------------------------------------------------
@@ -2716,6 +3007,23 @@ private:
     double vx = msg->twist.linear.x;
     double wz = msg->twist.angular.z;
 
+    // Reject non-finite input before any shaping, mode inference, or state
+    // bookkeeping.  Discarding it lets the firmware's existing 200 ms
+    // cmd_vel watchdog deterministically stop the mower without refreshing
+    // the valid-command heartbeat.  The warning is throttled because this
+    // callback runs at command rate.
+    if (!mowgli_hardware::is_finite_velocity_command(vx, wz))
+    {
+      RCLCPP_WARN_THROTTLE(
+          get_logger(),
+          *get_clock(),
+          5000,
+          "Rejecting non-finite cmd_vel (linear.x=%f, angular.z=%f); command discarded.",
+          vx,
+          wz);
+      return;
+    }
+
     // The firmware ignores cmd_vel when mode is IDLE.  When velocity commands
     // arrive before the BT publishes any high-level state, ensure the firmware
     // is not left in NULL/transition mode.
@@ -2786,14 +3094,16 @@ private:
     // min_linear_vel:=0.0 to disable the guard entirely, or raise it back
     // toward 0.15 if a given chassis still can't execute slow forward.
     //
-    // wz handling — Option C (task #34): the closed-loop yaw-rate shaping
+    // wz handling — Option C (task #34): the closed-loop yaw-rate control
     // that used to live here (Option B, task #24 — a host-side PI closing
     // on the gyro to absorb the firmware's nonlinear PWM→rotation response)
     // has moved INTO FIRMWARE (task #33), which now runs the same closed
     // loop without the ~50-90 ms USB round-trip latency that limited the
-    // host-side gains. wz is sent straight through, unshaped; see the
-    // firmware's own yaw_kp/yaw_ki (tuned via SET_DRIVE_PID, send_drive_pid())
-    // for the loop that used to be angular_rate_controller.hpp here.
+    // host-side gains. See the firmware's own yaw_kp/yaw_ki (tuned via
+    // SET_YAW_PID, send_yaw_pid()) for the loop that used to be
+    // angular_rate_controller.hpp here. The common open-loop slew cap below
+    // only limits how quickly the requested setpoint changes; it does not
+    // close another yaw feedback loop.
     //
     // The sub-deadband |vx| → 0 guard is unchanged (linear has no clean
     // host-side rate feedback — encoders slip; leave it to Nav2's loops).
@@ -2803,25 +3113,69 @@ private:
       vx = 0.0;
     }
 
-    // Remember what we were actually told to do; the dig monitor compares
+    // While escaping a dig, WE own the wire. Drop the incoming command
+    // entirely instead of forwarding it or advancing the slew state: the
+    // controller that dug the hole is still asking to drive forward into it.
+    if (dig_escaping_)
+    {
+      return;
+    }
+
+    // Every motion lane has now passed through twist_mux, so this is the only
+    // host-side point that can prevent a one-cycle speed or steering reversal
+    // regardless of whether FTC, RPP, docking, or teleop produced it. A
+    // reversal decelerates through zero; explicit zero commands remain
+    // immediate for obstacle and operator stops.
+    const std::int64_t command_now_ns = steadyNowNs();
+    double slew_dt_s = kCmdVelSlewNominalDtSec;
+    if (have_shaped_cmd_vel_)
+    {
+      const double elapsed_s =
+          static_cast<double>(command_now_ns - last_shaped_cmd_vel_ns_) * 1.0e-9;
+      if (elapsed_s > 0.0 && elapsed_s <= kCmdVelSlewResetTimeoutSec)
+      {
+        slew_dt_s = std::min(elapsed_s, kCmdVelSlewMaxDtSec);
+      }
+      else
+      {
+        last_shaped_cmd_vx_ = 0.0;
+        last_shaped_cmd_wz_ = 0.0;
+      }
+    }
+    vx = mowgli_hardware::limit_motion_command_slew(vx,
+                                                    last_shaped_cmd_vx_,
+                                                    slew_dt_s,
+                                                    cmd_vel_linear_accel_limit_,
+                                                    cmd_vel_linear_decel_limit_);
+    wz = mowgli_hardware::limit_motion_command_slew(wz,
+                                                    last_shaped_cmd_wz_,
+                                                    slew_dt_s,
+                                                    cmd_vel_angular_accel_limit_,
+                                                    cmd_vel_angular_decel_limit_);
+    last_shaped_cmd_vx_ = vx;
+    last_shaped_cmd_wz_ = wz;
+    last_shaped_cmd_vel_ns_ = command_now_ns;
+    have_shaped_cmd_vel_ = true;
+
+    // Let the ramp accumulate continuously through the sub-deadband region,
+    // while still preserving the bridge's existing wire-level deadband guard.
+    // Otherwise each zeroed first step would reset the next ramp to zero and a
+    // low acceleration limit could prevent forward motion forever.
+    if (std::abs(vx) > kMinCmdToConsider && std::abs(vx) < min_linear_vel_)
+    {
+      vx = 0.0;
+    }
+
+    // Remember what we actually forward; the dig monitor compares
     // this against real-world progress (see dig_monitor_tick). Stamped
     // because a command that stopped ARRIVING must not keep counting as a
     // command: when a Nav2 goal aborts, cmd_vel simply goes silent, and a
     // stale non-zero value here would let the detector accumulate evidence
     // against a robot that is no longer being asked to move at all.
     last_cmd_vx_ = vx;
+    last_cmd_wz_ = wz;
     last_cmd_vel_time_ = now();
     have_cmd_vel_ = true;
-
-    // While escaping a dig, WE own the wire. Drop the incoming command
-    // entirely instead of forwarding it: the controller that dug the hole is
-    // still asking to drive forward into it, and the escape is a bounded,
-    // deliberately un-overridable manoeuvre. Normal command flow resumes the
-    // moment the budget is spent.
-    if (dig_escaping_)
-    {
-      return;
-    }
 
     send_cmd_vel_packet(vx, wz);
   }
@@ -2837,6 +3191,27 @@ private:
   {
     last_map_pose_x_ = msg->pose.pose.position.x;
     last_map_pose_y_ = msg->pose.pose.position.y;
+    // Release the repeat-dig latch once the robot is provably away from the
+    // spot (2x the same-spot radius): the operator lifted it clear, or HOME
+    // drove it out. Without this the only exit was the charger, so a robot
+    // carried onto open grass still refused Play ("DIG_OBSTRUCTION" forever).
+    if (dig_escalated_ && DigEscalationClearedByDisplacement(dig_escalation_x_,
+                                                             dig_escalation_y_,
+                                                             last_map_pose_x_,
+                                                             last_map_pose_y_,
+                                                             dig_escalate_cfg_.radius_m))
+    {
+      dig_escalated_ = false;
+      dig_latch_history_.clear();
+      publish_dig_escalated();
+      RCLCPP_INFO(get_logger(),
+                  "Dig escalation cleared: robot is %.2f m from the escalation point "
+                  "(%.2f, %.2f) — carried clear or driven out.",
+                  std::hypot(last_map_pose_x_ - dig_escalation_x_,
+                             last_map_pose_y_ - dig_escalation_y_),
+                  dig_escalation_x_,
+                  dig_escalation_y_);
+    }
     // Worst axis of the position block; the detector compares a scalar
     // distance so the larger sigma is the honest one to gate on.
     // MAJOR AXIS of the xy covariance ellipse, not max(var_xx, var_yy).
@@ -2939,7 +3314,10 @@ private:
     // firmware backstop still covers the blocked-wheel case meanwhile.
     const bool pose_fresh =
         have_map_pose_ && (tick_now - last_map_pose_time_).seconds() < dig_pose_timeout_s_;
-    if (!pose_fresh)
+    const bool independent_pose_fresh =
+        have_dig_gnss_pose_ &&
+        (tick_now - last_dig_gnss_pose_time_).seconds() < dig_pose_timeout_s_;
+    if (!pose_fresh || !independent_pose_fresh)
     {
       dig_invalidate_baselines();
       return;
@@ -2948,7 +3326,8 @@ private:
     // Treat a command that has stopped arriving as no command at all.
     const bool cmd_fresh =
         have_cmd_vel_ && (tick_now - last_cmd_vel_time_).seconds() < dig_cmd_timeout_s_;
-    const double cmd_vx = cmd_fresh ? last_cmd_vx_ : 0.0;
+    const double cmd_tyre_speed =
+        cmd_fresh ? WorstCommandedTyreSpeed(last_cmd_vx_, last_cmd_wz_, wheel_track_) : 0.0;
 
     // A stale gyro means the turn exclusion cannot be evaluated. Report a
     // yaw rate above any plausible threshold so DigDecide stands down rather
@@ -2968,16 +3347,31 @@ private:
     // — see dig_detector.hpp.
     const DigVerdict verdict = DigDecide(dig_cfg_,
                                          dig_state_,
-                                         cmd_vx,
+                                         cmd_tyre_speed,
                                          wheel_step,
                                          last_map_pose_x_,
                                          last_map_pose_y_,
                                          trust_sigma,
                                          yaw_rate,
-                                         dt);
+                                         dt,
+                                         last_dig_gnss_pose_x_,
+                                         last_dig_gnss_pose_y_);
 
     if (verdict.action != DigAction::kDig)
     {
+      const double progress_floor = dig_cfg_.progress_fraction * verdict.wheel_dist;
+      if (verdict.wheel_dist >= dig_cfg_.min_wheel_dist && verdict.map_dist < progress_floor &&
+          verdict.independent_dist >= progress_floor)
+      {
+        RCLCPP_WARN_THROTTLE(get_logger(),
+                             *get_clock(),
+                             5000,
+                             "Dig candidate vetoed: encoders %.2f m, fused pose %.2f m, "
+                             "raw RTK %.2f m — chassis progress confirmed.",
+                             verdict.wheel_dist,
+                             verdict.map_dist,
+                             verdict.independent_dist);
+      }
       return;
     }
 
@@ -2988,12 +3382,14 @@ private:
   {
     RCLCPP_WARN(get_logger(),
                 "DIG DETECTED at map (%.2f, %.2f): encoders claimed %.2f m but the fused "
-                "pose moved %.2f m (GNSS sigma %.3f m, graph sigma %.3f m). "
+                "pose moved %.2f m and raw RTK moved %.2f m "
+                "(GNSS sigma %.3f m, graph sigma %.3f m). "
                 "Hard stop + bounded reverse.",
                 last_map_pose_x_,
                 last_map_pose_y_,
                 verdict.wheel_dist,
                 verdict.map_dist,
+                verdict.independent_dist,
                 dig_gnss_acc_m_,
                 last_map_sigma_);
 
@@ -3051,6 +3447,8 @@ private:
     }
 
     dig_escalated_ = true;
+    dig_escalation_x_ = last_map_pose_x_;
+    dig_escalation_y_ = last_map_pose_y_;
     RCLCPP_ERROR(get_logger(),
                  "Dig escalation: %d latches within %.2f m in %.0f s at map (%.2f, %.2f) — "
                  "the robot cannot free itself here; stopping.",
@@ -3060,6 +3458,62 @@ private:
                  last_map_pose_x_,
                  last_map_pose_y_);
     publish_dig_escalated();
+  }
+
+  /// Operator override for dig_escalated_ — see the service registration and
+  /// dig_escalated_'s doc comment for the rationale. Distance-gated (NOT a
+  /// bare acknowledge/dismiss): a request that arrives while the chassis is
+  /// still within dig_escalate_clear_distance_m_ of the anchor is refused, so
+  /// an operator who only glances at the GUI and presses the button without
+  /// actually moving the robot cannot silently defeat the guard
+  /// ShouldEscalate raised (issue #500's seventeen-latch wedge is exactly the
+  /// case this must not let back in).
+  void on_clear_dig_escalation(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                               std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+  {
+    if (!dig_escalated_)
+    {
+      res->success = true;
+      res->message = "no dig escalation is currently active";
+      return;
+    }
+    const double dist =
+        std::hypot(last_map_pose_x_ - dig_escalation_x_, last_map_pose_y_ - dig_escalation_y_);
+    if (!CanClearDigEscalation(dig_escalation_x_,
+                               dig_escalation_y_,
+                               last_map_pose_x_,
+                               last_map_pose_y_,
+                               dig_escalate_clear_distance_m_))
+    {
+      res->success = false;
+      char buf[192];
+      std::snprintf(buf,
+                    sizeof(buf),
+                    "still only %.2f m from the obstruction at (%.2f, %.2f) — move the mower "
+                    "more than %.2f m away before clearing",
+                    dist,
+                    dig_escalation_x_,
+                    dig_escalation_y_,
+                    dig_escalate_clear_distance_m_);
+      res->message = buf;
+      return;
+    }
+    dig_escalated_ = false;
+    dig_latch_history_.clear();
+    publish_dig_escalated();
+    RCLCPP_INFO(get_logger(),
+                "Dig escalation cleared by operator override: moved %.2f m from the obstruction "
+                "at (%.2f, %.2f).",
+                dist,
+                dig_escalation_x_,
+                dig_escalation_y_);
+    res->success = true;
+    char buf[128];
+    std::snprintf(buf,
+                  sizeof(buf),
+                  "dig escalation cleared (moved %.2f m from the obstruction)",
+                  dist);
+    res->message = buf;
   }
 
   void publish_dig_escalated()
@@ -3087,12 +3541,48 @@ private:
   /// Single point where a velocity command reaches the firmware.
   void send_cmd_vel_packet(double vx, double wz)
   {
+    if (mowgli_interfaces::updateMaintenanceActive())
+    {
+      vx = 0.0;
+      wz = 0.0;
+    }
+    // Keep this final construction boundary defensive as well: callers such
+    // as the bounded dig escape pass doubles.  Check float32 representability
+    // before narrowing: converting an out-of-range double is not a safe way
+    // to detect wire overflow.
+    if (!mowgli_hardware::is_float32_representable_velocity_command(vx, wz))
+    {
+      RCLCPP_WARN_THROTTLE(get_logger(),
+                           *get_clock(),
+                           5000,
+                           "Refusing non-finite or out-of-range LlCmdVel values "
+                           "(linear.x=%f, angular.z=%f).",
+                           vx,
+                           wz);
+      return;
+    }
+
+    // The pre-check establishes that both conversions are within float32's
+    // finite range.
+    const float wire_vx = static_cast<float>(vx);
+    const float wire_wz = static_cast<float>(wz);
+
     LlCmdVel pkt{};
     pkt.type = PACKET_ID_LL_CMD_VEL;
-    pkt.linear_x = static_cast<float>(vx);
-    pkt.angular_z = static_cast<float>(wz);
+    pkt.linear_x = wire_vx;
+    pkt.angular_z = wire_wz;
 
     send_raw_packet(reinterpret_cast<const uint8_t*>(&pkt), sizeof(LlCmdVel) - sizeof(uint16_t));
+
+    // Exact host command represented by the packet above. The firmware keeps
+    // final authority and may still reject motion because of an emergency or
+    // another board-level safety condition.
+    geometry_msgs::msg::TwistStamped applied;
+    applied.header.stamp = now();
+    applied.header.frame_id = "base_footprint";
+    applied.twist.linear.x = wire_vx;
+    applied.twist.angular.z = wire_wz;
+    pub_cmd_vel_applied_->publish(applied);
   }
 
   // ---------------------------------------------------------------------------
@@ -3155,6 +3645,7 @@ private:
   rclcpp::Publisher<mowgli_interfaces::msg::Status>::SharedPtr pub_status_;
   rclcpp::Publisher<mowgli_interfaces::msg::Emergency>::SharedPtr pub_emergency_;
   rclcpp::Publisher<mowgli_interfaces::msg::Power>::SharedPtr pub_power_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr pub_cmd_vel_applied_;
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr pub_imu_;
   rclcpp::Publisher<sensor_msgs::msg::MagneticField>::SharedPtr pub_mag_raw_;
   // Owns ~/wheel_odom + ~/wheel_ticks and all wheel-tick decode/aggregation
@@ -3190,23 +3681,59 @@ private:
 
   // ── Repeat-dig escalation (see dig_escalation.hpp) ───────────────────────
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr pub_dig_escalated_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr srv_clear_dig_escalation_;
   DigEscalationCfg dig_escalate_cfg_;
+  /// Floor-clamped clear-distance threshold — see its declare_parameter call
+  /// for why it is independent of dig_escalate_cfg_.radius_m.
+  double dig_escalate_clear_distance_m_{0.50};
   DigLatchHistory dig_latch_history_;
   /// Latched once the robot proves it cannot free itself at one spot. Cleared
-  /// only when the robot reaches the charger: mating with the dock is
-  /// unambiguous proof it physically left the obstruction, whether the
-  /// operator carried it out or it drove home. Nothing else clears it, so a
-  /// robot still sitting against the object cannot quietly resume.
+  /// (1) unconditionally when the robot reaches the charger (mating with the
+  /// dock is unambiguous proof it physically left the obstruction, whether the
+  /// operator carried it out or it drove home); (2) automatically once the
+  /// fused pose has moved kDigEscalationClearFactor x dig_escalate_radius_m
+  /// away from dig_escalation_{x,y}_ (carried clear by the operator, or driven
+  /// out on a HOME — checked in on_filtered_map_odom); (3) on operator request
+  /// via ~/clear_dig_escalation once the chassis has moved past
+  /// dig_escalate_clear_distance_m_ from the same anchor (see
+  /// on_clear_dig_escalation — an operator-confirmed "I freed it and it isn't
+  /// at the dock" path for the band between the clear distance and the
+  /// automatic 2x-radius release). A robot still sitting against the object
+  /// matches none of the three, so it cannot quietly resume: Play stays
+  /// refused by the tree's DigObstructionGuard until one of them happens.
   bool dig_escalated_{false};
+  /// Map-frame position last_map_pose_{x,y}_ held when dig_escalated_ was set
+  /// — the "same spot" both the displacement clear and ~/clear_dig_escalation
+  /// measure distance from.
+  double dig_escalation_x_{0.0};
+  double dig_escalation_y_{0.0};
 
-  /// Latest commanded forward velocity, captured in on_cmd_vel, with the
-  /// time it arrived — a command that goes silent must stop counting.
+  /// Latest differential-drive command, captured in on_cmd_vel, with the time
+  /// it arrived. Both components are required: a pure pivot has vx == 0 while
+  /// its tyres are still moving across the ground.
   double last_cmd_vx_{0.0};
+  double last_cmd_wz_{0.0};
   bool have_cmd_vel_{false};
   rclcpp::Time last_cmd_vel_time_{0, 0, RCL_ROS_TIME};
   /// A cmd_vel older than this no longer counts as "commanded to move" [s].
   /// Controllers publish at 10-20 Hz, so this is many missed cycles.
   static constexpr double dig_cmd_timeout_s_ = 0.5;
+
+  // Last command produced by the continuous slew calculation. This is kept
+  // separate from the wire value because the existing linear deadband guard
+  // can suppress an intermediate ramp step. A stale stream resets the next
+  // ramp to rest, matching the firmware watchdog's physical state.
+  double last_shaped_cmd_vx_{0.0};
+  double last_shaped_cmd_wz_{0.0};
+  std::int64_t last_shaped_cmd_vel_ns_{0};
+  bool have_shaped_cmd_vel_{false};
+  double cmd_vel_linear_accel_limit_{0.30};
+  double cmd_vel_linear_decel_limit_{0.60};
+  double cmd_vel_angular_accel_limit_{1.0};
+  double cmd_vel_angular_decel_limit_{2.0};
+  static constexpr double kCmdVelSlewNominalDtSec = 0.1;
+  static constexpr double kCmdVelSlewMaxDtSec = 0.2;
+  static constexpr double kCmdVelSlewResetTimeoutSec = 0.6;
 
   /// Fused-pose (map-frame) tracking.
   bool have_map_pose_{false};
@@ -3214,6 +3741,13 @@ private:
   double last_map_pose_y_{0.0};
   double last_map_sigma_{0.0};
   rclcpp::Time last_map_pose_time_{0, 0, RCL_ROS_TIME};
+
+  /// Fresh RTK-Fixed receiver position. It is an independent false-positive
+  /// veto for the fused-pose dig comparison, never a wheel-derived signal.
+  bool have_dig_gnss_pose_{false};
+  double last_dig_gnss_pose_x_{0.0};
+  double last_dig_gnss_pose_y_{0.0};
+  rclcpp::Time last_dig_gnss_pose_time_{0, 0, RCL_ROS_TIME};
 
   /// Receiver-reported position quality, for the dig detector's trust gate.
   /// The factor graph's own marginal is NOT usable for this — see
@@ -3244,6 +3778,7 @@ private:
   bool have_dig_tick_{false};
   rclcpp::Time last_dig_tick_{0, 0, RCL_ROS_TIME};
   rclcpp::Subscription<mowgli_interfaces::msg::GnssStatus>::SharedPtr sub_gnss_status_;
+  rclcpp::Subscription<mowgli_interfaces::msg::AbsolutePose>::SharedPtr sub_gps_absolute_pose_;
   rclcpp::Subscription<mowgli_interfaces::msg::HighLevelStatus>::SharedPtr sub_hl_status_;
 
   rclcpp::Service<mowgli_interfaces::srv::MowerControl>::SharedPtr srv_mower_control_;
@@ -3330,11 +3865,17 @@ private:
   // (re)connect; pid_resend_count_ > 0 makes send_drive_pid() fire on the next
   // N heartbeat ticks (seeded so the first packet survives USB re-enumeration /
   // firmware boot even if one is dropped).
-  double wheel_pid_kp_{0.2};
-  double wheel_pid_ki_{0.092};
-  double wheel_pid_kd_{0.01};
-  double wheel_pid_integral_limit_{15.0};
+  double wheel_pid_kp_{kTemplateWheelPidKp};
+  double wheel_pid_ki_{kTemplateWheelPidKi};
+  double wheel_pid_kd_{kTemplateWheelPidKd};
+  double wheel_pid_integral_limit_{kTemplateWheelPidIntegralLimit};
   double wheel_pid_pwm_per_mps_{282.135};
+  // Motor stiction estimate [PWM] the wheel_pid_* set must bridge
+  // (drive_gain_sanity.hpp); startup-only. When the startup set fails the
+  // gate, drive_gains_below_deadband_ makes send_drive_pid() substitute the
+  // template gains until a set-parameters change passes it.
+  double deadband_pwm_{40.0};
+  bool drive_gains_below_deadband_{false};
   int pid_resend_count_{5};
 
   // Firmware gyro yaw-rate loop (Option C, task #33/#34). Defaults are the

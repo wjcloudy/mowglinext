@@ -12,12 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mowglinext/mowglinext/pkg/msgs/geometry"
-	"github.com/mowglinext/mowglinext/pkg/msgs/mowgli"
-	"github.com/mowglinext/mowglinext/pkg/types"
 	"github.com/docker/distribution/uuid"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"github.com/mowglinext/mowglinext/pkg/msgs/geometry"
+	"github.com/mowglinext/mowglinext/pkg/msgs/mowgli"
+	"github.com/mowglinext/mowglinext/pkg/types"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
@@ -48,6 +48,14 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+// fusionGraphTriggerServices maps the /mowglinext/call/:command names for
+// fusion_graph_node's std_srvs/Trigger services to the ROS service names.
+var fusionGraphTriggerServices = map[string]string{
+	"fusion_graph_save":            "/fusion_graph_node/save_graph",
+	"fusion_graph_clear":           "/fusion_graph_node/clear_graph",
+	"fusion_graph_clear_lidar_map": "/fusion_graph_node/clear_lidar_map",
+}
+
 func MowgliNextRoutes(r *gin.RouterGroup, provider types.IRosProvider) {
 	group := r.Group("/mowglinext")
 	ServiceRoute(group, provider)
@@ -69,9 +77,9 @@ func topicSubscribeInterval(topic string) (int, bool) {
 	switch topic {
 	case "gps", "gnssStatus", "pose", "imu", "ticks", "wheelOdom", "lidar":
 		return 100, true
-	case "fusionRaw", "cogHeading", "magYaw", "obstacles", "icpOdom":
+	case "fusionRaw", "cogHeading", "magYaw", "obstacles":
 		return 200, true
-	case "mowProgress":
+	case "mowProgress", "lidarMap":
 		return 500, true // large OccupancyGrid — throttle hard
 	case "diagnostics", "status", "highLevelStatus", "btLog", "map",
 		"path", "plan", "power", "emergency", "dockingSensor",
@@ -582,6 +590,21 @@ func ServiceRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 				return
 			}
 			err = provider.CallService(ctx, "/hardware_bridge/mower_control", &CallReq, &mowgli.MowerControlRes{}, "mowgli_interfaces/srv/MowerControl")
+		case "coverage_orientation":
+			var req mowgli.CoverageOrientationReq
+			if err = c.BindJSON(&req); err != nil {
+				c.JSON(400, ErrorResponse{Error: err.Error()})
+				return
+			}
+			var res mowgli.CoverageOrientationRes
+			err = provider.CallService(ctx, "/behavior_tree_node/coverage_orientation", &req, &res, "mowgli_interfaces/srv/CoverageOrientation")
+			if err == nil && !res.Success {
+				err = errors.New(res.Message)
+			}
+			if err == nil {
+				c.JSON(200, res)
+				return
+			}
 		case "start_in_area":
 			var CallReq mowgli.StartInAreaReq
 			err = c.BindJSON(&CallReq)
@@ -636,10 +659,16 @@ func ServiceRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 				c.JSON(200, map[string]interface{}{"message": promoteRes.Message})
 				return
 			}
-		case "discard_obstacle":
+		case "ignore_obstacle", "discard_obstacle":
 			// Reject a PENDING obstacle proposal (currently: wheel-slip dig
 			// keepouts) by its MapObstacleInfo.id. Nothing was persisted, so
 			// this only drops it from the live keepout mask.
+			// Tracker IDs belong to a separate namespace: Ignore must target
+			// the tracker, never the map server's pending dig proposals.
+			service := "/map_server_node/discard_obstacle"
+			if command == "ignore_obstacle" {
+				service = "/obstacle_tracker/clear_obstacle"
+			}
 			var CallReq mowgli.ClearObstacleReq
 			err = c.BindJSON(&CallReq)
 			if err != nil {
@@ -648,7 +677,7 @@ func ServiceRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 			}
 			var discardRes mowgli.ClearObstacleRes
 			err = provider.CallService(ctx,
-				"/map_server_node/discard_obstacle",
+				service,
 				&CallReq,
 				&discardRes,
 				"mowgli_interfaces/srv/ClearObstacle")
@@ -659,16 +688,15 @@ func ServiceRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 				c.JSON(200, map[string]interface{}{"message": discardRes.Message})
 				return
 			}
-		case "fusion_graph_save", "fusion_graph_clear":
-			// Both target std_srvs/Trigger services on fusion_graph_node.
+		case "fusion_graph_save", "fusion_graph_clear", "fusion_graph_clear_lidar_map":
+			// All three target std_srvs/Trigger services on fusion_graph_node.
+			// clear_lidar_map drops only the LiDAR map-anchor occupancy grid
+			// (use_lidar_map_anchor); the graph itself is untouched.
 			type TriggerRes struct {
 				Success bool   `json:"success"`
 				Message string `json:"message"`
 			}
-			service := "/fusion_graph_node/save_graph"
-			if command == "fusion_graph_clear" {
-				service = "/fusion_graph_node/clear_graph"
-			}
+			service := fusionGraphTriggerServices[command]
 			var res TriggerRes
 			err = provider.CallService(ctx, service, &struct{}{}, &res, "std_srvs/srv/Trigger")
 			if err == nil && !res.Success {
@@ -705,6 +733,26 @@ func ServiceRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 			}
 			var res TriggerRes
 			err = provider.CallService(ctx, "/hardware_bridge/reboot_board", &struct{}{}, &res, "std_srvs/srv/Trigger")
+			if err == nil && !res.Success {
+				err = errors.New(res.Message)
+			}
+			if err == nil {
+				c.JSON(200, map[string]interface{}{"message": res.Message})
+				return
+			}
+		case "clear_dig_escalation":
+			// Operator override for a latched repeat-dig escalation
+			// (Status.dig_escalated) — see dig_escalation.hpp. Distance-gated
+			// server-side: this fails (res.Success=false, a human-readable
+			// reason in Message) until the chassis has moved far enough past
+			// the obstruction, so the frontend surfaces that reason rather
+			// than treating a refusal as a transport error.
+			type TriggerRes struct {
+				Success bool   `json:"success"`
+				Message string `json:"message"`
+			}
+			var res TriggerRes
+			err = provider.CallService(ctx, "/hardware_bridge/clear_dig_escalation", &struct{}{}, &res, "std_srvs/srv/Trigger")
 			if err == nil && !res.Success {
 				err = errors.New(res.Message)
 			}
