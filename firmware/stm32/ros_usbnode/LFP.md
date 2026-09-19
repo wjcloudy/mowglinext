@@ -110,9 +110,10 @@ No packet change is needed; the current v6 host and firmware must be paired.
   firmware-local and is not reported to Nav2. Current upstream emergency aborts
   during reverse and settle are retained.
 - Onboard LIS3DH tilt threshold remains 0x2C with the 500 ms trip timeout.
-  Failed I2C reads retain the custom behavior of returning **no tilt**. This
-  suppresses the reported phantom dock trips but is not detection of a failed
-  tilt sensor; a disconnected sensor still needs separate diagnosis.
+  Failed or stale onboard sensor reads now inhibit motion and latch a sensor fault.
+  The foreground recovery verifies configuration and fresh status; it does not
+  clear the emergency. This replaces the former no-tilt-on-read-error policy.
+  See [I2C-RECOVERY.md](I2C-RECOVERY.md) for both sensor buses.
 - PB3 trace ownership is cleared before soft-I2C startup. PB3 is also the J18
   MPU6050 clock, so keep SWO trace disabled when flashing or attaching a debugger.
   The 500B USB D+ disconnect pulse allows re-enumeration after reset.
