@@ -19,6 +19,7 @@ export interface ExternalSaver {
 }
 
 export type SettingsSection =
+    | "updates"
     | "appearance"
     | "hardware"
     | "drive_motor"
@@ -34,7 +35,10 @@ export type SettingsSection =
     | "navigation"
     | "rain"
     | "leds"
+    | "mqtt"
     | "irrisense"
+    | "remote_access"
+    | "notifications"
     | "advanced";
 
 export type SectionMeta = {
@@ -46,6 +50,13 @@ export type SectionMeta = {
 };
 
 const SECTION_DEFINITIONS: SectionMeta[] = [
+    {
+        id: "updates",
+        label: "settingsSections.updates.label",
+        icon: "cloud-sync",
+        description: "settingsSections.updates.description",
+        keys: [],
+    },
     {
         id: "appearance",
         label: "settingsSections.appearance.label",
@@ -120,7 +131,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
         icon: "node-index",
         description: "settingsSections.localization.description",
         keys: [
-            "use_scan_matching", "use_loop_closure",
+            "use_lidar_map_anchor", "lidar_anchor_shadow_mode",
             "use_magnetometer",
             "enable_mag_cal", "declination_deg", "min_horizontal_uT", "mag_yaw_variance",
         ],
@@ -141,8 +152,13 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             // so they were dead controls. swath_overlap (a real coverage_server
             // param) is surfaced here instead.
             "mowing_enabled", "mowing_speed", "transit_speed",
+            // Blade-load slowdown (FollowCoveragePath.blade_load_*, injected by
+            // navigation.launch.py): slow the feed when the blade RPM sags.
+            "blade_load_slowdown_enabled", "blade_load_rpm_full",
+            "blade_load_rpm_min", "blade_load_min_speed_ratio",
             "headland_width", "num_headland_passes", "swath_overlap",
-            "chassis_safety_inset", "min_turning_radius", "mow_direction",
+            "chassis_safety_inset", "min_turning_radius", "mow_direction", "mow_cross_hatch",
+            "connector_max_headland_passes",
         ],
     },
     {
@@ -165,7 +181,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
         keys: [
             "battery_full_voltage", "battery_empty_voltage", "battery_critical_voltage",
             "battery_full_percent", "battery_low_percent", "battery_critical_percent",
-            "battery_critical_recovery_percent",
+            "battery_critical_recovery_percent", "battery_manual_resume_percent",
         ],
     },
     {
@@ -197,7 +213,8 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "obstacle_inflation_radius", "max_obstacle_avoidance_distance",
             "obstacle_clearance_margin", "obstacle_detection_range_m",
             "obstacle_wait_timeout_s",
-            "obstacle_margin", "obstacle_slowdown_ratio",
+            "obstacle_margin", "obstacle_slowdown_ratio", "dig_obstacle_enabled",
+            "dig_sensitivity",
         ],
     },
     {
@@ -208,6 +225,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
         keys: [
             "xy_goal_tolerance", "yaw_goal_tolerance", "coverage_xy_tolerance",
             "progress_timeout_sec",
+            "boundary_inner_margin_m", "dock_inner_margin_exempt_radius_m",
         ],
     },
     {
@@ -229,7 +247,23 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "led_enabled", "led_count", "led_spi_device", "led_spi_speed_hz",
             "led_brightness", "led_idle_scale", "led_refresh_hz",
             "led_low_battery_percent", "led_charge_full_percent",
+            "led_charge_complete_timeout_s", "led_charge_complete_dim_scale",
+            "led_charge_complete_indicator_count", "led_charge_complete_indicator_scale",
+            "led_charge_complete_indicator_ids",
             "led_status_timeout_s", "led_keepalive_s", "led_device_retry_s",
+        ],
+    },
+    {
+        id: "mqtt",
+        label: "settingsSections.mqtt.label",
+        icon: "wifi",
+        description: "settingsSections.mqtt.description",
+        keys: [
+            // Every mqtt_* key is claimed here so none of them leaks into
+            // AdvancedSection's free-form editor — same rationale as "leds"
+            // above (a raw broker password with no context).
+            "mqtt_enabled", "mqtt_host", "mqtt_port", "mqtt_username",
+            "mqtt_password", "mqtt_topic_prefix", "mqtt_use_ssl",
         ],
     },
     {
@@ -239,6 +273,23 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
         description: "settingsSections.irrisense.description",
         // No yaml keys: the IrriSense settings (token included) live in the
         // GUI's key-value DB and the section loads/saves them itself.
+        keys: [],
+    },
+    {
+        id: "remote_access",
+        label: "settingsSections.remote_access.label",
+        icon: "global",
+        description: "settingsSections.remote_access.description",
+        // No yaml keys: the remote-access settings (auth key included) live
+        // in the GUI's key-value DB and the section loads/saves them itself.
+        keys: [],
+    },
+    {
+        id: "notifications",
+        label: "settingsSections.notifications.label",
+        icon: "bell",
+        description: "settingsSections.notifications.description",
+        // Same as IrriSense: DB-backed, the section owns load/save.
         keys: [],
     },
     {

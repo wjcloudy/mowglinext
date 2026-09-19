@@ -119,6 +119,13 @@ type GnssStatus struct {
 	MsmSummaryCellCount       uint16                         `json:"msm_summary_cell_count"`
 	MsmSummaryAgeS            float32                        `json:"msm_summary_age_s"`
 	PositionObservationSequence uint64                         `json:"position_observation_sequence"`
+	CorrectionTransportStatus uint8                          `json:"correction_transport_status"`
+	CorrectionResponseAccepted bool                           `json:"correction_response_accepted"`
+	CorrectionFlowStatus      uint8                          `json:"correction_flow_status"`
+	CorrectionSemanticStatus  uint8                          `json:"correction_semantic_status"`
+	CorrectionSource          string                         `json:"correction_source"`
+	CorrectionForwardingSource string                         `json:"correction_forwarding_source"`
+	MsmSummarySource          string                         `json:"msm_summary_source"`
 }
 
 // HighLevelStatus matches mowgli_interfaces/msg/HighLevelStatus.
@@ -160,6 +167,9 @@ type MapArea struct {
 	Obstacles                 []geometry.Polygon             `json:"obstacles"`
 	IsNavigationArea          bool                           `json:"is_navigation_area"`
 	ObstacleInfo              []MapObstacleInfo              `json:"obstacle_info"`
+	ProposedObstacles         []geometry.Polygon             `json:"proposed_obstacles"`
+	ProposedObstacleInfo      []MapObstacleInfo              `json:"proposed_obstacle_info"`
+	Id                        uint32                         `json:"id"`
 }
 
 // MapObstacleInfo matches mowgli_interfaces/msg/MapObstacleInfo.
@@ -201,6 +211,9 @@ type Status struct {
 	UiBoardAvailable          bool                           `json:"ui_board_available"`
 	MowEnabled                bool                           `json:"mow_enabled"`
 	FirmwareDebugEnabled      bool                           `json:"firmware_debug_enabled"`
+	DigEscalated              bool                           `json:"dig_escalated"`
+	DigEscalatedDistanceM     float32                        `json:"dig_escalated_distance_m"`
+	DigEscalatedRequiredDistanceM float32                        `json:"dig_escalated_required_distance_m"`
 	MowerEscStatus            uint8                          `json:"mower_esc_status"`
 	MowerEscTemperature       float32                        `json:"mower_esc_temperature"`
 	MowerEscCurrent           float32                        `json:"mower_esc_current"`

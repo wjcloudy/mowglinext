@@ -52,6 +52,8 @@ assert_match "gnss_serial_device=/dev/ttyAMA4" \
   '^[[:space:]]+gnss_serial_device:[[:space:]]+"?/dev/ttyAMA4"?[[:space:]]*$' "$CONTENT"
 assert_match "gnss_serial_baud=921600" \
   '^[[:space:]]+gnss_serial_baud:[[:space:]]+921600[[:space:]]*$' "$CONTENT"
+assert_match "gnss_config_baud=921600 is a distinct canonical target" \
+  '^[[:space:]]+gnss_config_baud:[[:space:]]+921600[[:space:]]*$' "$CONTENT"
 assert_match "gnss_transport=serial" \
   '^[[:space:]]+gnss_transport:[[:space:]]+"?serial"?[[:space:]]*$' "$CONTENT"
 assert_match "gnss_frame_id=gps_link" \
@@ -110,6 +112,30 @@ if command -v python3 >/dev/null && python3 -c 'import yaml' 2>/dev/null; then
   fi
 else
   pass "yaml syntax (skipped; PyYAML missing)"
+fi
+
+section "retired localization overrides are removed on upgrade"
+
+cat >> "$YAML" <<'YAML_RETIRED'
+    use_scan_matching: true
+    use_loop_closure: true
+    icp_max_iter: 30
+    lc_max_dist_m: 5.0
+    lidar_map_half_extent_m: 80.0
+    use_lidar_map_anchor: false
+YAML_RETIRED
+if ! harness_run; then
+  fail "upgrade harness_run" "non-zero exit"
+else
+  for retired in use_scan_matching use_loop_closure icp_max_iter lc_max_dist_m lidar_map_half_extent_m; do
+    if grep -qE "^[[:space:]]+${retired}:" "$YAML"; then
+      fail "retired localization key absent: $retired" "found in $YAML"
+    else
+      pass "retired localization key absent: $retired"
+    fi
+  done
+  assert_match "operator scan-to-map preference survives upgrade" \
+    '^[[:space:]]+use_lidar_map_anchor:[[:space:]]+false[[:space:]]*$' "$(cat "$YAML")"
 fi
 
 test_summary

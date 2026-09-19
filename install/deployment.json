@@ -1,0 +1,55 @@
+{
+  "component_compatibility": {
+    "mowgli-ros2": "ros-stack-1",
+    "mowglinext-gui": "ros-gui-1",
+    "gps": "gnss-contract-1",
+    "lidar-ldlidar": "scan-contract-1",
+    "lidar-rplidar": "scan-contract-1",
+    "lidar-stl27l": "scan-contract-1"
+  },
+  "gui_compatibility": "ros-gui-1",
+  "components": [
+    {
+      "name": "mowgli-ros2",
+      "type": "built",
+      "context": ".",
+      "file": "ros2/Dockerfile",
+      "target": "runtime"
+    },
+    {
+      "name": "mowglinext-gui",
+      "type": "built",
+      "context": "gui",
+      "file": "gui/Dockerfile",
+      "target": ""
+    },
+    {
+      "name": "gps",
+      "type": "external",
+      "image": "ghcr.io/pepeuch/universal-gnss-ros2-lyrical",
+      "version": "v0.1.4-rc2",
+      "digest": "sha256:24ea6c1c0553463207a4c33b803e920a974989f5891f2f107e8c35cce56f7a95"
+    },
+    {
+      "name": "lidar-ldlidar",
+      "type": "built",
+      "context": "sensors/lidar-ldlidar",
+      "file": "sensors/lidar-ldlidar/Dockerfile",
+      "target": ""
+    },
+    {
+      "name": "lidar-rplidar",
+      "type": "built",
+      "context": "sensors/lidar-rplidar",
+      "file": "sensors/lidar-rplidar/Dockerfile",
+      "target": ""
+    },
+    {
+      "name": "lidar-stl27l",
+      "type": "built",
+      "context": "sensors/lidar-stl27l",
+      "file": "sensors/lidar-stl27l/Dockerfile",
+      "target": ""
+    }
+  ]
+}

@@ -1,7 +1,8 @@
+import math
 # Copyright 2026 Mowgli Project
 # SPDX-License-Identifier: GPL-3.0
 #
-# Unit tests for robot_config_util.load_robot_params — the deep-merge that
+# Unit tests for _util.load_robot_params — the deep-merge that
 # lets the INSTALLED mowgli_robot.yaml be sparse (install choices + calibration
 # outputs only) while every other default falls through to the in-package
 # template. These run without any ROS deps — only PyYAML is required.
@@ -173,7 +174,7 @@ def test_default_tool_width_matches_template():
 def test_map_server_and_coverage_launch_share_tool_width_default():
     """Regression guard: full_system.launch.py (map_server.tool_width) and
     navigation.launch.py (feeds coverage_server.operation_width) must both
-    fall back to robot_config_util.DEFAULT_TOOL_WIDTH_M — not each hardcode
+    fall back to _util.DEFAULT_TOOL_WIDTH_M — not each hardcode
     their own literal. This is a source-text check (launch files pull in the
     full `launch`/`launch_ros`/ament ROS2 packages via generate_launch_description,
     so they cannot be imported directly in a plain-Python test); it fails
@@ -272,20 +273,19 @@ class TestDeriveTurnSpeed:
 class TestCheckTurnGeometry:
     """Undrivable planned turn radii — reported, never raised."""
 
-    # The deployed pair as of issue #499: floor below the half-track.
-    LIVE_TRACK = 0.325
-    LIVE_MIN_R = 0.15
-    LIVE_CONN_R = 0.18
-    LIVE_TURN_SPEED = 0.16
-    LIVE_WZ_MAX = 0.8
+    # The legacy pair measured in issue #499: floor below the half-track.
+    TRACK = 0.325
+    LEGACY_MIN_R = 0.15
+    LEGACY_CONN_R = 0.18
+    TURN_SPEED = 0.16
+    WZ_MAX = 0.8
 
-    def test_flags_the_live_config_inner_wheel_reversal(self):
+    def test_flags_the_legacy_config_inner_wheel_reversal(self):
         """min_turning_radius 0.15 <= half-track 0.1625: the inner wheel must
-        REVERSE to trace the arc. This is the shipped state, and it must warn."""
+        reverse to trace the arc, so an installed legacy override must warn."""
         # Act
-        warnings = check_turn_geometry(self.LIVE_MIN_R, self.LIVE_CONN_R,
-                                       self.LIVE_TRACK, self.LIVE_TURN_SPEED,
-                                       self.LIVE_WZ_MAX)
+        warnings = check_turn_geometry(self.LEGACY_MIN_R, self.LEGACY_CONN_R,
+                                       self.TRACK, self.TURN_SPEED, self.WZ_MAX)
 
         # Assert
         assert any("half-track" in w for w in warnings), (
@@ -296,9 +296,8 @@ class TestCheckTurnGeometry:
         """The tightest arc FTC can command is speed_slow/max_cmd_vel_ang =
         0.16/0.8 = 0.20 m, but coverage plans down to 0.15 m."""
         # Act
-        warnings = check_turn_geometry(self.LIVE_MIN_R, self.LIVE_CONN_R,
-                                       self.LIVE_TRACK, self.LIVE_TURN_SPEED,
-                                       self.LIVE_WZ_MAX)
+        warnings = check_turn_geometry(self.LEGACY_MIN_R, self.LEGACY_CONN_R,
+                                       self.TRACK, self.TURN_SPEED, self.WZ_MAX)
 
         # Assert
         assert any("max_cmd_vel_ang" in w for w in warnings)
@@ -308,8 +307,8 @@ class TestCheckTurnGeometry:
         floor — nothing to say."""
         # Arrange — 0.40 m arcs: inner/outer ratio 0.42, needs wz = 0.16/0.40 = 0.4.
         # Act
-        warnings = check_turn_geometry(0.40, 0.45, self.LIVE_TRACK,
-                                       self.LIVE_TURN_SPEED, self.LIVE_WZ_MAX)
+        warnings = check_turn_geometry(0.40, 0.45, self.TRACK,
+                                       self.TURN_SPEED, self.WZ_MAX)
 
         # Assert
         assert warnings == []
@@ -318,9 +317,8 @@ class TestCheckTurnGeometry:
         """The warning has to carry NUMBERS — the whole failure was that the two
         offending values lived in different files and nobody related them."""
         # Act
-        warnings = check_turn_geometry(self.LIVE_MIN_R, self.LIVE_CONN_R,
-                                       self.LIVE_TRACK, self.LIVE_TURN_SPEED,
-                                       self.LIVE_WZ_MAX)
+        warnings = check_turn_geometry(self.LEGACY_MIN_R, self.LEGACY_CONN_R,
+                                       self.TRACK, self.TURN_SPEED, self.WZ_MAX)
 
         # Assert — v_inner = v(1 - b/R) = 0.16 * (1 - 0.1625/0.15) = -0.013 m/s.
         carve = next(w for w in warnings if "half-track" in w)
@@ -335,10 +333,14 @@ class TestCheckTurnGeometry:
         # Assert
         assert any("half-track" in w for w in warnings)
 
+    def test_shipped_geometry_matches_controller_authority(self):
+        """The 0.20 m production radius clears both geometry checks."""
+        warnings = check_turn_geometry(0.20, 0.20, self.TRACK,
+                                       self.TURN_SPEED, self.WZ_MAX)
+        assert warnings == []
+
     def test_never_raises_on_any_input(self):
-        """WARN-only is load-bearing: the shipped defaults trip this, so raising
-        would refuse to start navigation on every existing robot. Firmware stays
-        the sole blade-safety authority either way."""
+        """WARN-only remains load-bearing for installed legacy overrides."""
         # Arrange — including degenerate values the caller's clamps would contain.
         for args in [(0.0, 0.0, 0.325, 0.16, 0.8),
                      (0.15, 0.18, 0.0, 0.16, 0.8),
@@ -379,7 +381,7 @@ def _find_schema_property(node, name):
 
 
 class TestLidarEnabledResolution:
-    """robot_config_util.resolve_lidar_enabled + its absent-key warning."""
+    """_util.resolve_lidar_enabled + its absent-key warning."""
 
     def setup_method(self):
         # warn_lidar_key_absent dedupes per process; clear between tests.
@@ -513,19 +515,7 @@ class TestLidarEnabledResolution:
 
 
 class TestScanFactorsFollowLidar:
-    """use_scan_matching / use_loop_closure must follow use_lidar.
-
-    The gating leaked: both default from the TEMPLATE (`true` for each), which
-    has no relation to `lidar_enabled`, so a GPS-only stack still handed
-    fusion_graph use_scan_matching=True. Observed live 2026-08-31 with
-    use_lidar=false: use_scan_matching=True, use_loop_closure=True,
-    /scan_deskewed publisher count 0, scans_received 0.
-
-    navigation.launch.py ANDs each flag with use_lidar at SUBSTITUTION time (so
-    a CLI `use_lidar:=` override is covered too). These tests evaluate the same
-    expression the launch file builds, and pin that it is actually applied to
-    both flags.
-    """
+    """The active scan-to-map anchor follows hardware; retired ICP stays off."""
 
     @staticmethod
     def _gate(lidar_text, flag_text):
@@ -543,30 +533,42 @@ class TestScanFactorsFollowLidar:
                 + " else 'false'")
         return eval(expr, {"__builtins__": {}})  # noqa: S307
 
-    @pytest.mark.parametrize("flag", ["use_scan_matching", "use_loop_closure"])
+    @pytest.mark.parametrize("flag", ["use_lidar_map_anchor"])
     def test_lidar_off_forces_flag_off(self, flag):
         """No scanner -> no scan factors, whatever the yaml asked for."""
         # Arrange / Act / Assert
         assert self._gate("false", "true") == "false", flag
         assert self._gate("false", "false") == "false", flag
 
-    @pytest.mark.parametrize("flag", ["use_scan_matching", "use_loop_closure"])
+    @pytest.mark.parametrize("flag", ["use_lidar_map_anchor"])
     def test_lidar_on_passes_the_operator_choice_through(self, flag):
         """The gate must not become an override: with a LiDAR present the
-        operator's own use_scan_matching / use_loop_closure still decides."""
+        operator's own use_lidar_map_anchor still decides."""
         # Arrange / Act / Assert
         assert self._gate("true", "true") == "true", flag
         assert self._gate("true", "false") == "false", flag
 
-    def test_navigation_launch_gates_both_flags(self):
-        """Source-text guard that the gate is wired to BOTH flags where they are
-        handed to fusion_graph (a pure truth-table test cannot see that)."""
-        # Arrange / Act
+    def test_navigation_gates_anchor_and_disables_retired_icp(self):
         src = _COVERAGE_LAUNCH.read_text()
+        assert '"use_lidar_map_anchor": lidar_gated(use_lidar_map_anchor)' in src
+        assert "use_scan_matching" not in src
+        assert "use_loop_closure" not in src
 
-        # Assert
-        assert '"use_scan_matching": lidar_gated(use_scan_matching)' in src
-        assert '"use_loop_closure": lidar_gated(use_loop_closure)' in src
+    def test_standalone_disables_retired_icp_and_requires_anchor_opt_in(self):
+        import ast
+        path = _PKG_DIR.parent / "fusion_graph" / "launch" / "fusion_graph.launch.py"
+        tree = ast.parse(path.read_text())
+        for key in ("use_scan_matching", "use_loop_closure"):
+            assert key not in path.read_text()
+        declarations = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == "DeclareLaunchArgument" and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value == "use_lidar_map_anchor"]
+        assert len(declarations) == 1
+        defaults = [kw.value for kw in declarations[0].keywords if kw.arg == "default_value"]
+        assert len(defaults) == 1
+        assert isinstance(defaults[0], ast.Constant) and defaults[0].value == "false"
 
     def test_scan_deskew_warns_when_lidar_on_but_no_scans(self):
         """The opposite mismatch: config says LiDAR on, the mowgli-lidar
@@ -590,3 +592,304 @@ class TestScanFactorsFollowLidar:
         watchdog = src.split("void on_scan_watchdog()")[1].split("void on_scan(")[0]
         assert "rclcpp::shutdown()" not in watchdog
         assert "throw " not in watchdog
+
+
+# ---------------------------------------------------------------------------
+# Chassis footprint geometry
+#
+# The local-costmap inflation floor is DERIVED from these, because chassis
+# dimensions are operator-editable in the GUI. Before 2026-09-05 the floor was
+# a literal (0.58) that had drifted below the real circumscribed radius
+# (0.586 m at the then-shipped chassis_width 0.40) without anyone noticing.
+# These pin the derivation so that cannot recur.
+# ---------------------------------------------------------------------------
+
+def test_chassis_footprint_uses_template_defaults_when_params_empty():
+    front, rear, half_width = _util.chassis_footprint({})
+    assert front == pytest.approx(0.18 + 0.60 / 2 + 0.05)
+    assert rear == pytest.approx(0.18 - 0.60 / 2 - 0.05)
+    assert half_width == pytest.approx(0.45 / 2 + 0.05)
+
+
+def test_chassis_footprint_follows_the_params():
+    front, rear, half_width = _util.chassis_footprint(
+        {"chassis_length": 0.50, "chassis_width": 0.30, "chassis_center_x": 0.10}
+    )
+    assert front == pytest.approx(0.10 + 0.25 + 0.05)
+    assert rear == pytest.approx(0.10 - 0.25 - 0.05)
+    assert half_width == pytest.approx(0.15 + 0.05)
+
+
+def test_circumscribed_radius_at_shipped_dimensions():
+    # sqrt(0.530^2 + 0.275^2); the shipped inflation floor must not sit below it.
+    assert _util.chassis_circumscribed_radius({}) == pytest.approx(0.5971, abs=1e-4)
+
+
+def test_circumscribed_radius_grows_with_a_wider_chassis():
+    narrow = _util.chassis_circumscribed_radius({"chassis_width": 0.40})
+    wide = _util.chassis_circumscribed_radius({"chassis_width": 0.45})
+    assert wide > narrow
+    # The regression this guards: 0.58 was shipped as the floor while the real
+    # radius at chassis_width 0.40 was already 0.586 m.
+    assert narrow == pytest.approx(0.5860, abs=1e-4)
+
+
+def test_dig_skip_radius_covers_the_whole_chassis_at_shipped_dimensions():
+    # FollowStrip skips coverage poses this close to a wheel-slip dig. Inside
+    # the circumscribed radius some part of the body can be over the hole.
+    assert _util.dig_skip_radius({}) == pytest.approx(0.5971, abs=1e-4)
+
+
+def test_dig_skip_radius_follows_an_operator_edited_chassis():
+    # chassis_* are GUI-editable: a literal would go stale exactly like the
+    # hardcoded cw = 0.40 that routed coverage 2.5 cm inside the body.
+    shipped = _util.dig_skip_radius({})
+    longer = _util.dig_skip_radius({"chassis_length": 0.80})
+    assert longer > shipped
+    front, rear, half_width = _util.chassis_footprint({"chassis_length": 0.80})
+    assert longer >= math.hypot(max(abs(front), abs(rear)), half_width) - 1e-9
+
+
+def test_dig_proposal_radius_is_the_wheel_ruts_not_the_chassis():
+    # hypot(0.325/2 + 0.04/2, 0.10/2) = hypot(0.1825, 0.05)
+    radius = _util.dig_proposal_radius({})
+    assert radius == pytest.approx(0.1892, abs=1e-4)
+    # Covers the outer edge of both tyres ...
+    assert radius >= 0.325 / 2.0 + 0.04 / 2.0
+    # ... and is nowhere near the 0.60 m chassis-length box it replaces, nor
+    # the body-sized skip radius: the body is added ONCE, by the keepout band.
+    assert 2.0 * radius < 0.60
+    assert radius < _util.chassis_half_width({})
+    assert radius < _util.dig_skip_radius({})
+
+
+def test_dig_proposal_radius_follows_the_configured_wheels():
+    wide = _util.dig_proposal_radius({"wheel_track": 0.50, "wheel_width": 0.08})
+    big_wheels = _util.dig_proposal_radius({"wheel_radius": 0.20})
+    assert wide == pytest.approx(math.hypot(0.29, 0.05))
+    assert big_wheels > _util.dig_proposal_radius({})
+
+
+def test_circumscribed_radius_encloses_every_footprint_corner():
+    params = {"chassis_length": 0.72, "chassis_width": 0.51, "chassis_center_x": 0.22}
+    front, rear, half_width = _util.chassis_footprint(params)
+    radius = _util.chassis_circumscribed_radius(params)
+    for x in (front, rear):
+        for y in (half_width, -half_width):
+            assert math.hypot(x, y) <= radius + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Blade-load slowdown (FollowCoveragePath.blade_load_*)
+#
+# The FTC decision itself is unit-tested in mowgli_nav2_plugins
+# (test_ftc_blade_load.cpp); these cover the launch-side validation that turns
+# the operator's four mowgli_robot.yaml keys into the injected FTC params.
+
+
+class TestDeriveBladeLoadParams:
+    """navigation.launch.py injection of the blade-load slowdown knobs."""
+
+    def test_passes_a_valid_config_through_unchanged(self):
+        # Arrange / Act
+        params, warnings = _util.derive_blade_load_params(True, 2500.0, 1800.0, 0.4)
+
+        # Assert
+        assert warnings == []
+        assert params == {
+            "blade_load_slowdown_enabled": True,
+            "blade_load_rpm_full": 2500.0,
+            "blade_load_rpm_min": 1800.0,
+            "blade_load_min_speed_ratio": 0.4,
+        }
+
+    def test_template_defaults_are_disabled_and_warning_free(self):
+        params, warnings = _util.derive_blade_load_params(
+            False,
+            _util.DEFAULT_BLADE_LOAD_RPM_FULL,
+            _util.DEFAULT_BLADE_LOAD_RPM_MIN,
+            _util.DEFAULT_BLADE_LOAD_MIN_SPEED_RATIO,
+        )
+        assert warnings == []
+        assert params["blade_load_slowdown_enabled"] is False
+        # A disabled feature must still ship a usable ramp so flipping the GUI
+        # toggle alone engages it.
+        assert params["blade_load_rpm_full"] > params["blade_load_rpm_min"]
+
+    def test_accepts_yaml_string_booleans(self):
+        # The sparse installed file may carry the key as a string token.
+        params, _ = _util.derive_blade_load_params("true", 2500.0, 1800.0, 0.4)
+        assert params["blade_load_slowdown_enabled"] is True
+        params, _ = _util.derive_blade_load_params("false", 2500.0, 1800.0, 0.4)
+        assert params["blade_load_slowdown_enabled"] is False
+
+    def test_empty_ramp_disables_with_a_warning(self):
+        # rpm_full == rpm_min: FTC would fail open silently — say so and disable.
+        params, warnings = _util.derive_blade_load_params(True, 2000.0, 2000.0, 0.4)
+        assert params["blade_load_slowdown_enabled"] is False
+        assert len(warnings) == 1
+        assert "ramp is empty" in warnings[0]
+
+    def test_inverted_ramp_disables_with_a_warning(self):
+        params, warnings = _util.derive_blade_load_params(True, 1500.0, 2500.0, 0.4)
+        assert params["blade_load_slowdown_enabled"] is False
+        assert any("DISABLED" in w for w in warnings)
+
+    def test_bad_ramp_is_silent_when_the_feature_is_off(self):
+        # Nothing to warn about: the thresholds are inert while disabled.
+        _, warnings = _util.derive_blade_load_params(False, 1500.0, 2500.0, 0.4)
+        assert warnings == []
+
+    def test_ratio_above_one_is_clamped(self):
+        params, warnings = _util.derive_blade_load_params(True, 2500.0, 1800.0, 1.5)
+        assert params["blade_load_min_speed_ratio"] == 1.0
+        assert any("clamped" in w for w in warnings)
+
+    def test_ratio_floor_prevents_parking_the_robot(self):
+        params, warnings = _util.derive_blade_load_params(True, 2500.0, 1800.0, 0.0)
+        assert params["blade_load_min_speed_ratio"] == pytest.approx(
+            _util.BLADE_LOAD_MIN_SPEED_RATIO_FLOOR)
+        assert any("clamped" in w for w in warnings)
+
+
+@pytest.mark.parametrize("override", [None, False, True])
+def test_dig_keepout_toggle_reaches_map_server(override):
+    """The GUI's sparse boolean must override map_server.yaml's enabled default."""
+    import ast
+
+    path = _write_sparse({} if override is None else {"dig_obstacle_enabled": override})
+    try:
+        merged = load_robot_params(str(_PKG_DIR), runtime_path=path)
+    finally:
+        os.unlink(path)
+    expected = True if override is None else override
+    assert merged["dig_obstacle_enabled"] is expected
+
+    tree = ast.parse(_MAP_SERVER_LAUNCH.read_text())
+    map_server = next(
+        node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "map_server_node"
+                for target in node.targets)
+    )
+    parameters = next(kw.value for kw in map_server.keywords if kw.arg == "parameters")
+    injected = {}
+    for parameter in parameters.elts:
+        if isinstance(parameter, ast.Dict):
+            for key, value in zip(parameter.keys, parameter.values):
+                if isinstance(key, ast.Constant) and key.value == "dig_obstacle_enabled":
+                    injected[key.value] = eval(
+                        compile(ast.Expression(value), "<launch parameter>", "eval"),
+                        {"robot_params": merged, "bool": bool},
+                    )
+    assert injected["dig_obstacle_enabled"] is expected
+
+
+def test_chassis_half_width_tracks_the_configured_chassis() -> None:
+    """The body half-width every collision check measures against must FOLLOW the
+    operator's chassis_width. A consumer that snapshots it into a literal is the
+    2026-09-16 collision: the chassis grew 0.40 -> 0.45 m, the Nav2 footprint
+    followed, the coverage planner's hardcoded copy did not, and the plan ended
+    up 2.5 cm inside the robot."""
+    narrow = _util.chassis_half_width({"chassis_width": 0.40})
+    shipped = _util.chassis_half_width({"chassis_width": 0.45})
+
+    # chassis_width/2 + the costmap footprint margin — the same number
+    # chassis_footprint() puts in the Nav2 footprint.
+    assert narrow == pytest.approx(0.20 + _util.CHASSIS_FOOTPRINT_MARGIN_M)
+    assert shipped == pytest.approx(0.225 + _util.CHASSIS_FOOTPRINT_MARGIN_M)
+    assert shipped > narrow, "a wider chassis must widen the half-width"
+
+    # It IS the footprint's half-width, not an independent computation.
+    _front, _rear, footprint_half = _util.chassis_footprint({"chassis_width": 0.45})
+    assert shipped == pytest.approx(footprint_half)
+
+    # A sparse config falls back to the shipped chassis, never to zero.
+    assert _util.chassis_half_width({}) == pytest.approx(
+        _util.DEFAULT_CHASSIS_WIDTH_M / 2.0 + _util.CHASSIS_FOOTPRINT_MARGIN_M)
+
+
+# ---------------------------------------------------------------------------
+# dig_sensitivity — one operator knob over the wheel-slip dig detector
+# ---------------------------------------------------------------------------
+_BRIDGE_YAML = _PKG_DIR / "config" / "hardware_bridge.yaml"
+_BRIDGE_LAUNCH = _LAUNCH_DIR / "mowgli.launch.py"
+
+
+def _bridge_yaml_params() -> dict:
+    with open(_BRIDGE_YAML, "r") as handle:
+        doc = yaml.safe_load(handle) or {}
+    (node_params,) = [v["ros__parameters"] for v in doc.values()
+                      if isinstance(v, dict) and "ros__parameters" in v]
+    return node_params
+
+
+def test_dig_sensitivity_medium_is_exactly_the_shipped_detector():
+    """The default level must not change a robot that never touches the knob."""
+    assert _template_params()["dig_sensitivity"] == "medium"
+    assert _util.DEFAULT_DIG_SENSITIVITY == "medium"
+    shipped = _bridge_yaml_params()
+    injected = _util.dig_detector_params({"dig_sensitivity": "medium"})
+    assert injected, "medium injects nothing"
+    for key, value in injected.items():
+        assert shipped[key] == value, f"{key}: medium={value} shipped={shipped[key]}"
+
+
+def test_dig_sensitivity_levels_are_ordered_from_tolerant_to_strict():
+    low, medium, high = (_util.dig_detector_params({"dig_sensitivity": level})
+                         for level in ("low", "medium", "high"))
+    # More evidence, more tyre travel and LESS observed progress before "low"
+    # calls it a dig; and more same-spot repeats before the mission stops.
+    assert low["dig_window_s"] > medium["dig_window_s"] > high["dig_window_s"]
+    assert low["dig_min_wheel_dist"] > medium["dig_min_wheel_dist"] > high["dig_min_wheel_dist"]
+    assert (low["dig_progress_fraction"] < medium["dig_progress_fraction"]
+            < high["dig_progress_fraction"])
+    assert low["dig_escalate_count"] > medium["dig_escalate_count"] >= high["dig_escalate_count"]
+
+
+@pytest.mark.parametrize("tyre_m, chassis_m, seconds", [
+    (0.40, 0.03, 1.2),   # 2026-09-18, straight dig while mowing
+    (0.33, 0.01, 1.2),   # 2026-09-04, differential spin, issue #527 comment
+    (0.189, 0.015, 1.2),  # stalled pure pivot (test_dig_detector.cpp)
+])
+def test_low_sensitivity_still_latches_every_dig_on_record(tyre_m, chassis_m, seconds):
+    """Sustained at the recorded rates, each field dig clears the "low" bar."""
+    low = _util.dig_detector_params({"dig_sensitivity": "low"})
+    scale = low["dig_window_s"] / seconds
+    assert tyre_m * scale >= low["dig_min_wheel_dist"]
+    assert chassis_m * scale < low["dig_progress_fraction"] * tyre_m * scale
+
+
+def test_dig_sensitivity_off_disables_only_the_host_detector():
+    assert _util.dig_detector_params({"dig_sensitivity": "off"}) == {"dig_detect_enabled": False}
+    # A hand-edited bare `off` is a YAML boolean; it must not fall back to the
+    # default and silently keep the detector running.
+    assert yaml.safe_load("dig_sensitivity: off") == {"dig_sensitivity": False}
+    assert _util.resolve_dig_sensitivity({"dig_sensitivity": False}) == "off"
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (" LOW ", "low"), ("High", "high"), ("nonsense", "medium"), (True, "medium"), (3, "medium"),
+])
+def test_dig_sensitivity_is_normalised_and_unknown_values_fall_back(raw, expected):
+    assert _util.resolve_dig_sensitivity({"dig_sensitivity": raw}) == expected
+    assert _util.resolve_dig_sensitivity({}) == "medium"
+
+
+def test_dig_sensitivity_schema_matches_the_presets_and_default():
+    schema_path = _PKG_DIR.parents[2] / "gui" / "asserts" / "mower_config.schema.json"
+    prop = _find_schema_property(json.loads(schema_path.read_text()), "dig_sensitivity")
+    assert prop is not None
+    assert set(prop["enum"]) == set(_util.DIG_SENSITIVITY_PRESETS)
+    # The settings backend prunes a value equal to the schema default, so the
+    # two defaults must agree or choosing the template default is a no-op edit.
+    assert prop["default"] == _util.DEFAULT_DIG_SENSITIVITY
+
+
+def test_hardware_bridge_launch_injects_the_dig_sensitivity_preset():
+    """A template key no launch file injects is inert (ros2/CLAUDE.md)."""
+    source = _BRIDGE_LAUNCH.read_text()
+    assert "dig_detector_params(robot_params)" in source
+    # Injected AFTER the static params file, so the preset wins over it.
+    assert source.index("hardware_bridge_params,") < source.index(
+        "dig_detector_params(robot_params)")

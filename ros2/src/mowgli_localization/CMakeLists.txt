@@ -9,7 +9,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -50,19 +50,30 @@ add_executable(wheel_odometry_node
 
 target_include_directories(wheel_odometry_node PUBLIC ${INCLUDE_DIR})
 
-ament_target_dependencies(wheel_odometry_node
-  rclcpp
-  nav_msgs
-  geometry_msgs
-  tf2
-  tf2_ros
-  tf2_geometry_msgs
-  mowgli_interfaces
+target_link_libraries(wheel_odometry_node
+  ${rclcpp_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${tf2_TARGETS}
+  ${tf2_ros_TARGETS}
+  ${tf2_geometry_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
 # Executable: navsat_to_absolute_pose_node
 # ---------------------------------------------------------------------------
+
+add_library(navsat_status_association
+  src/navsat_status_association.cpp
+)
+
+target_include_directories(navsat_status_association PUBLIC ${INCLUDE_DIR})
+
+target_link_libraries(navsat_status_association
+  ${sensor_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
+)
 
 add_executable(navsat_to_absolute_pose_node
   src/navsat_to_absolute_pose_node.cpp
@@ -70,15 +81,17 @@ add_executable(navsat_to_absolute_pose_node
 
 target_include_directories(navsat_to_absolute_pose_node PUBLIC ${INCLUDE_DIR})
 
-ament_target_dependencies(navsat_to_absolute_pose_node
-  rclcpp
-  sensor_msgs
-  geometry_msgs
-  std_srvs
-  tf2
-  tf2_ros
-  mowgli_interfaces
+target_link_libraries(navsat_to_absolute_pose_node
+  ${rclcpp_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${std_srvs_TARGETS}
+  ${tf2_TARGETS}
+  ${tf2_ros_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
+
+target_link_libraries(navsat_to_absolute_pose_node navsat_status_association)
 
 # ---------------------------------------------------------------------------
 # Executable: localization_monitor_node
@@ -90,12 +103,12 @@ add_executable(localization_monitor_node
 
 target_include_directories(localization_monitor_node PUBLIC ${INCLUDE_DIR})
 
-ament_target_dependencies(localization_monitor_node
-  rclcpp
-  nav_msgs
-  geometry_msgs
-  std_msgs
-  mowgli_interfaces
+target_link_libraries(localization_monitor_node
+  ${rclcpp_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${std_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -108,11 +121,12 @@ add_executable(cog_to_imu
 
 target_include_directories(cog_to_imu PUBLIC ${INCLUDE_DIR})
 
-ament_target_dependencies(cog_to_imu
-  rclcpp
-  nav_msgs
-  geometry_msgs
-  sensor_msgs
+target_link_libraries(cog_to_imu
+  ${rclcpp_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 target_link_libraries(cog_to_imu yaml-cpp)
@@ -125,12 +139,12 @@ add_executable(mag_yaw_publisher
   src/mag_yaw_publisher_node.cpp
 )
 
-ament_target_dependencies(mag_yaw_publisher
-  rclcpp
-  geometry_msgs
-  sensor_msgs
-  tf2
-  tf2_ros
+target_link_libraries(mag_yaw_publisher
+  ${rclcpp_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${tf2_TARGETS}
+  ${tf2_ros_TARGETS}
 )
 
 target_link_libraries(mag_yaw_publisher yaml-cpp)
@@ -148,14 +162,14 @@ add_executable(calibrate_imu_yaw_node
 
 target_include_directories(calibrate_imu_yaw_node PUBLIC ${INCLUDE_DIR})
 
-ament_target_dependencies(calibrate_imu_yaw_node
-  rclcpp
-  rclcpp_action
-  geometry_msgs
-  sensor_msgs
-  nav_msgs
-  std_srvs
-  mowgli_interfaces
+target_link_libraries(calibrate_imu_yaw_node
+  ${rclcpp_TARGETS}
+  ${rclcpp_action_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${std_srvs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 target_link_libraries(calibrate_imu_yaw_node yaml-cpp)
@@ -170,10 +184,12 @@ add_executable(costmap_scan_filter_node
   src/costmap_scan_filter_node.cpp
 )
 
-ament_target_dependencies(costmap_scan_filter_node
-  rclcpp
-  sensor_msgs
-  mowgli_interfaces
+target_include_directories(costmap_scan_filter_node PUBLIC ${INCLUDE_DIR})
+
+target_link_libraries(costmap_scan_filter_node
+  ${rclcpp_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -187,10 +203,10 @@ add_executable(scan_deskew_node
   src/scan_deskew_node.cpp
 )
 
-ament_target_dependencies(scan_deskew_node
-  rclcpp
-  sensor_msgs
-  nav_msgs
+target_link_libraries(scan_deskew_node
+  ${rclcpp_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -207,14 +223,14 @@ add_executable(gps_dock_detection_node
 
 target_include_directories(gps_dock_detection_node PUBLIC ${INCLUDE_DIR})
 
-ament_target_dependencies(gps_dock_detection_node
-  rclcpp
-  geometry_msgs
-  sensor_msgs
-  tf2
-  tf2_ros
-  tf2_geometry_msgs
-  mowgli_interfaces
+target_link_libraries(gps_dock_detection_node
+  ${rclcpp_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${tf2_TARGETS}
+  ${tf2_ros_TARGETS}
+  ${tf2_geometry_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -228,6 +244,7 @@ install(
 
 install(
   TARGETS
+    navsat_status_association
     wheel_odometry_node
     navsat_to_absolute_pose_node
     localization_monitor_node
@@ -287,6 +304,26 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
 
+  ament_add_gtest(test_cog_observation_timing
+    test/test_cog_observation_timing.cpp
+  )
+  target_include_directories(test_cog_observation_timing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(test_cog_observation_timing
+    ${mowgli_interfaces_TARGETS}
+  )
+
+  ament_add_gtest(test_localization_monitor_freshness
+    test/test_localization_monitor_freshness.cpp
+  )
+  target_include_directories(test_localization_monitor_freshness PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(test_localization_monitor_freshness
+    ${mowgli_interfaces_TARGETS}
+  )
+
   # ---- test_costmap_scan_filter ----
   # Re-implements the static helper so we don't drag rclcpp/main symbols
   # into the test binary; the helper is small enough to keep in sync by
@@ -294,8 +331,8 @@ if(BUILD_TESTING)
   ament_add_gtest(test_costmap_scan_filter
     test/test_costmap_scan_filter.cpp
   )
-  ament_target_dependencies(test_costmap_scan_filter
-    sensor_msgs
+  target_link_libraries(test_costmap_scan_filter
+    ${sensor_msgs_TARGETS}
   )
 
   ament_add_gtest(test_navsat_projection_utils
@@ -304,10 +341,22 @@ if(BUILD_TESTING)
   target_include_directories(test_navsat_projection_utils PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
-  ament_target_dependencies(test_navsat_projection_utils
-    mowgli_interfaces
-    sensor_msgs
+  target_link_libraries(test_navsat_projection_utils
+    ${mowgli_interfaces_TARGETS}
+    ${sensor_msgs_TARGETS}
   )
+
+  ament_add_gtest(test_navsat_status_association
+    test/test_navsat_status_association.cpp
+  )
+  target_include_directories(test_navsat_status_association PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(test_navsat_status_association
+    ${mowgli_interfaces_TARGETS}
+    ${sensor_msgs_TARGETS}
+  )
+  target_link_libraries(test_navsat_status_association navsat_status_association)
 
   # ---- test_dock_cog_gate ----
   # Pure C++ test of the one-click dock-calibration COG-coherence gate
@@ -318,6 +367,17 @@ if(BUILD_TESTING)
     test/test_dock_cog_gate.cpp
   )
   target_include_directories(test_dock_cog_gate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  # ---- test_dock_persist_plan ----
+  # Pure C++ test of the dock calibration's two-step persistence
+  # (dock_persist_plan.hpp): the yaw step (robot OFF the dock) must never be a
+  # GPS position capture; the position step runs after the verified re-dock.
+  ament_add_gtest(test_dock_persist_plan
+    test/test_dock_persist_plan.cpp
+  )
+  target_include_directories(test_dock_persist_plan PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
 
@@ -333,6 +393,15 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
 
+  # ---- test_gravity_estimator ----
+  # Pure C++ regression test for the costmap IMU gravity gate.
+  ament_add_gtest(test_gravity_estimator
+    test/test_gravity_estimator.cpp
+  )
+  target_include_directories(test_gravity_estimator PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
   # ---- test_robot_yaml_scalar ----
   # Guards the ONE canonical dock_pose persist path (Invariant 6): the
   # motion-derived (yaw_source=MOTION) write must splice only the dock_pose_*
@@ -342,8 +411,8 @@ if(BUILD_TESTING)
   ament_add_gtest(test_robot_yaml_scalar
     test/test_robot_yaml_scalar.cpp
   )
-  ament_target_dependencies(test_robot_yaml_scalar
-    mowgli_interfaces
+  target_link_libraries(test_robot_yaml_scalar
+    ${mowgli_interfaces_TARGETS}
   )
 
 endif()

@@ -72,6 +72,9 @@ if(BUILD_TESTING)
   ament_add_pytest_test(test_urdf_xacro test/test_urdf_xacro.py
     TIMEOUT 30
   )
+  ament_add_pytest_test(test_cmd_vel_ws_relay test/test_cmd_vel_ws_relay.py
+    TIMEOUT 30
+  )
 
   # Static guard for Inv 2 (TF sole ownership) — greps sources/configs, no
   # nodes spun up.
@@ -83,6 +86,22 @@ if(BUILD_TESTING)
   # injections in the launch files (num_headland_passes, mowing_enabled,
   # dock_max_retries, dock_use_charger_detection). AST-based, no ROS2 runtime.
   ament_add_pytest_test(test_launch_injection test/test_launch_injection.py
+    TIMEOUT 30
+  )
+
+  # Lockstep guard for the firmware wheel-PI defaults: template ==
+  # mowgli.launch.py fallback == hardware_bridge_node.cpp declared default, and
+  # the set clears the template's deadband_pwm (2026-09-15 stiction lock).
+  ament_add_pytest_test(test_drive_pid_defaults test/test_drive_pid_defaults.py
+    TIMEOUT 30
+  )
+
+  # Type guard for the LiDAR map geometry fusion_graph.launch.py forwards:
+  # declare_parameter<double> aborts the localizer on an int, which is how a
+  # GUI settings save bricked the robot on 2026-09-15. Executes the launch
+  # file's own pure helper out of its AST, no ROS2 runtime.
+  ament_add_pytest_test(test_fusion_graph_launch_types
+    test/test_fusion_graph_launch_types.py
     TIMEOUT 30
   )
 
