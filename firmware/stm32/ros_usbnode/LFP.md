@@ -1,25 +1,41 @@
 # Custom Yardforce 500B LFP firmware
 
-Updated onto upstream `dev` at `5cb07fabb72f4c1a8a31cc8857eb61814cbe986c`
-(5 September 2026). Both branches retain the custom 8S LiFePO4 charging and
-500B hardware changes. Protocol v6, firmware build identification, runtime
-kinematics and safety limits, yaw control, anti-dig and emergency aborts come
-from current upstream.
+All three branches include upstream `dev` at `e36ecea9` and the blade reversal
+fix from PR #559 at `ac5d167b` (19 September 2026). The LFP charging profile,
+ADC selection and custom 500B hardware behavior remain branch-specific.
 
 ## Branches and builds
 
-| Branch | Charging ADC | Build |
+| Branch | Purpose | Build environment |
 | --- | --- | --- |
-| `fix/wheel-pi-ticks-lfp-adc` | Circular DMA; average 8 battery/charge-voltage scans | `pio run -e Yardforce500B_LFP` |
-| `fix/wheel-pi-ticks-lfp` | Per-conversion interrupt; average samples collected in each 10 ms window | `pio run -e Yardforce500B_LFP` |
+| `fix/wheel-pi-ticks-lfp` | Interrupt ADC; average each 10 ms window | `Yardforce500B_LFP` |
+| `fix/wheel-pi-ticks-lfp-adc` | Circular DMA; average 8 voltage scans | `Yardforce500B_LFP` |
+| `codex/lfp-charge-early-capture` | DMA plus charge diagnostics / early-capture investigation; .118 deployment line | `Yardforce500B_LFP_DIAG` |
 
-The `-lfp-adc` branch is the newest reference (`185f1306` before this merge).
-Its DMA acquisition also applies to the plain 500B target, without LFP
-oversampling. The interrupt branch additionally retains
-`Yardforce500B_LFP_DEBUG`, with `-Og -g3` and the original remote debug endpoint.
-Both branches otherwise share the charging logic and custom hardware features.
-The LFP environment inherits the upstream 500B toolchain and build-id hook.
-Select it explicitly: the default `pio run` target remains the stock 500.
+Select the environment explicitly with `pio run -e <environment>`; the default
+remains the stock 500. The interrupt branch also retains `Yardforce500B_LFP_DEBUG`.
+The diagnostics environment retains recorder ABI 2 and the PWM ceiling of 1390.
+Use its matching ELF when obtaining recorder addresses; never reuse an address
+from another build. Plain LFP builds omit the diagnostic recorder.
+
+## Blade reversal synchronization
+
+The production driver and regression harness come from PR #559, including
+continued receive/error handling while TX is busy and release only on a newly
+received qualifying ESC reply. Reversal keeps OFF for at least 1 second and
+requires inactive, error-free zero reports spanning at least 300 ms; stale or
+invalid replies cannot release it. Pending reversal has no forced timeout.
+
+The ESC speed word is not a verified live coast-down measurement. The observed
+500 holds its last value after OFF before clearing it. See
+[BLADE-REVERSE.md](BLADE-REVERSE.md) for the exact 500 test baseline; this does not
+establish physical stop timing on the 500B or validate the new LFP combination.
+The native blade harness also compiles with the real LFP board selection.
+500B reversal timing remains HARDWARE_REQUIRED: use the exact deployed commit,
+ELF/binary hashes and ESC revision, with blades removed, wheels raised, a clear
+rotor and an accessible cutoff. Observe forward/OFF/reverse/OFF and confirm the
+rotor physically stops before opposite rotation; retain USB telemetry alongside
+that observation. A firmware flash alone does not satisfy this acceptance test.
 
 ## Preserved charge profile
 
@@ -97,19 +113,69 @@ No packet change is needed; the current v6 host and firmware must be paired.
   Failed I2C reads retain the custom behavior of returning **no tilt**. This
   suppresses the reported phantom dock trips but is not detection of a failed
   tilt sensor; a disconnected sensor still needs separate diagnosis.
-- PB3 trace ownership is cleared before soft-I2C startup; bounded SWO output
-  prevents an undrained trace FIFO hanging boot. The 500B USB D+ disconnect
-  pulse remains, allowing re-enumeration after reset.
-- Preserve the documented **hard power cycle after flashing**. PB3 is both
-  SWO and the J18 MPU6050 clock; trace activity during flashing can disturb the
-  IMU even when firmware later reclaims the pin. The no-TPIU command remains
-  documented beside the LFP environment in `platformio.ini`.
+- PB3 trace ownership is cleared before soft-I2C startup. PB3 is also the J18
+  MPU6050 clock, so keep SWO trace disabled when flashing or attaching a debugger.
+  The 500B USB D+ disconnect pulse allows re-enumeration after reset.
+- Disable internal ITM output as well as external trace: the bounded SWO wait is
+  per character, so a whole debug message can still trigger the watchdog when
+  ITM is enabled without a reader. See the flashing procedure below.
 - Upstream's normal emergency-enabled release default is retained. The old
   unconditional bench `I_DONT_NEED_MY_FINGERS` define is not carried forward.
 
+## Flashing without a physical power cycle
+
+The .118 STM32F401 mower recovered after flashing on 6 September 2026 without
+cycling power. The critical OpenOCD command is **`itm ports off`**, placed after
+Cortex-M target creation and before `init`. OpenOCD automatically enables ITM
+port 0 when creating that target, even without a TPIU; see the
+[OpenOCD ITM documentation](https://openocd.org/doc/html/Architecture-and-Core-Commands.html).
+Clearing `DBGMCU_CR` / PB3 `TRACE_IOEN` alone is insufficient: on .118 it was
+already zero while ITM remained enabled and debug output caused watchdog boot
+loops. Disabling ITM restored normal IMU telemetry and charging without a
+physical power cycle. This supersedes the old mandatory hard-boot advice.
+
+Build as the normal project user from `firmware/stm32/ros_usbnode`:
+
+```sh
+pio run -e Yardforce500B_LFP
+```
+
+Back up the installed flash first and stop the ROS hardware bridge for the
+maintenance window. Copy the selected branch's `.pio/build/Yardforce500B_LFP/firmware.bin`
+and `remote_upload/yardforce500b_no_trace.cfg` to the Pi connected to ST-Link,
+verify the transferred binary's checksum, then run there (adjust both paths):
+
+```sh
+sudo openocd -c "set FIRMWARE /absolute/path/firmware.bin" \
+  -f /absolute/path/yardforce500b_no_trace.cfg
+```
+
+The helper combines the OpenOCD programming/recovery and ITM-off settings
+verified on .118: it uses a minimal target without TPIU, 100 kHz SWD, disables
+ITM before initialization, checks device ID `0x423` (STM32F401xB/C), writes and
+verifies the binary at `0x08000000`, then issues `reset run` using SYSRESETREQ.
+An NRST wire is not required. This helper is specific to the 500B STM32F401;
+do not use it for the standard 500's STM32F103.
+
+Require successful verification before restarting the bridge, then check live
+IMU samples, firmware identification and plausible battery/current telemetry.
+Retain the backup and flashing log. Keep ITM disabled on later debugger
+attachments too. A physical power cycle is a fallback if peripherals still fail
+to recover, not a required flashing step. `st-flash --reset` alone did not solve
+this on .118: the installed st-flash 1.7.0 failed during programming, and OpenOCD
+was needed to recover. The default PlatformIO upload command is unchanged;
+use the explicit helper above for this procedure.
+
+## Charging contact-loss protection
+
+The September charging-only overlay stops duty on acquired input loss, requires
+250 ms of stable input before a zero-duty restart, limits repeated restarts,
+and latches failed-output faults. See [CHARGING-MAINTENANCE.md](CHARGING-MAINTENANCE.md)
+for the hooks, constants, branch differences and upstream merge checklist.
+
 ## ADC fault handling
 
-Both branches hold charge PWM at zero until ADC input is valid. A start/rearm
+All three branches hold charge PWM at zero until ADC input is valid. A start/rearm
 failure, ADC error, or more than 30 ms without acquisition progress latches
 charging off until reboot. The normal 10 ms controller cadence checks that
 deadline; this is not an asynchronous hardware cutoff. The charge counter stops
@@ -117,15 +183,15 @@ integrating invalid input. Voltage/current filters start at the first measured
 values so the controller never ramps against a zero-filled startup buffer.
 
 On the DMA branch, ADC overrun, DMA transfer/direct-mode/FIFO errors and a
-disabled stream also latch the fault. Completion flags are polled; no additional
-DMA interrupts are installed. Current, dock voltage and NTC use the latest
+disabled stream also latch the fault. LFP completion/error interrupts provide the contact-loss guard and acquisition
+timestamps; stock 500B still polls its completion flags. Current, dock voltage and NTC use the latest
 completed row. Stock 500B keeps two rows (without averaging) so a completed
 scan remains available during a write; LFP keeps eight. Voltage averaging
 excludes a row being overwritten. A snapshot
 that moves while copied is discarded, and persistent snapshot failure also
 expires input freshness. The IRQ branch tracks completion of all five channels.
 
-The fixed -0.20 A Pi/electronics compensation is retained on both branches.
+The fixed -0.20 A Pi/electronics compensation is retained on all three branches.
 Charge-counter accounting is unchanged pending confirmation of whether that
 counter should include the electronics' consumption: it currently subtracts
 the offset again after the ADC current correction.
@@ -138,6 +204,7 @@ Run as the normal project user:
 python3 firmware/scripts/board_defaults_parity.py
 python3 firmware/scripts/protocol_version_guard.py --check
 python3 firmware/scripts/sync_ros_lib.py --check
+python3 firmware/scripts/test_blade_reverse.py
 python3 firmware/scripts/test_lfp_charger.py
 python3 firmware/scripts/test_adc_charging.py
 ```

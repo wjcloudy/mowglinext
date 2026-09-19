@@ -313,11 +313,15 @@ def main():
             (out / name).write_text((FW / 'include' / name).read_text(encoding='utf-8'), encoding='utf-8')
         for name, variant in [('Yardforce500', 'BOARD_YARDFORCE500_VARIANT_ORIG'),
                               ('Yardforce500B', 'BOARD_YARDFORCE500_VARIANT_B'),
+                              ('Yardforce500B_LFP', 'BOARD_YARDFORCE500_VARIANT_B'),
                               ('Yardforce500_COASTDOWN_VALIDATION', 'BOARD_YARDFORCE500_VARIANT_ORIG')]:
             if Path(args.cc).stem.lower() == 'cl':
                 cmd = [args.cc, '/nologo', '/std:c11', '/utf-8', '/W3', f'/D{variant}=1', 'test.c', '/Fe:' + str(binary)]
             else:
                 cmd = [args.cc, '-std=c11', '-Wall', '-Wextra', '-Werror', f'-D{variant}=1', 'test.c', '-o', str(binary)]
+            if name == 'Yardforce500B_LFP':
+                cmd.insert(1, ('/D' if Path(args.cc).stem.lower() == 'cl' else '-D') +
+                           'BOARD_YARDFORCE500B_LFP=1')
             if name.endswith('COASTDOWN_VALIDATION'):
                 cmd.insert(1, ('/D' if Path(args.cc).stem.lower() == 'cl' else '-D') +
                            'BLADEMOTOR_COASTDOWN_VALIDATION=1')
