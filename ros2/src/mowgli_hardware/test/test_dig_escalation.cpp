@@ -222,3 +222,76 @@ TEST(DigEscalation, ShippedDefaultsMatchTheDocumentedValues)
   EXPECT_DOUBLE_EQ(cfg.window_s, 60.0);
   EXPECT_EQ(cfg.min_count, 3);
 }
+
+// ── Operator override: CanClearDigEscalation ────────────────────────────────
+
+TEST(DigEscalation, WithinRadiusOfTheAnchorCannotClear)
+{
+  // 0.30 m from the anchor: still inside the 0.50 m "same spot" radius that
+  // raised the escalation — moving this little could still be the chassis
+  // rocking against the same object.
+  EXPECT_FALSE(mh::CanClearDigEscalation(0.0, 0.0, 0.30, 0.0, 0.50));
+}
+
+TEST(DigEscalation, ExactlyAtTheRadiusCannotClear)
+{
+  // Symmetric with ShouldEscalate's own <= radius_m "same spot" test — the
+  // boundary itself still counts as the spot, not clear of it.
+  EXPECT_FALSE(mh::CanClearDigEscalation(0.0, 0.0, 0.50, 0.0, 0.50));
+}
+
+TEST(DigEscalation, PastTheRadiusCanClear)
+{
+  EXPECT_TRUE(mh::CanClearDigEscalation(0.0, 0.0, 0.51, 0.0, 0.50));
+}
+
+TEST(DigEscalation, DistanceIsMeasuredFromTheAnchorNotTheOrigin)
+{
+  // Anchor away from (0,0): a naive hypot(x, y) would wrongly pass this.
+  EXPECT_FALSE(mh::CanClearDigEscalation(10.0, 20.0, 10.2, 20.1, 0.50));
+  EXPECT_TRUE(mh::CanClearDigEscalation(10.0, 20.0, 10.6, 20.0, 0.50));
+}
+
+TEST(DigEscalation, NonPositiveRadiusNeverBlocksAClear)
+{
+  // Mirrors ShouldEscalate's own disable sentinel: escalation itself cannot
+  // fire at this threshold, so a clear request must never be refused either.
+  EXPECT_TRUE(mh::CanClearDigEscalation(0.0, 0.0, 0.0, 0.0, 0.0));
+  EXPECT_TRUE(mh::CanClearDigEscalation(0.0, 0.0, 0.0, 0.0, -1.0));
+}
+
+// ── Displacement clear ──────────────────────────────────────────────────────
+// Field report 2026-09-14: after DIG_OBSTRUCTION the operator lifted the robot
+// onto open grass and pressed Play; nothing happened, because the latch only
+// ever cleared at the charger. The latch must release once the fused pose is
+// provably away from the escalation point, and must NOT release for the
+// shuffling a still-wedged robot does inside the same hole.
+
+TEST(DigEscalation, ShufflingInsideTheHoleDoesNotClear)
+{
+  // 0.5 m radius → 1.0 m clear distance. 0.6 m is still "same spot".
+  EXPECT_FALSE(mh::DigEscalationClearedByDisplacement(10.0, 5.0, 10.6, 5.0, 0.50));
+  EXPECT_FALSE(mh::DigEscalationClearedByDisplacement(10.0, 5.0, 10.0, 5.0, 0.50));
+  EXPECT_FALSE(mh::DigEscalationClearedByDisplacement(10.0, 5.0, 10.7, 5.7, 0.50));  // 0.99 m
+}
+
+TEST(DigEscalation, CarriedClearOfTheSpotClears)
+{
+  EXPECT_TRUE(mh::DigEscalationClearedByDisplacement(10.0, 5.0, 11.05, 5.0, 0.50));
+  EXPECT_TRUE(mh::DigEscalationClearedByDisplacement(10.0, 5.0, 10.0, 3.0, 0.50));
+  EXPECT_TRUE(mh::DigEscalationClearedByDisplacement(-9.03, 12.82, -9.03, 14.0, 0.50));
+}
+
+TEST(DigEscalation, ClearDistanceIsTwiceTheSameSpotRadius)
+{
+  EXPECT_DOUBLE_EQ(mh::kDigEscalationClearFactor, 2.0);
+  // Just under vs just over the 2x boundary for a 0.30 m radius.
+  EXPECT_FALSE(mh::DigEscalationClearedByDisplacement(0.0, 0.0, 0.59, 0.0, 0.30));
+  EXPECT_TRUE(mh::DigEscalationClearedByDisplacement(0.0, 0.0, 0.61, 0.0, 0.30));
+}
+
+TEST(DigEscalation, DisabledRadiusNeverClears)
+{
+  EXPECT_FALSE(mh::DigEscalationClearedByDisplacement(0.0, 0.0, 50.0, 50.0, 0.0));
+  EXPECT_FALSE(mh::DigEscalationClearedByDisplacement(0.0, 0.0, 50.0, 50.0, -1.0));
+}

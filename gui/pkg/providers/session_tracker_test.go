@@ -68,6 +68,114 @@ func TestSessionTracker_RecordsRealSession(t *testing.T) {
 	}
 }
 
+func TestSessionTracker_RtkRecoveryTransientStaysInSession(t *testing.T) {
+	db := types.NewMockDBProvider()
+	s := newTrackerNoGoroutine(db)
+
+	s.OnHighLevelStatus(status(2, "MOWING", false))
+	s.sessionStart = time.Now().UTC().Add(-60 * time.Second)
+	startedAt := s.sessionStart
+	s.OnHighLevelStatus(status(2, "WAITING_FOR_RTK", false))
+	s.OnHighLevelStatus(status(2, "WAITING_FOR_RTK", false))
+	s.OnHighLevelStatus(status(1, "IDLE", false))
+	s.OnHighLevelStatus(status(2, "MOWING", false))
+
+	if !s.inSession {
+		t.Fatal("RTK recovery transition must keep the mowing session open")
+	}
+	if !s.sessionStart.Equal(startedAt) {
+		t.Fatal("RTK recovery transition must not start a new session")
+	}
+	if got := loadStoredSessions(t, db); len(got) != 0 {
+		t.Fatalf("RTK recovery transition must not store a completed session, got %d", len(got))
+	}
+}
+
+func TestSessionTracker_ResumablePausesStayInSession(t *testing.T) {
+	tests := []struct {
+		name          string
+		approachState string
+		pauseState    string
+		resumeState   string
+		wantRecharges int
+	}{
+		{
+			name:          "critical battery recharge",
+			approachState: "CRITICAL_BATTERY_DOCKING",
+			pauseState:    "CRITICAL_BATTERY_CHARGING",
+			resumeState:   "RESUMING_UNDOCKING",
+			wantRecharges: 1,
+		},
+		{
+			name:          "rain wait",
+			approachState: "RAIN_DETECTED_DOCKING",
+			pauseState:    "RAIN_WAITING",
+			resumeState:   "RESUMING_AFTER_RAIN",
+			wantRecharges: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := types.NewMockDBProvider()
+			s := newTrackerNoGoroutine(db)
+			s.OnHighLevelStatus(status(2, "MOWING", false))
+			s.sessionStart = time.Now().UTC().Add(-60 * time.Second)
+			startedAt := s.sessionStart
+			s.OnHighLevelStatus(status(2, tt.approachState, false))
+			s.OnHighLevelStatus(status(1, tt.pauseState, false))
+			s.OnHighLevelStatus(status(1, tt.pauseState, false))
+			s.OnHighLevelStatus(status(2, tt.resumeState, false))
+			s.OnHighLevelStatus(status(2, "MOWING", false))
+
+			if !s.inSession || s.paused {
+				t.Fatalf("resumed mow must remain in the original open session: inSession=%v paused=%v", s.inSession, s.paused)
+			}
+			if !s.sessionStart.Equal(startedAt) {
+				t.Fatal("resumable pause must not start a new session")
+			}
+			if s.pauseCount != tt.wantRecharges {
+				t.Fatalf("recharge pause count = %d, want %d", s.pauseCount, tt.wantRecharges)
+			}
+			if got := loadStoredSessions(t, db); len(got) != 0 {
+				t.Fatalf("resumable pause must not store an ended session, got %d", len(got))
+			}
+		})
+	}
+}
+
+// Regression for the dock-motion gate (#584): after a finished mow the tree now
+// publishes state=2 (AUTONOMOUS) together with MOWING_COMPLETE while it drives
+// back to the dock. That return trip must close the session as "completed"
+// exactly as before, not keep it open (inflating distance/duration) nor turn a
+// failed docking into an "error" session.
+func TestSessionTracker_MowingCompleteWithAutonomousStateEndsTheSession(t *testing.T) {
+	db := types.NewMockDBProvider()
+	s := newTrackerNoGoroutine(db)
+	s.OnHighLevelStatus(status(2, "MOWING", false))
+	s.sessionStart = time.Now().UTC().Add(-60 * time.Second)
+	// Completed mow, robot still AUTONOMOUS (state=2) while returning to the dock.
+	s.OnHighLevelStatus(status(2, "MOWING_COMPLETE", false))
+	s.OnHighLevelStatus(status(2, "MOWING_COMPLETE", false))
+	got := loadStoredSessions(t, db)
+	if len(got) != 1 {
+		t.Fatalf("expected the session to be finalized at MOWING_COMPLETE, got %d stored sessions", len(got))
+	}
+	if got[0].Status != "completed" {
+		t.Fatalf("expected completed, got %q", got[0].Status)
+	}
+	if s.inSession {
+		t.Fatalf("session must not stay open during the return-to-dock trip")
+	}
+	// A docking failure after the finished mow must not rewrite the finished session.
+	s.OnHighLevelStatus(status(0, "NAV_TO_DOCK_FAILED", false))
+	s.OnHighLevelStatus(status(0, "NAV_TO_DOCK_FAILED", false))
+	got = loadStoredSessions(t, db)
+	if len(got) != 1 || got[0].Status != "completed" {
+		t.Fatalf("docking failure after a finished mow must leave the session completed, got %+v", got)
+	}
+}
+
 // progressStatus builds a mowing status carrying live coverage/swath telemetry.
 func progressStatus(coverage float32, completed, skipped int) []byte {
 	b, _ := json.Marshal(map[string]any{
@@ -124,11 +232,11 @@ func TestSessionTracker_AccumulatesDistance(t *testing.T) {
 
 	s.OnHighLevelStatus(status(2, "MOWING", false)) // start; resets odometer
 	s.sessionStart = time.Now().UTC().Add(-60 * time.Second)
-	s.OnOdometry(odomAt(0, 0))   // baseline
-	s.OnOdometry(odomAt(0.3, 0)) // +0.3
-	s.OnOdometry(odomAt(0.6, 0)) // +0.3
-	s.OnOdometry(odomAt(0.9, 0)) // +0.3 => 0.9
-	s.OnOdometry(odomAt(50, 50)) // jump > maxOdomStepM: discarded, re-baseline
+	s.OnOdometry(odomAt(0, 0))     // baseline
+	s.OnOdometry(odomAt(0.3, 0))   // +0.3
+	s.OnOdometry(odomAt(0.6, 0))   // +0.3
+	s.OnOdometry(odomAt(0.9, 0))   // +0.3 => 0.9
+	s.OnOdometry(odomAt(50, 50))   // jump > maxOdomStepM: discarded, re-baseline
 	s.OnOdometry(odomAt(50.3, 50)) // +0.3 => 1.2
 
 	s.OnHighLevelStatus(status(1, "IDLE_DOCKED", false))

@@ -4,6 +4,8 @@
 
 ## Hardware
 
+> **Building the robot?** The illustrated, step-by-step **[build manual](https://mowgli.garden/build/)** (EN/FR) covers parts, wiring, the compute board, IMU, RTK GNSS, LiDAR, firmware flashing, the installer and the first mow. This page is the reference summary.
+
 ### Compute Board
 
 Any 64-bit Linux board with Docker support (the installer supports `arm64` and `amd64`):
@@ -58,9 +60,9 @@ The fastest way to explore and develop MowgliNext — no local setup required:
 
 ### What's included
 
-The devcontainer provides a complete ROS2 Kilted development environment:
+The devcontainer provides a complete ROS2 Lyrical development environment:
 
-- Full Nav2 navigation stack plus GTSAM 4.3a1, for the `fusion_graph` factor-graph localizer — the stack's sole localizer, with optional LiDAR scan-matching and loop-closure factors
+- Full Nav2 navigation stack plus GTSAM 4.3a1, for the `fusion_graph` factor-graph localizer — the stack's sole localizer, with an optional persistent LiDAR map anchor for complete GNSS outages
 - Nav2 controller plugins as the stack uses them: `mowgli_nav2_plugins/FTCController` follows the coverage path, RotationShim + Regulated Pure Pursuit handle transit
 - Foxglove Bridge + rosbridge for visualization
 - GUI stack (Go 1.24, Node 22, yarn) so `cd gui && go build` and `cd gui/web && yarn dev` work out of the box
@@ -68,7 +70,7 @@ The devcontainer provides a complete ROS2 Kilted development environment:
 - Claude Code CLI + GitHub CLI for AI-assisted development
 - Auto-sourced ROS2 workspace
 
-Two things the devcontainer deliberately does **not** carry: the Webots simulator (see [Run the simulation](#run-the-simulation) below), and Fields2Cover v3. The image builds Fields2Cover 2.0.0 into `/opt/fields2cover-200`, while `mowgli_coverage` pins Fields2Cover 3.0.0 at `/opt/fields2cover-300` — which only the full `ros2/Dockerfile` build provides. Build the focused development set in the devcontainer rather than the whole workspace.
+The devcontainer builds Fields2Cover v3 and the pinned Lyrical source dependencies. Webots itself remains in the dedicated simulation image (see [Run the simulation](#run-the-simulation) below).
 
 **Forwarded ports:**
 
@@ -124,6 +126,14 @@ Run diagnostics on an existing installation:
 ```bash
 cd ~/mowglinext/install && ./mowglinext.sh --check
 ```
+
+Add or re-run a single step on an already-installed robot, instead of repeating the whole flow — e.g. install the host auto-updater afterwards, without re-answering every hardware prompt:
+
+```bash
+cd ~/mowglinext/install && ./mowglinext.sh --only=updater
+```
+
+Valid step names: `system`, `docker`, `uart`, `backend`, `gps`, `lidar`, `rangefinders`, `directory`, `migrate`, `env`, `udev`, `mower`, `tools`, `motd`, `updater`, `startup` (run with any other/unrecognised name to have the installer print this same list). `--only=` skips the branch/language prompts and reuses your existing configuration — it does not re-ask anything the full install flow would.
 
 ## Manual Install
 
@@ -200,7 +210,7 @@ Access the diagnostics dashboard at `http://<mower-ip>:4006/#/diagnostics`.
 **Displays:**
 - **System:** state, status and uptime of each Docker service (`mowgli`, `gps`, `lidar`, `gui`, …), CPU temperature, and an optional live firmware debug log stream
 - **Localisation:** the fused map-frame pose published by `fusion_graph_node` (`/odometry/filtered_map`) — x/y/z, roll/pitch/yaw — next to the live GNSS diagnostics card
-- **Fusion Graph:** nodes in the graph, loop closures, scan-match success rate, pose sigma, keyframes and rejects, straight from `/fusion_graph/diagnostics`
+- **Fusion Graph:** graph size, pose covariance, GNSS/slip gates, and LiDAR tile/filter/anchor telemetry from `/fusion_graph/diagnostics`
 - **Heading sources:** the yaw estimates the localizer fuses, side by side
 - **BT State & Coverage:** current behavior-tree state and sub-state, battery / charging / emergency latch, Nav2 recovery activity, and mow progress (current area, sub-paths done and skipped, coverage %)
 - **Configuration Cross-checks:** see below

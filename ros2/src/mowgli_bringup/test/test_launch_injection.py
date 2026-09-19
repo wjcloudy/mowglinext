@@ -108,8 +108,55 @@ def _node_parameter_keys(call: ast.Call) -> List[str]:
     return keys
 
 
+def _node_parameter_values(call: ast.Call, key: str) -> List[ast.expr]:
+    """Values assigned to one string key in a Node's parameter dicts."""
+    values: List[ast.expr] = []
+    for kw in call.keywords:
+        if kw.arg != "parameters" or not isinstance(kw.value, ast.List):
+            continue
+        for elt in kw.value.elts:
+            if not isinstance(elt, ast.Dict):
+                continue
+            for dict_key, dict_value in zip(elt.keys, elt.values):
+                if (
+                    isinstance(dict_key, ast.Constant)
+                    and dict_key.value == key
+                ):
+                    values.append(dict_value)
+    return values
+
+
 # ---------------------------------------------------------------------------
-# (a) num_headland_passes must reach coverage_server UNCLAMPED (issue #429).
+# (a) physical GNSS cadence must reach cog_to_imu (MGNSS-011).
+# ---------------------------------------------------------------------------
+
+
+def test_navigation_launch_wires_physical_gnss_rate_to_cog() -> None:
+    tree = _parse("navigation.launch.py")
+    assert _reads_robot_param(
+        tree,
+        "physical_gnss_observation_rate_hz",
+        "gnss_profile_rate_hz",
+    ), (
+        "navigation.launch.py must read the configured receiver-profile rate; "
+        "COG timing must not invent or infer a ROS publication rate."
+    )
+
+    call = _find_node_call(tree, "cog_to_imu")
+    assert call is not None, "navigation.launch.py no longer launches cog_to_imu"
+    values = _node_parameter_values(call, "physical_gnss_observation_rate_hz")
+    assert len(values) == 1
+    assert (
+        isinstance(values[0], ast.Name)
+        and values[0].id == "physical_gnss_observation_rate_hz"
+    ), (
+        "cog_to_imu must receive the bare physical GNSS rate loaded from "
+        "gnss_profile_rate_hz, not a publication-rate expression."
+    )
+
+
+# ---------------------------------------------------------------------------
+# (b) num_headland_passes must reach coverage_server UNCLAMPED (issue #429).
 # ---------------------------------------------------------------------------
 
 
@@ -162,7 +209,34 @@ def test_navigation_launch_does_not_clamp_num_headland_passes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (b) mowing_enabled must reach hardware_bridge_node (issue #195).
+# (b2) connector_max_headland_passes must reach coverage_server (issue #497).
+# ---------------------------------------------------------------------------
+
+
+def test_navigation_launch_injects_connector_max_headland_passes() -> None:
+    """navigation.launch.py must read connector_max_headland_passes from
+    mowgli_robot.yaml and write it into coverage_server's parameter dict.
+    Without the write the operator's Turn-Around Headland Limit setting does
+    nothing — coverage_server keeps its own declare_int default of 0
+    (unlimited) forever, and turn-around connectors keep using the whole
+    headland apron regardless of what the GUI shows.
+    """
+    tree = _parse("navigation.launch.py")
+    assert _reads_robot_param(
+        tree, "connector_max_headland_passes", "connector_max_headland_passes"
+    ), (
+        "navigation.launch.py no longer reads connector_max_headland_passes "
+        "from the robot config (rt_rp.get) — the GUI setting is orphaned."
+    )
+    values = _subscript_assign_values(tree, "cov_params", "connector_max_headland_passes")
+    assert values, (
+        'navigation.launch.py must assign cov_params["connector_max_headland_passes"] — '
+        "without it coverage_server keeps its own default and the setting is dead."
+    )
+
+
+# ---------------------------------------------------------------------------
+# (c) mowing_enabled must reach hardware_bridge_node (issue #195).
 # ---------------------------------------------------------------------------
 
 
@@ -213,7 +287,7 @@ def test_mowing_enabled_is_not_wired_to_some_other_node() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (c) dock_max_retries / dock_use_charger_detection must reach docking_server
+# (d) dock_max_retries / dock_use_charger_detection must reach docking_server
 #     (issue #195). test_nav2_params.py only checks the keys exist in the static
 #     YAML — which was already true BEFORE they were wired up, so that test
 #     cannot fail if the injection is deleted. These can.
@@ -258,5 +332,115 @@ def test_navigation_launch_injects_dock_use_charger_detection() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "key,default,configured",
+    [("max_charge_voltage", 29.4, 28.5), ("max_charge_current", 1.2, 1.8)],
+)
+def test_mowgli_launch_passes_charge_limits_to_hardware_bridge(
+    key: str, default: float, configured: float
+) -> None:
+    """Saved charge ceilings must reach the bridge; missing keys keep defaults."""
+    call = _find_node_call(_parse("mowgli.launch.py"), "hardware_bridge_node")
+    assert call is not None
+    parameters = next(kw.value for kw in call.keywords if kw.arg == "parameters")
+    values = [
+        value
+        for entry in parameters.elts
+        if isinstance(entry, ast.Dict)
+        for name, value in zip(entry.keys, entry.values)
+        if isinstance(name, ast.Constant) and name.value == key
+    ]
+    assert len(values) == 1, f"hardware_bridge must receive {key} exactly once"
+    expression = compile(ast.Expression(values[0]), "mowgli.launch.py", "eval")
+    for robot_params, expected in [({}, default), ({key: configured}, configured)]:
+        actual = eval(
+            expression, {"__builtins__": {}, "float": float},
+            {"robot_params": robot_params},
+        )
+        assert isinstance(actual, float)
+        assert actual == pytest.approx(expected)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_cross_hatch_setting_reaches_behavior_tree() -> None:
+    call = _find_node_call(_parse("full_system.launch.py"), "behavior_tree_node")
+    assert call is not None
+    parameters = next(kw.value for kw in call.keywords if kw.arg == "parameters")
+    values = [value for entry in parameters.elts if isinstance(entry, ast.Dict)
+              for key, value in zip(entry.keys, entry.values)
+              if isinstance(key, ast.Constant) and key.value == "mow_cross_hatch"]
+    assert len(values) == 1
+    expression = compile(ast.Expression(values[0]), "full_system.launch.py", "eval")
+    for config, expected in [({}, False), ({"mow_cross_hatch": True}, True)]:
+        assert eval(expression, {"__builtins__": {}, "bool": bool},
+                    {"robot_params": config}) is expected
+
+
+@pytest.mark.parametrize(
+    "launch_file", ["navigation.launch.py", "full_system.launch.py"])
+def test_no_closure_rebinds_a_name_of_its_enclosing_function(
+        launch_file: str) -> None:
+    """A nested function that ASSIGNS a name its enclosing function also owns
+    makes that name local to the closure, so any read of it there raises
+    UnboundLocalError — at LAUNCH time, not import time. That is what
+    crash-looped the stack on the robot on 2026-09-16 (`obstacle_margin`
+    re-assigned inside `_inject_dock_pose_and_speeds`), and no regex or yaml
+    test can see it. The symbol table can: a closure must use FRESH local names.
+    """
+    import symtable
+
+    with open(_launch_path(launch_file)) as fh:
+        table = symtable.symtable(fh.read(), launch_file, "exec")
+
+    offenders = []
+
+    def _walk(scope) -> None:
+        for child in scope.get_children():
+            if scope.get_type() == "function" and child.get_type() == "function":
+                outer = {sym.get_name() for sym in scope.get_symbols()
+                         if sym.is_local() or sym.is_parameter()}
+                offenders.extend(
+                    f"{scope.get_name()} -> {child.get_name()}: {sym.get_name()}"
+                    for sym in child.get_symbols()
+                    if sym.is_local() and not sym.is_parameter()
+                    and sym.get_name() in outer)
+            _walk(child)
+
+    _walk(table)
+    assert not offenders, (
+        "closure re-binds a name of its enclosing function (UnboundLocalError "
+        f"at launch): {offenders}"
+    )
+
+
+def test_foxglove_bridge_respawns() -> None:
+    """The bridge is the GUI's ONLY link to ROS (gui/pkg/providers/ros.go dials
+    ws://localhost:8765). On 2026-09-18 it segfaulted seconds after the GUI
+    backend connected and was never restarted, so the web UI showed no robot on
+    the map and "no GPS" for a whole run while the robot was RTK-Fixed and
+    mowing. It is outside the motion path, so respawning it can only restore
+    observability."""
+    tree = ast.parse(open(_launch_path("foxglove_bridge.launch.py")).read())
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or getattr(node.func, "id", None) != "Node":
+            continue
+        kwargs = {kw.arg: kw.value for kw in node.keywords}
+        name = kwargs.get("name")
+        if not isinstance(name, ast.Constant) or name.value != "foxglove_bridge":
+            continue
+        respawn = kwargs.get("respawn")
+        assert isinstance(respawn, ast.Constant) and respawn.value is True, (
+            "foxglove_bridge must respawn: without it a single crash leaves the "
+            "operator blind with no indication that the robot is fine."
+        )
+        delay = kwargs.get("respawn_delay")
+        assert isinstance(delay, ast.Constant) and delay.value > 0, (
+            "respawn_delay bounds a crash loop."
+        )
+        return
+
+    pytest.fail("no foxglove_bridge Node found in foxglove_bridge.launch.py")

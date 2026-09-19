@@ -176,6 +176,7 @@ export const enum DockCalibrationStatusConstants {
   PHASE_PERSIST = 5,
   PHASE_IDLE = 6,
   PHASE_DONE = 7,
+  PHASE_CAPTURE_POSITION = 8,
 };
 
 export type DockCalibrationStatus = {
@@ -240,6 +241,25 @@ export const enum GnssStatusConstants {
   CORRECTION_STREAM_STATUS_ACTIVE = 3,
   CORRECTION_STREAM_STATUS_UNAVAILABLE = 4,
   CORRECTION_STREAM_STATUS_ERROR = 5,
+  CORRECTION_TRANSPORT_STATUS_UNKNOWN = 0,
+  CORRECTION_TRANSPORT_STATUS_DISCONNECTED = 1,
+  CORRECTION_TRANSPORT_STATUS_CONNECTING = 2,
+  CORRECTION_TRANSPORT_STATUS_CONNECTED = 3,
+  CORRECTION_TRANSPORT_STATUS_STREAMING = 4,
+  CORRECTION_TRANSPORT_STATUS_RECONNECTING = 5,
+  CORRECTION_TRANSPORT_STATUS_FAILED = 6,
+  CORRECTION_FLOW_STATUS_UNKNOWN = 0,
+  CORRECTION_FLOW_STATUS_IDLE = 1,
+  CORRECTION_FLOW_STATUS_WAITING = 2,
+  CORRECTION_FLOW_STATUS_ACTIVE = 3,
+  CORRECTION_FLOW_STATUS_STALE = 4,
+  CORRECTION_FLOW_STATUS_INVALID = 5,
+  CORRECTION_SEMANTIC_STATUS_UNKNOWN = 0,
+  CORRECTION_SEMANTIC_STATUS_UNAVAILABLE = 1,
+  CORRECTION_SEMANTIC_STATUS_WAITING = 2,
+  CORRECTION_SEMANTIC_STATUS_HEALTHY = 3,
+  CORRECTION_SEMANTIC_STATUS_STALE = 4,
+  CORRECTION_SEMANTIC_STATUS_INVALID = 5,
   CAP_RTK_MODE = 1,
   CAP_HDOP = 2,
   CAP_VDOP = 4,
@@ -265,6 +285,9 @@ export const enum GnssStatusConstants {
   CAP_BASELINE_SOLUTION_STATUS = 4194304,
   CAP_CORRECTION_STREAM = 8388608,
   CAP_MSM_SUMMARY = 16777216,
+  CAP_CORRECTION_TRANSPORT = 33554432,
+  CAP_CORRECTION_FLOW = 67108864,
+  CAP_CORRECTION_SEMANTIC = 134217728,
 };
 
 export type GnssStatus = {
@@ -314,6 +337,13 @@ export type GnssStatus = {
   msm_summary_cell_count?: number;
   msm_summary_age_s?: number;
   position_observation_sequence?: number;
+  correction_transport_status?: number;
+  correction_response_accepted?: boolean;
+  correction_flow_status?: number;
+  correction_semantic_status?: number;
+  correction_source?: string;
+  correction_forwarding_source?: string;
+  msm_summary_source?: string;
 };
 
 export const enum HighLevelStatusConstants {
@@ -360,6 +390,9 @@ export type MapArea = {
   obstacles?: Polygon[];
   is_navigation_area?: boolean;
   obstacle_info?: MapObstacleInfo[];
+  proposed_obstacles?: Polygon[];
+  proposed_obstacle_info?: MapObstacleInfo[];
+  id?: number;
 };
 
 export const enum MapObstacleInfoConstants {
@@ -416,6 +449,9 @@ export type Status = {
   ui_board_available?: boolean;
   mow_enabled?: boolean;
   firmware_debug_enabled?: boolean;
+  dig_escalated?: boolean;
+  dig_escalated_distance_m?: number;
+  dig_escalated_required_distance_m?: number;
   mower_esc_status?: number;
   mower_esc_temperature?: number;
   mower_esc_current?: number;
@@ -477,6 +513,7 @@ export type Map = {
   map_center_y?: number;
   navigation_areas?: MapArea[];
   working_area?: MapArea[];
+  working_area_indices?: number[];
   dock_x?: number;
   dock_y?: number;
   dock_heading?: number;

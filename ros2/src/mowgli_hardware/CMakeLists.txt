@@ -9,7 +9,7 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -52,8 +52,8 @@ target_link_libraries(mowgli_hardware_core pthread)
 
 # clock_fit.cpp needs rclcpp::Time. Promote rclcpp to the static lib's
 # public deps so test executables also pick it up transitively.
-ament_target_dependencies(mowgli_hardware_core
-  rclcpp
+target_link_libraries(mowgli_hardware_core
+  ${rclcpp_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -69,14 +69,14 @@ target_link_libraries(hardware_bridge_node
   mowgli_hardware_core
 )
 
-ament_target_dependencies(hardware_bridge_node
-  rclcpp
-  std_msgs
-  std_srvs
-  sensor_msgs
-  geometry_msgs
-  nav_msgs
-  mowgli_interfaces
+target_link_libraries(hardware_bridge_node
+  ${rclcpp_TARGETS}
+  ${std_msgs_TARGETS}
+  ${std_srvs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${mowgli_interfaces_TARGETS}
 )
 
 # ---------------------------------------------------------------------------
@@ -161,7 +161,9 @@ if(BUILD_TESTING)
     PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
-  ament_target_dependencies(test_dig_detector mowgli_interfaces)
+  target_link_libraries(test_dig_detector
+    ${mowgli_interfaces_TARGETS}
+  )
 
   # ---- test_dig_escalation ----
   # Header-only pure logic (dig_escalation.hpp): no link against
@@ -194,6 +196,88 @@ if(BUILD_TESTING)
   target_include_directories(test_blade_gate
     PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  # ---- test_heartbeat_emergency_policy ----
+  # The firmware's pure heartbeat safety policy is compiled here directly so
+  # all stop/release combinations are verified without physical hardware.
+  ament_add_gtest(test_heartbeat_emergency_policy
+    test/test_heartbeat_emergency_policy.cpp
+  )
+  target_include_directories(test_heartbeat_emergency_policy
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../firmware/stm32/ros_usbnode/include
+  )
+
+  # ---- test_cmd_vel_validation ----
+  ament_add_gtest(test_cmd_vel_validation
+    test/test_cmd_vel_validation.cpp
+  )
+  target_include_directories(test_cmd_vel_validation
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  # ---- test_cmd_vel_slew ----
+  ament_add_gtest(test_cmd_vel_slew
+    test/test_cmd_vel_slew.cpp
+  )
+  target_include_directories(test_cmd_vel_slew
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  # ---- test_battery_state_semantics ----
+  ament_add_gtest(test_battery_state_semantics
+    test/test_battery_state_semantics.cpp
+  )
+  target_include_directories(test_battery_state_semantics
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  # ---- test_timer_period ----
+  ament_add_gtest(test_timer_period
+    test/test_timer_period.cpp
+  )
+  target_include_directories(test_timer_period
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  # ---- test_drive_gain_sanity ----
+  # Pure header: the wheel-gain deadband gate hardware_bridge applies before
+  # pushing wheel_pid_* to the firmware (stiction-locked gains, 2026-09-15).
+  ament_add_gtest(test_drive_gain_sanity
+    test/test_drive_gain_sanity.cpp
+  )
+  target_include_directories(test_drive_gain_sanity
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  # ---- test_hardware_bridge_parameters ----
+  # Includes the node implementation to exercise ROS's actual read-only
+  # parameter contract while a missing serial device keeps the test hardware-free.
+  ament_add_gtest(test_hardware_bridge_parameters
+    test/test_hardware_bridge_parameters.cpp
+    src/odometry_publisher.cpp
+  )
+  target_link_libraries(test_hardware_bridge_parameters
+    mowgli_hardware_core
+  )
+  target_include_directories(test_hardware_bridge_parameters
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+  target_link_libraries(test_hardware_bridge_parameters
+    ${rclcpp_TARGETS}
+    ${std_msgs_TARGETS}
+    ${std_srvs_TARGETS}
+    ${sensor_msgs_TARGETS}
+    ${geometry_msgs_TARGETS}
+    ${nav_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
   )
 endif()
 

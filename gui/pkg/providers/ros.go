@@ -31,8 +31,8 @@ var topicMap = map[string]topicDef{
 	// One-click dock calibration live status (the GUI's foxglove-friendly
 	// window into the CalibrateDock action — foxglove_bridge has no action op).
 	"dockCalibrationStatus": {"/calibrate_imu_yaw_node/dock_calibration/status", "mowgli_interfaces/msg/DockCalibrationStatus"},
-	"gps":             {"/gps/fix", "sensor_msgs/msg/NavSatFix"},
-	"gnssStatus":      {"/gps/status", "mowgli_interfaces/msg/GnssStatus"},
+	"gps":                   {"/gps/fix", "sensor_msgs/msg/NavSatFix"},
+	"gnssStatus":            {"/gps/status", "mowgli_interfaces/msg/GnssStatus"},
 	// The robot's global pose comes from fusion_graph_node, the sole
 	// map-frame localizer. "pose" and "fusionRaw" both point at
 	// /odometry/filtered_map; the duplicate key is kept for backwards
@@ -51,9 +51,9 @@ var topicMap = map[string]topicDef{
 	"emergency":           {"/hardware_bridge/emergency", "mowgli_interfaces/msg/Emergency"}, // safety-critical
 	"lidar":               {"/scan", "sensor_msgs/msg/LaserScan"},                            // large message
 	"mowProgress":         {"/map_server_node/mow_progress", "nav_msgs/msg/OccupancyGrid"},   // mowed-area overlay (large)
+	"lidarMap":            {"/fusion_graph/lidar_map", "nav_msgs/msg/OccupancyGrid"},         // fusion_graph LiDAR anchor map (large, latched)
 	"diagnostics":         {"/diagnostics", "diagnostic_msgs/msg/DiagnosticArray"},
 	"fusionDiag":          {"/fusion_graph/diagnostics", "diagnostic_msgs/msg/DiagnosticArray"},
-	"icpOdom":             {"/fusion_graph/icp_odometry", "nav_msgs/msg/Odometry"}, // LiDAR-only odom (ICP monitor)
 	"obstacles":           {"/obstacle_tracker/obstacles", "mowgli_interfaces/msg/ObstacleArray"},
 	"robotDescription":    {"/robot_description", "std_msgs/msg/String"},                     // published once
 	"recordingTrajectory": {"/behavior_tree_node/recording_trajectory", "nav_msgs/msg/Path"}, // area recording preview
@@ -192,6 +192,21 @@ type RosProvider struct {
 
 	dbProvider     types2.IDBProvider
 	sessionTracker *SessionTracker
+	// notifier receives highLevelStatus + map payloads for push notifications;
+	// nil until AttachNotifier (guarded by mtx).
+	notifier *NotificationProvider
+}
+
+// AttachNotifier routes highLevelStatus and map payloads to the notification
+// provider from now on. The provider is built after the ROS provider in
+// main.go, hence a setter rather than a constructor argument.
+func (r *RosProvider) AttachNotifier(n *NotificationProvider) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+	r.notifier = n
+	if last, ok := r.lastMessage["map"]; ok && n != nil {
+		n.EnqueueMap(append([]byte(nil), last...))
+	}
 }
 
 // foxgloveAdapters maps logicalKey to a per-message transform applied between
@@ -343,6 +358,16 @@ func (r *RosProvider) fanOut(logicalKey string, msg []byte) {
 		msgCopy := append([]byte(nil), msg...)
 		r.sessionTracker.EnqueueOdometry(msgCopy)
 	}
+	// Push notifications: same ordered-queue contract as the session tracker;
+	// the map payload keeps its zone-name lookup current.
+	if r.notifier != nil {
+		switch logicalKey {
+		case "highLevelStatus":
+			r.notifier.Enqueue(append([]byte(nil), msg...))
+		case "map":
+			r.notifier.EnqueueMap(append([]byte(nil), msg...))
+		}
+	}
 }
 
 // initDockPoseSubscription subscribes to the map_server_node's docking_pose
@@ -403,12 +428,24 @@ func (r *RosProvider) initMapPolling() {
 	}()
 }
 
+// Preserve ROS area IDs when the UI separates mowing and navigation areas.
+func splitMapAreas(areas []mowgli.MapArea) (working, navigation []mowgli.MapArea, indices []uint32) {
+	for index, area := range areas {
+		if area.IsNavigationArea {
+			navigation = append(navigation, area)
+		} else {
+			working = append(working, area)
+			indices = append(indices, uint32(index))
+		}
+	}
+	return
+}
+
 func (r *RosProvider) pollMap() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	var workingAreas []mowgli.MapArea
-	var navAreas []mowgli.MapArea
+	var allAreas []mowgli.MapArea
 
 	// Fetch all areas (index 0..N until success=false)
 	for i := uint32(0); i < 100; i++ {
@@ -426,13 +463,10 @@ func (r *RosProvider) pollMap() {
 		if !res.Success {
 			break
 		}
-		if res.Area.IsNavigationArea {
-			navAreas = append(navAreas, res.Area)
-		} else {
-			workingAreas = append(workingAreas, res.Area)
-		}
+		allAreas = append(allAreas, res.Area)
 	}
 
+	workingAreas, navAreas, workingIndices := splitMapAreas(allAreas)
 	if workingAreas == nil {
 		workingAreas = []mowgli.MapArea{}
 	}
@@ -440,24 +474,16 @@ func (r *RosProvider) pollMap() {
 		navAreas = []mowgli.MapArea{}
 	}
 
-	// Read cached docking pose (written by initDockPoseSubscription)
-	r.mtx.Lock()
-	dockX := r.dockX
-	dockY := r.dockY
-	dockHeading := r.dockHeading
-	r.mtx.Unlock()
-
 	mapData := mowgli.Map{
-		MapWidth:        20.0,
-		MapHeight:       20.0,
-		MapCenterX:      0.0,
-		MapCenterY:      0.0,
-		NavigationAreas: navAreas,
-		WorkingArea:     workingAreas,
-		DockX:           dockX,
-		DockY:           dockY,
-		DockHeading:     dockHeading,
+		MapWidth:           20.0,
+		MapHeight:          20.0,
+		MapCenterX:         0.0,
+		MapCenterY:         0.0,
+		NavigationAreas:    navAreas,
+		WorkingArea:        workingAreas,
+		WorkingAreaIndices: workingIndices,
 	}
+	r.addDockPose(&mapData)
 
 	data, err := json.Marshal(mapData)
 	if err != nil {

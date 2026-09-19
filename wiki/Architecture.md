@@ -2,7 +2,7 @@
 
 Comprehensive technical documentation of the Mowgli ROS2 system design, including package organization, data flow, communication protocols, and integration points.
 
-Built on **ROS2 Kilted** with **Webots** simulation, this architecture spans 12 focused packages providing complete autonomous lawn mower functionality. [CLAUDE.md](https://github.com/mowglinext/mowglinext/blob/main/CLAUDE.md) is the authoritative short-form reference and the place to check first if any page on the wiki looks out of date.
+Built on **ROS2 Lyrical** with **Webots** simulation, this architecture spans 12 focused packages providing complete autonomous lawn mower functionality. [CLAUDE.md](https://github.com/mowglinext/mowglinext/blob/main/CLAUDE.md) is the authoritative short-form reference and the place to check first if any page on the wiki looks out of date.
 
 Machine-generated indexes of the same code live in the repo and are refreshed with it — useful when you need file/line precision rather than prose: [`docs/claude/codemaps/`](https://github.com/mowglinext/mowglinext/tree/main/docs/claude/codemaps) (one per package), [`docs/claude/ros-interfaces.md`](https://github.com/mowglinext/mowglinext/blob/main/docs/claude/ros-interfaces.md) (every topic/service/action/TF and who publishes it), [`docs/claude/parameters.md`](https://github.com/mowglinext/mowglinext/blob/main/docs/claude/parameters.md), [`docs/claude/testing-ci.md`](https://github.com/mowglinext/mowglinext/blob/main/docs/claude/testing-ci.md), and [`docs/claude/doc-index.md`](https://github.com/mowglinext/mowglinext/blob/main/docs/claude/doc-index.md) (which document is authoritative vs historical). Each top-level directory also carries a short `CLAUDE.md` pointer file.
 
@@ -13,7 +13,7 @@ The map-frame and local-odometry legs are both owned by a **single localizer**, 
 | Layer | Owner | Notes |
 |---|---|---|
 | `map → odom` AND `odom → base_footprint` | `fusion_graph_node` (sole, default, unconditional) | GTSAM iSAM2 Pose2 factor graph; publishes **both** TF legs from a dedicated TF broadcast thread. Fuses a wheel between-factor (non-holonomic σ_y ≪ σ_x, from `/wheel_odom`), a gyro between-factor on yaw, a custom `GnssLeverArmFactor` (analytic Jacobian, antenna lever-arm rotates with node yaw, fed by the raw `/gps/fix` NavSatFix — *not* `/gps/pose_cov`, which is the legacy twin the dock-calibration gate uses), and unary yaw factors for COG (`/imu/cog_heading`) and tilt-compensated mag (`/imu/mag_yaw`, when calibrated). Datum + lever-arm from `mowgli_robot.yaml`. Config in `ros2/src/fusion_graph/config/fusion_graph.yaml`. Surface: `/odometry/filtered_map`, `/odometry/filtered`, `/fusion_graph/diagnostics`, `/fusion_graph/markers`, `~/save_graph` / `~/clear_graph` services. No SLAM. |
-| LiDAR (optional) | `fusion_graph_node` | When `use_scan_matching` / `use_loop_closure` are on, the scan (`/scan_deskewed` by default, `scan_topic` to override) enters the same factor graph as scan-matching between-factors and loop-closure factors, carrying the map-frame estimate through multi-minute RTK-Float windows. No parallel TF tree, no separate twist channel. |
+| LiDAR (optional) | `fusion_graph_node` | With `use_lidar_map_anchor`, fresh RTK-Fixed scans build persistent georeferenced tiles. Any usable GNSS, including Float, keeps the particle filter asleep; after a complete GNSS outage it can add validated XY-only priors. Scan-to-scan ICP and loop closure were removed. |
 | Map / areas | `map_server_node` | Polygon-based area DB + `mow_progress` GridMap layer, persisted to disk. No SLAM back-end. |
 
 > `fusion_graph_node` is the **only** node that publishes `map → odom` or `odom → base_footprint`. The robot_localization dual EKF, slam_toolbox, Kinematic-ICP, and FusionCore were all removed. See [Factor-Graph Localizer](#optional-factor-graph-localizer-fusion_graph) below for details.
@@ -231,7 +231,7 @@ Application layer
 - **ObstacleArray.msg** – Collection of tracked obstacles from obstacle_tracker_node
 - **TrackedObstacle.msg** – Individual persistent obstacle with position, age, and observation count
 - **MapObstacleInfo.msg** – Per-area obstacle identity/state returned by `~/get_mowing_area`
-- **DigEvent.msg** – Wheel-slip dig report from `hardware_bridge_node`'s dig detector (`~/dig_event`), promoted to a keepout by `map_server_node`
+- **DigEvent.msg** – Wheel-slip dig report from `hardware_bridge_node`'s dig detector (`~/dig_event`); `map_server_node` records it as an operator-reviewable proposal (never an automatic keepout) and `behavior_tree_node` turns it into a session dig skip zone for `FollowStrip`
 - **GnssStatus.msg** – Authoritative receiver status from the GNSS sidecar (`/gps/status`)
 - **DockCalibrationStatus.msg** – Progress/result feed for the one-click dock calibration
 
@@ -552,8 +552,8 @@ launched unconditionally by navigation.launch.py:
                                not by /gps/pose_cov),
              yaw unary  /imu/cog_heading  (GPS-COG absolute yaw),
              yaw unary  /imu/mag_yaw      (optional, when calibrated)
-   - Optional LiDAR scan-matching between-factors and loop-closure factors
-     (gated by use_scan_matching / use_loop_closure).
+   - Optional persistent LiDAR tiles learned under RTK-Fixed; validated
+     XY-only factors are reserved for complete GNSS outages.
    - Output: /odometry/filtered_map (map frame) and /odometry/filtered
              (odom frame, dead reckoning — twist.angular.z left at 0)
    - Publishes BOTH TFs from a dedicated TF broadcast thread:
@@ -747,40 +747,21 @@ label from the removed dual EKF) with levels:
 
 ### Factor-Graph Localizer (fusion_graph) {#optional-factor-graph-localizer-fusion_graph}
 
-**Package:** `ros2/src/fusion_graph/` (separate ament_cmake package).
+**Package:** `ros2/src/fusion_graph/`.
 
-**Purpose:** the **sole, default, unconditional** map+odom localizer, built on **GTSAM iSAM2**. It publishes **both** `map → odom` AND `odom → base_footprint` (from a dedicated TF broadcast thread), plus `/odometry/filtered_map`. The map-frame estimate is the result of an incremental Pose2 factor graph, which lets LiDAR scan-matching and loop-closure factors carry the position through multi-minute RTK-Float windows where dead-reckoning alone would drift.
+`fusion_graph_node` is the sole, unconditional map+odom localizer. It publishes both `map → odom` and `odom → base_footprint`, plus `/odometry/filtered_map`. Each Pose2 graph node combines wheel and gyro between-factors, a lever-arm-aware factor fed directly by `/gps/fix`, and COG or optional magnetometer yaw factors. The removed dual EKF, slam_toolbox, Kinematic-ICP, scan-to-scan ICP, and loop closure have no execution or configuration path.
 
-**Activation:** none — `fusion_graph_node` is launched **unconditionally** by `navigation.launch.py`. There is **no `use_fusion_graph` arg**. The robot_localization dual EKF (`ekf_map_node` + `ekf_odom_node`), `robot_localization.yaml`, slam_toolbox, Kinematic-ICP, and FusionCore were all removed; `fusion_graph_node` is the only node that publishes either TF leg. Config lives in `ros2/src/fusion_graph/config/fusion_graph.yaml`.
+With `use_lidar_map_anchor` on, scans acquired under fresh RTK-Fixed build persistent datum-aligned tiles. Only a local window is loaded, which lets large gardens grow without one dense global grid. The Beluga filter stays asleep while any usable GNSS observation arrives, including RTK Float. After a complete outage it warms up from 15 s and validated XY-only observations become factor-eligible at 20 s. The filter does not supply absolute yaw. Sparse or repetitive scenery simply fails the scan-support and consistency gates, leaving wheel/gyro dead reckoning.
 
-**Graph structure (per node, `node_period_s` cadence):**
-
-| Factor | Source | Notes |
+| Input/factor | Source | Notes |
 |---|---|---|
-| Wheel `BetweenFactor` | `/wheel_odom` | Body-frame Pose2; non-holonomic σ_y ≪ σ_x. |
-| Gyro `BetweenFactor` (yaw only) | `/imu/data` | Integrated `wz` over the inter-node window. |
-| Custom `GnssLeverArmFactor` | `/gps/fix` | Analytic Jacobian — antenna lever-arm rotates with the node's yaw, so GPS XY couples to heading correctly. Robust Huber when fix < `STATUS_GBAS_FIX`. |
-| Yaw unary | `/imu/cog_heading` | GPS course-over-ground absolute yaw, gated on forward motion. |
-| Yaw unary (optional) | `/imu/mag_yaw` | Tilt-compensated mag yaw, only when `use_magnetometer:=true`. |
-| Scan `BetweenFactor` (optional) | `/scan_deskewed` (`scan_topic`) | ICP between consecutive nodes; gated on `use_scan_matching:=true`. Both LiDAR toggles are ANDed with `use_lidar` at launch. |
-| Loop-closure `BetweenFactor` (optional) | `/scan_deskewed` + scan storage | Candidate search around new nodes; gated on `use_loop_closure:=true` **and** a persisted graph file existing on disk (the first session cannot loop-close against itself). |
+| Wheel between-factor | `/wheel_odom` | Body-frame, distance-scaled, non-holonomic covariance. |
+| Gyro between-factor | `/imu/data` | Integrated yaw rate, with stationary bias estimation. |
+| `GnssLeverArmFactor` | `/gps/fix` | Datum projection and antenna offset are handled inside the node; non-Fixed positions use a robust model. |
+| Yaw unary | `/imu/cog_heading`, optional `/imu/mag_yaw` | COG is motion/RTK gated; magnetometer is opt-in. |
+| LiDAR XY prior | `/scan_deskewed` | Only after a complete GNSS outage and only if candidate validation succeeds. |
 
-**Public surface:**
-
-- **Topics**:
-  - `/fusion_graph/diagnostics` (`diagnostic_msgs/DiagnosticArray`, 1 Hz) — `total_nodes`, `scans_attached`, `loop_closures`, `scans_received`, `scan_matches_ok`, `scan_matches_fail`, `cov_xx`, `cov_yy`, `cov_yawyaw`, plus keyframe (`keyframes_total`, `kf_matches_ok|fail`), gate (`gps_rejects_wrongfix`, `slip_veto`, `stationary_hand_push`) and ICP-reject counters. Surfaced in the GUI's *Diagnostics → Fusion Graph (iSAM2)* panel.
-  - `/fusion_graph/markers` (`visualization_msgs/MarkerArray`, 1 Hz, transient_local) — node positions, trajectory, loop-closure edges (decimated to ≤1500 nodes).
-  - `/imu/fg_yaw` (`sensor_msgs/Imu`, 10 Hz) — yaw-only output exposed for downstream consumers / diagnostics.
-- **Services** (both `std_srvs/Trigger`):
-  - `~/save_graph` — persists graph (XML), per-node scans (binary), and metadata (datum + indices) to `/ros2_ws/maps/fusion_graph.{graph,scans,meta}`. Auto-fires on RECORDING→IDLE, on dock arrival, and every `periodic_save_period_s` (default 5 min) during AUTONOMOUS state.
-  - `~/clear_graph` — wipes iSAM2 + scans + queues. The next valid pose seed (GPS, set_pose, or scan-match relocalization) re-initializes.
-- **Parameter knobs** worth knowing: `node_period_s` (the yaml carries 0.02 = 50 Hz, but `navigation.launch.py` overrides it from `mowgli_robot.yaml` — 0.04 = 25 Hz is the deployed hardware cadence), `wheel_sigma_*`, `gyro_sigma_theta`, `gps_sigma_floor`, `cov_update_every_n`, `isam2_relinearize_skip`, `isam2_rebase_every_nodes`, `scan_retention_nodes`, plus the LC / ICP block (`lc_max_dist_m`, `lc_min_age_s`, `icp_max_iter`, …). All declared at startup; no dynamic_reconfigure.
-
-**State persistence:**
-- On disk: `<graph_save_prefix>.graph` (gtsam serialised Values), `.scans` (per-node Eigen `Vector2d` blobs), `.meta` (next index, last node time, datum lat/lon).
-- On startup: if `autoload_graph:=true` and the files exist, the node resumes from the last-saved state; subsequent ticks add nodes after the highest loaded index. This is what makes "park the robot, restart ROS2, resume mowing" work without losing the graph.
-
-**Why it exists:** a plain EKF treats GPS as an unbiased XY observation and times out cleanly during dropouts, but has no mechanism to use LiDAR for an absolute pose lock — which is why the previous robot_localization dual EKF was replaced. The factor graph adds scan between-factors and loop-closure factors on top of the same GPS / wheel / IMU fusion, at the cost of a richer node and a non-trivial CPU budget (~5 ms/tick on a Pi 4 with scan matching enabled).
+Public outputs include `/fusion_graph/diagnostics`, `/fusion_graph/lidar_map`, `/fusion_graph/lidar_anchor_candidate`, `/fusion_graph/markers`, `/imu/fg_yaw`, and the two odometry topics. `~/save_graph`, `~/clear_graph`, and `~/clear_lidar_map` are `std_srvs/Trigger` services. Graph state uses `<graph_save_prefix>.graph` and `.meta`; persistent submaps live under `<graph_save_prefix>.lidartiles`, with legacy `.lidarmap` import only for migration. Save/rebase/tile I/O work is asynchronous.
 
 ---
 
@@ -908,7 +889,7 @@ Starts (in order):
 #### Configuration Files
 
 **hardware_bridge.yaml** – Serial communication, IMU cal sample count.
-**fusion_graph.yaml** (`ros2/src/fusion_graph/config/`) – Factor-graph tuning: node cadence, wheel/gyro/GPS sigmas, lever-arm, COG/mag gates, iSAM2 knobs, LiDAR scan-matching / loop-closure block.
+**fusion_graph.yaml** (`ros2/src/fusion_graph/config/`) – Factor-graph tuning: node cadence, wheel/gyro/GPS sigmas, lever arm, COG/mag gates, iSAM2 knobs, and the persistent LiDAR map anchor.
 **nav2_params_base.yaml** – Shared Nav2 base (costmaps, planner, controller) deep-merged with one overlay.
 **nav2_params_lidar.yaml** / **nav2_params_no_lidar.yaml** – Thin overlays for the LiDAR vs GPS-only variants (obstacle vs static layers, scan-based vs pass-through collision_monitor).
 **twist_mux.yaml** – Velocity command multiplexing (nav < teleop < emergency).
@@ -1118,7 +1099,6 @@ FollowCoveragePath:                         # coverage
   obstacle_footprint: true
   use_footprint_clearance: false            # field: full-footprint sweep too conservative
   require_clear_exit: true                  # cul-de-sac guard — do not skirt a wall
-  ignore_obstacles_outside_zone: true
   enable_obstacle_deviation: true
   max_lateral_deviation: 1.5                # overridden from max_obstacle_avoidance_distance
   obstacle_wait_timeout_s: 2.5
@@ -1566,8 +1546,12 @@ The legacy on-demand strip planner (`~/get_next_strip` service and its `GetNextS
 
 ```yaml
 tool_width: 0.18            # m – single source: map_server stamp + F2C operation_width
-coverage_xy_tolerance: 0.05 # m – must stay < tool_width (capped at 0.15 in launch)
-mowing_speed: 0.5           # m/s – injected into FollowCoveragePath.speed_fast
+coverage_xy_tolerance: 0.50 # m – must stay >= FTC max_goal_distance_error (0.50).
+                            # navigation.launch.py FLOORS it at that value; it is
+                            # NOT capped. FTC parks up to max_goal_distance_error
+                            # short of the final pose, so a TIGHTER gate is never
+                            # satisfied and the area is re-mowed (err 105).
+mowing_speed: 0.2           # m/s – injected into FollowCoveragePath.speed_fast
 ```
 
 `nav2_params.yaml`:
@@ -1765,7 +1749,7 @@ Simulation Stack (webots_ros2_driver + ros2_control)
 | `ros2 launch mowgli_simulation webots_minimal.launch.py` | Webots + the world + ros2_control only, no Nav2 stack. `world:=` selects a file inside `worlds_webots/` |
 | `cd ros2 && make e2e-test` | Self-contained: `sim-stop`, build, launch the sim, wait, run `src/e2e_test.py`, stop the sim |
 
-**Container:** the `simulation` Docker stage (`ros2/Dockerfile`) extends `runtime` with Xvfb, TigerVNC + noVNC for GUI access, `ros-kilted-webots-ros2`, and the Webots release `.deb`. Cyberbotics publishes that `.deb` for **linux/amd64 only**, and the stage asserts `TARGETARCH = amd64`, so the simulation image cannot be built on ARM (Apple Silicon or a Raspberry Pi needs emulation or an x86 host). The `runtime` image stays architecture-neutral.
+**Container:** the `simulation` Docker stage (`ros2/Dockerfile`) extends `runtime` with Xvfb, TigerVNC + noVNC for GUI access, `webots_ros2` built from a pinned source revision, and the Webots release `.deb`. Cyberbotics publishes that `.deb` for **linux/amd64 only**, and the stage asserts `TARGETARCH = amd64`, so the simulation image cannot be built on ARM (Apple Silicon or a Raspberry Pi needs emulation or an x86 host). The `runtime` image stays architecture-neutral.
 
 **After any crash, run `make sim-stop` before relaunching** — a stale Webots IPC socket or leftover Cyclone DDS shared memory hangs the next launch in a retry loop.
 
@@ -2036,9 +2020,9 @@ The one sim-only addition is `/sim/ground_truth_pose`, published by the `kinemat
 | `/wheel_odom` | nav_msgs/Odometry | hardware_bridge_node | ~10 Hz | Integrated wheel velocities (RELIABLE; tight vy covariance enforces non-holonomic constraint) |
 | `/gps/fix` | sensor_msgs/NavSatFix | ublox_nav_sat_fix_hp_node | 5 Hz | RTK Fixed when available (σ ~3 mm) |
 | `/gps/absolute_pose` | geometry_msgs/PoseWithCovarianceStamped | navsat_to_absolute_pose_node | 5 Hz | RTK position converted to local ENU (diagnostics / BT) |
-| `/odometry/filtered_map` | nav_msgs/Odometry | fusion_graph_node | factor-graph cadence | Fused pose (map frame, GPS-corrected; LiDAR-aware when scan matching is enabled) |
-| `/fusion_graph/diagnostics` | diagnostic_msgs/DiagnosticArray | fusion_graph_node | 1 Hz | Factor-graph health (total_nodes, scan-match success, loop closures, cov_xx/yy) |
-| `/fusion_graph/markers` | visualization_msgs/MarkerArray | fusion_graph_node | 1 Hz | Node positions, trajectory, loop-closure edges |
+| `/odometry/filtered_map` | nav_msgs/Odometry | fusion_graph_node | factor-graph cadence | Fused map-frame pose from GNSS, wheels, gyro and optional LiDAR outage anchor |
+| `/fusion_graph/diagnostics` | diagnostic_msgs/DiagnosticArray | fusion_graph_node | 1 Hz | Graph covariance, GNSS gates, slip/gyro state, LiDAR tile/filter/anchor telemetry |
+| `/fusion_graph/markers` | visualization_msgs/MarkerArray | fusion_graph_node | 1 Hz | Graph nodes and trajectory |
 | `/localization/status` | diagnostic_msgs/DiagnosticStatus | localization_monitor_node | 2 Hz | GPS quality + localizer health |
 | `/plan_coverage/_action/feedback` and `/plan_coverage/_action/result` | mowgli_interfaces/action/PlanCoverage | mowgli_coverage (coverage_server) | Per BT PlanCoverageArea call | F2C v3 plan: typed segments + hole-free `drivable_subpaths` + `full_path` — each sub-path is driven by the FollowStrip BT node as one FollowCoveragePath goal |
 | `/path` | nav_msgs/Path | planner_server (Nav2) | 1 Hz | Global path from Nav2 planner |
@@ -2052,12 +2036,12 @@ The one sim-only addition is `/sim/ground_truth_pose`, published by the `kinemat
 | Topic | Subscriber | Purpose |
 |-------|-----------|---------|
 | `/cmd_vel` | hardware_bridge_node (real); `kinematic_drive.py` Supervisor (Webots sim) | Motor/wheel commands |
-| `/scan` | fusion_graph_node (when use_scan_matching/use_loop_closure), collision_monitor, obstacle_layer, diagnostics_node | Scan-matching factors, obstacle detection, monitoring |
+| `/scan` | fusion_graph_node (when `use_lidar_map_anchor`), collision_monitor, obstacle_layer, diagnostics_node | Persistent submap learning/outage localization, obstacle detection, monitoring |
 | `/imu/data` | fusion_graph_node, diagnostics_node | Sensor fusion (gyro between-factor) + monitoring |
 | `/wheel_odom` | fusion_graph_node, controller_server (odom_topic), diagnostics_node | Wheel between-factor + FTC/RPP velocity feedback + monitoring |
 | `/gps/fix` | fusion_graph_node | GnssLeverArmFactor (projects lat/lon in-node; the graph's GNSS input) |
 | `/gps/pose_cov` | map_server_node | RTK-quality gate for `~/set_docking_point`; also GUI/BT |
-| `/odometry/filtered_map` | nav2 (bt_navigator), BT, diagnostics_node, GUI | Localized pose for control, behavior tree, diagnostics |
+| `/odometry/filtered_map` | nav_msgs/Odometry | fusion_graph_node | factor-graph cadence | Fused map-frame pose from GNSS, wheels, gyro and optional LiDAR outage anchor |
 | `/map` | nav2 planner, behavior_tree (area polygons), diagnostics_node | Global navigation reference (area-polygon grid) |
 | `/gps/fix` | navsat_to_absolute_pose_node, diagnostics_node | Convert fix to local frame, monitor GPS |
 | `/status` | behavior_tree_node, localization_monitor_node, diagnostics_node | Health checks, sensor freshness |
@@ -2103,7 +2087,7 @@ The one sim-only addition is `/sim/ground_truth_pose`, published by the `kinemat
    - **Infrastructure:** mowgli_bringup (launch files, the config template, Nav2 params, and the URDF/xacro — there is no separate `mowgli_description` package)
    - **Third-party:** `opennav_coverage` git submodule for the `_msgs` action definitions only — that is the sole subpackage `ros2/scripts/sync_workspace_packages.sh` symlinks into the workspace, so colcon never sees the upstream servers (there are no `COLCON_IGNORE` files).
 
-2. **ROS2 Kilted + Webots R2025a:** Modern robotics stack with lifecycle management, and a simulator that runs the identical ROS2 stack (see [§9](#9-mowgli_simulation)).
+2. **ROS2 Lyrical + Webots R2025a:** Modern robotics stack with lifecycle management, and a simulator that runs the identical ROS2 stack (see [§9](#9-mowgli_simulation)).
 
 3. **Decoupled Communication:** ROS2 pub/sub (topics), services, and actions isolate packages. Easy to substitute, test, or extend components independently.
 
@@ -2125,10 +2109,9 @@ The one sim-only addition is `/sim/ground_truth_pose`, published by the `kinemat
      Kinematic-ICP, and FusionCore were all removed.
    - No SLAM back-end. The map frame is GPS-anchored; saved area polygons,
      dock pose, and the persisted graph survive restarts.
-   - Graceful degradation: operates without GPS in GNSS-denied areas
-     (wheel + gyro dead-reckoning; with LiDAR `use_scan_matching` /
-     `use_loop_closure` on, scan-matching between-factors keep the map-frame
-     estimate stable across multi-minute RTK-Float windows).
+   - During a complete GNSS outage, wheel + gyro dead reckoning remains active;
+     if enabled, the persistent LiDAR map anchor may add validated XY-only
+     factors after its warm-up and application delays.
 
 6. **Coverage Path Following:** `FollowCoveragePath` = `mowgli_nav2_plugins/FTCController`
    standalone (no RotationShim), fed ONE whole continuous `drivable_subpath`:

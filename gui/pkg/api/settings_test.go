@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mowglinext/mowglinext/pkg/types"
 	"github.com/gin-gonic/gin"
+	"github.com/mowglinext/mowglinext/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -768,6 +768,37 @@ func TestApplyUniversalGnssCompatibility_DeletesEmptyNormalizedReceiverModel(t *
 	assert.False(t, exists)
 }
 
+func TestApplyUniversalGnssCompatibility_RemovesUnicoreOverridesForUblox(t *testing.T) {
+	flat := map[string]any{
+		"gnss_receiver_family":    "ublox",
+		"gnss_receiver_model":     "UM982",
+		"gnss_signal_group":       "3 6",
+		"gnss_rover_dynamic_mode": "uav",
+	}
+
+	applyUniversalGnssCompatibility(flat, gnssTestSchemaDefaults())
+
+	for _, key := range []string{"gnss_receiver_model", "gnss_signal_group", "gnss_rover_dynamic_mode"} {
+		_, exists := flat[key]
+		assert.False(t, exists, key)
+	}
+}
+
+func TestApplyUniversalGnssCompatibility_PreservesUnicoreOverridesForAuto(t *testing.T) {
+	flat := map[string]any{
+		"gnss_receiver_family":    "auto",
+		"gnss_receiver_model":     "UM982",
+		"gnss_signal_group":       "3 6",
+		"gnss_rover_dynamic_mode": "uav",
+	}
+
+	applyUniversalGnssCompatibility(flat, gnssTestSchemaDefaults())
+
+	assert.Equal(t, "UM982", flat["gnss_receiver_model"])
+	assert.Equal(t, "3 6", flat["gnss_signal_group"])
+	assert.Equal(t, "uav", flat["gnss_rover_dynamic_mode"])
+}
+
 func TestPostSettingsYAML_DoesNotMaterializeAbsentGnssDefaults(t *testing.T) {
 	// Use the real schema so this proves the fix against the actual schema
 	// defaults, not a test stub.
@@ -878,6 +909,65 @@ func TestGetSettingsYAML_UsesEnvFallbackForFamilyDeviceAndBaudWhenYAMLIsMissing(
 	assert.Equal(t, "unicore", response["gnss_receiver_family"])
 	assert.Equal(t, "/dev/serial/by-id/usb-fallback", response["gnss_serial_device"])
 	assert.Equal(t, float64(460800), response["gnss_serial_baud"])
+}
+
+func TestGetSettingsYAML_NTRIPEnvFallbackIsBoolean(t *testing.T) {
+	chdirToGuiRoot(t)
+	resetSchemaCache()
+	t.Cleanup(resetSchemaCache)
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"false", false}, {"0", false}, {"off", false}, {"no", false},
+		{"true", true}, {"1", true}, {" ON ", true}, {"yes", true}, {"Y", true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			yamlFile := createTempYAMLFile(t, "")
+			envFile := createTempConfigFile(t, "GNSS_NTRIP_ENABLED="+tc.value+"\nGNSS_NTRIP_GGA_ENABLED="+tc.value+"\n")
+			db := types.NewMockDBProvider()
+			db.Set("system.mower.yamlConfigFile", []byte(yamlFile))
+			db.Set("system.mower.runtimeEnvFile", []byte(envFile))
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "/api/settings/yaml", nil)
+			setupSettingsRouter(db).ServeHTTP(w, req)
+			require.Equal(t, http.StatusOK, w.Code)
+			var response map[string]any
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+			assert.Equal(t, tc.want, response["ntrip_enabled"])
+			assert.Equal(t, tc.want, response["gnss_ntrip_gga_enabled"])
+		})
+	}
+}
+
+func TestPostSettingsYAML_NTRIPDisableSurvivesReloadAfterDefaultPruning(t *testing.T) {
+	chdirToGuiRoot(t)
+	resetSchemaCache()
+	t.Cleanup(resetSchemaCache)
+	yamlFile := createTempYAMLFileAtGuiRoot(t, "mowgli:\n  ros__parameters:\n    ntrip_enabled: true\n")
+	envFile := createTempConfigFileAtGuiRoot(t, "GNSS_NTRIP_ENABLED=true\n")
+	db := types.NewMockDBProvider()
+	db.Set("system.mower.yamlConfigFile", []byte(yamlFile))
+	db.Set("system.mower.runtimeEnvFile", []byte(envFile))
+	router := setupSettingsRouter(db)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/settings/yaml", strings.NewReader(`{"ntrip_enabled":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	content, err := os.ReadFile(yamlFile)
+	require.NoError(t, err)
+	assert.NotContains(t, string(content), "ntrip_enabled:")
+	env, err := os.ReadFile(envFile)
+	require.NoError(t, err)
+	assert.Contains(t, string(env), "GNSS_NTRIP_ENABLED=false")
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/api/settings/yaml", nil)
+	router.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, false, response["ntrip_enabled"])
 }
 
 func TestGetSettingsYAML_KeepsExplicitNTRIPDisableOverEnvFallback(t *testing.T) {
@@ -1039,6 +1129,13 @@ func TestPostSettingsYAMLPrunesRetiredKeys(t *testing.T) {
     outline_passes: 3
     motor_temp_high_c: 80.0
     mow_angle_increment_deg: 15.0
+    ticks_per_revolution: 84
+    use_scan_matching: true
+    use_loop_closure: true
+    icp_max_iter: 30
+    lc_max_dist_m: 5.0
+    lidar_map_half_extent_m: 80.0
+    use_lidar_map_anchor: true
     mowing_speed: 0.55
 `)
 	envFile := createTempConfigFileAtGuiRoot(t, "")
@@ -1062,10 +1159,11 @@ func TestPostSettingsYAMLPrunesRetiredKeys(t *testing.T) {
 
 	content, err := os.ReadFile(yamlFile)
 	require.NoError(t, err)
-	for _, retired := range []string{"outline_passes", "motor_temp_high_c", "mow_angle_increment_deg"} {
+	for _, retired := range []string{"outline_passes", "motor_temp_high_c", "mow_angle_increment_deg", "ticks_per_revolution", "use_scan_matching", "use_loop_closure", "icp_max_iter", "lc_max_dist_m", "lidar_map_half_extent_m"} {
 		assert.NotContains(t, string(content), retired,
 			"retired key %s must be scrubbed from the installed YAML", retired)
 	}
+	assert.Contains(t, string(content), "use_lidar_map_anchor: true")
 	// A real operator override (0.55 != the 0.2 default) must survive.
 	assert.Contains(t, string(content), "mowing_speed: 0.55")
 }
