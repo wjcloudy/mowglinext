@@ -166,6 +166,34 @@ this on .118: the installed st-flash 1.7.0 failed during programming, and OpenOC
 was needed to recover. The default PlatformIO upload command is unchanged;
 use the explicit helper above for this procedure.
 
+
+### If the onboard I2C bus remains stuck after reset
+
+On .118 with diagnostics firmware `0df13383` / 1.11.13 on 19 September 2026,
+the first flash left I2C1 busy (`SR2=0x0002`, SCL high, SDA low). Ordinary MCU
+reset did not clear it. The tilt-sensor read delayed the main loop, IMU output
+fell to about 33 Hz, and blade status was starved (temperature displayed zero).
+ITM and PB3 trace were already disabled. This is distinct from the trace issue.
+
+With the bridge stopped and blades removed, the standalone recovery helper
+resets/halts the MCU (PWM reset), releases PB6/PB7 as open-drain pins, clocks
+nine SCL pulses, emits STOP and verifies both lines high before restarting:
+
+```sh
+sudo openocd -f /absolute/path/yardforce500b_recover_i2c.cfg
+```
+
+It does not flash firmware or bypass a safety input. Failed line checks leave
+the CPU halted; investigate the bus instead of blindly resuming. Restart the
+bridge only after success and verify fresh blade status, IMU samples and power
+telemetry. On that exact .118 build, this restored about 88 Hz IMU output,
+22.5 C blade temperature, charging around 1.8 A and the SFTRST reset cause,
+without a physical power cycle. The firmware binary SHA256 was
+`52b7930bc5b3e66ff52dc633c234f6fa9530ecbc5f34392a44edcedba286679f`.
+This validates recovery on that board/build, not blade reversal timing or a
+change to the charging profile. Full evidence is retained in the deployment
+`2026-09-19_lfp-blade_0df13383` on .118.
+
 ## Charging contact-loss protection
 
 The September charging-only overlay stops duty on acquired input loss, requires
