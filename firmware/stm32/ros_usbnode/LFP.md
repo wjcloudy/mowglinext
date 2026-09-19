@@ -1,25 +1,41 @@
 # Custom Yardforce 500B LFP firmware
 
-Updated onto upstream `dev` at `5cb07fabb72f4c1a8a31cc8857eb61814cbe986c`
-(5 September 2026). Both branches retain the custom 8S LiFePO4 charging and
-500B hardware changes. Protocol v6, firmware build identification, runtime
-kinematics and safety limits, yaw control, anti-dig and emergency aborts come
-from current upstream.
+All three branches include upstream `dev` at `e36ecea9` and the blade reversal
+fix from PR #559 at `ac5d167b` (19 September 2026). The LFP charging profile,
+ADC selection and custom 500B hardware behavior remain branch-specific.
 
 ## Branches and builds
 
-| Branch | Charging ADC | Build |
+| Branch | Purpose | Build environment |
 | --- | --- | --- |
-| `fix/wheel-pi-ticks-lfp-adc` | Circular DMA; average 8 battery/charge-voltage scans | `pio run -e Yardforce500B_LFP` |
-| `fix/wheel-pi-ticks-lfp` | Per-conversion interrupt; average samples collected in each 10 ms window | `pio run -e Yardforce500B_LFP` |
+| `fix/wheel-pi-ticks-lfp` | Interrupt ADC; average each 10 ms window | `Yardforce500B_LFP` |
+| `fix/wheel-pi-ticks-lfp-adc` | Circular DMA; average 8 voltage scans | `Yardforce500B_LFP` |
+| `codex/lfp-charge-early-capture` | DMA plus charge diagnostics / early-capture investigation; .118 deployment line | `Yardforce500B_LFP_DIAG` |
 
-The `-lfp-adc` branch is the newest reference (`185f1306` before this merge).
-Its DMA acquisition also applies to the plain 500B target, without LFP
-oversampling. The interrupt branch additionally retains
-`Yardforce500B_LFP_DEBUG`, with `-Og -g3` and the original remote debug endpoint.
-Both branches otherwise share the charging logic and custom hardware features.
-The LFP environment inherits the upstream 500B toolchain and build-id hook.
-Select it explicitly: the default `pio run` target remains the stock 500.
+Select the environment explicitly with `pio run -e <environment>`; the default
+remains the stock 500. The interrupt branch also retains `Yardforce500B_LFP_DEBUG`.
+The diagnostics environment retains recorder ABI 2 and the PWM ceiling of 1390.
+Use its matching ELF when obtaining recorder addresses; never reuse an address
+from another build. Plain LFP builds omit the diagnostic recorder.
+
+## Blade reversal synchronization
+
+The production driver and regression harness come from PR #559, including
+continued receive/error handling while TX is busy and release only on a newly
+received qualifying ESC reply. Reversal keeps OFF for at least 1 second and
+requires inactive, error-free zero reports spanning at least 300 ms; stale or
+invalid replies cannot release it. Pending reversal has no forced timeout.
+
+The ESC speed word is not a verified live coast-down measurement. The observed
+500 holds its last value after OFF before clearing it. See
+[BLADE-REVERSE.md](BLADE-REVERSE.md) for the exact 500 test baseline; this does not
+establish physical stop timing on the 500B or validate the new LFP combination.
+The native blade harness also compiles with the real LFP board selection.
+500B reversal timing remains HARDWARE_REQUIRED: use the exact deployed commit,
+ELF/binary hashes and ESC revision, with blades removed, wheels raised, a clear
+rotor and an accessible cutoff. Observe forward/OFF/reverse/OFF and confirm the
+rotor physically stops before opposite rotation; retain USB telemetry alongside
+that observation. A firmware flash alone does not satisfy this acceptance test.
 
 ## Preserved charge profile
 
@@ -159,7 +175,7 @@ for the hooks, constants, branch differences and upstream merge checklist.
 
 ## ADC fault handling
 
-Both branches hold charge PWM at zero until ADC input is valid. A start/rearm
+All three branches hold charge PWM at zero until ADC input is valid. A start/rearm
 failure, ADC error, or more than 30 ms without acquisition progress latches
 charging off until reboot. The normal 10 ms controller cadence checks that
 deadline; this is not an asynchronous hardware cutoff. The charge counter stops
@@ -175,7 +191,7 @@ excludes a row being overwritten. A snapshot
 that moves while copied is discarded, and persistent snapshot failure also
 expires input freshness. The IRQ branch tracks completion of all five channels.
 
-The fixed -0.20 A Pi/electronics compensation is retained on both branches.
+The fixed -0.20 A Pi/electronics compensation is retained on all three branches.
 Charge-counter accounting is unchanged pending confirmation of whether that
 counter should include the electronics' consumption: it currently subtracts
 the offset again after the ADC current correction.
@@ -188,6 +204,7 @@ Run as the normal project user:
 python3 firmware/scripts/board_defaults_parity.py
 python3 firmware/scripts/protocol_version_guard.py --check
 python3 firmware/scripts/sync_ros_lib.py --check
+python3 firmware/scripts/test_blade_reverse.py
 python3 firmware/scripts/test_lfp_charger.py
 python3 firmware/scripts/test_adc_charging.py
 ```
