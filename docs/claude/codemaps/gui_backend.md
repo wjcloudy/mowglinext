@@ -33,7 +33,7 @@ See `docs/UPDATE_CHECKS.md` for the behavior.
 | Push notification missing / wrong / duplicated | `gui/pkg/providers/notify_events.go` (`NotifyDetector.OnStatus` — session + zone + failure-state machine, 60 s per-message cooldown, 120 s RTK dwell), wording `notify_messages.go` (`notifyCatalogue` en/fr), channels `notify_senders.go` (Telegram / Pushover / ntfy / webhook, all via `github.com/nikoksr/notify`), provider `notify.go` (fed from `ros.go` `fanOut` on `highLevelStatus` + `map`), DB keys `notify_config.go`, API `gui/pkg/api/notifications.go` |
 | Session statistics wrong | `gui/pkg/providers/session_tracker.go` (`OnHighLevelStatus` `:174`, `OnOdometry` `:138`, DB key `mowing.sessions` `:80`); read/delete in `gui/pkg/api/diagnostics.go:332-443` |
 | Map polling / dock pose shown on map | `gui/pkg/providers/ros.go:351-468` (`initDockPoseSubscription`, `pollMap` every 5 s → virtual `"map"` topic) |
-| Map save / replace / OpenMower import | `gui/pkg/api/mowglinext.go:156-229` (`mapWriteBudget`, `replaceMapInternal`), `gui/pkg/api/openmower_import.go` (`postImportOpenMower` `:187`, reprojection `:497-596`, `gui/pkg/api/utm.go`) |
+| Map save / replace / OpenMower import | `gui/pkg/api/map_replace.go` (`replaceMapInternal`: read-back snapshot → clear → add×N → `save_areas`, per-call deadline `mapServiceCallTimeout`, rollback to the snapshot on failure, `mapWriteBudget`; tests `map_replace_test.go` with an in-memory `fakeMapServer`), route `ReplaceMapRoute` in `gui/pkg/api/mowglinext.go`, `gui/pkg/api/openmower_import.go` (`postImportOpenMower` `:187`, reprojection `:497-596`, `gui/pkg/api/utm.go`) |
 | Container list / logs / restart | `gui/pkg/api/containers.go` (WS log stream `:128`, `StreamContainerLogLines` `:196`), `gui/pkg/providers/docker.go` |
 | Firmware flash (prebuilt / custom / Vermut) | `gui/pkg/providers/firmware.go` (`FlashFirmware` `:76` routing, `flashPrebuilt` `:258`, `postFlashProtocolCheck` `:322`), manifest `firmware_manifest.go:21`, template `gui/asserts/board.h.template`, SSE route `gui/pkg/api/setup.go:27` |
 | Drive PID / feed-forward tuning tool | `gui/pkg/api/drive_tuning.go` (`docker exec` into `mowgli-ros2` → `ros2 run mowgli_tools tune_drive_pid`, `:829-842`; reports under `/ros2_ws/config/drive_tuning`) |
@@ -43,6 +43,8 @@ See `docs/UPDATE_CHECKS.md` for the behavior.
 | Live ROS param read/write (no restart) | `gui/pkg/api/params.go` → `ros.go:555-570` → `foxglove/parameters.go` |
 | MQTT / HomeKit bridge | `gui/pkg/providers/mqtt.go` (embedded mochi broker, `<prefix>/<key>` + `<prefix>/call<service>`), `gui/pkg/providers/homekit.go` (hap switch, `:8000`, pin `system.homekit.pincode`) |
 | Static bundle / gzip sidecars / SPA fallback | `gui/pkg/api/web_static.go` (`registerWebUI`), gzip produced in `gui/Dockerfile:10-12` |
+| Fleet: identity, peer registry, peer mirror, command proxy, map push | `gui/pkg/providers/fleet_identity.go` (`robot_name` from yaml, `fleet.robot_id`), `fleet.go` (`fleet.peers`, symmetric add/remove, `Robots()` snapshot, `Call()` proxy allowlist), `fleet_peer_client.go` (WebSocket mirror of a peer's multiplex), `fleet_map.go` (`PushMap`); routes `gui/pkg/api/fleet.go`; two-robot in-process tests `gui/pkg/api/fleet_test.go` |
+| Coordinated mowing (area assignment, completed memory, peer poses, yield rule) | `gui/pkg/providers/fleet_coordinator_logic.go` (pure: `computeAssignment`, `updateCompletedMemory`, `decideYield`), `fleet_coordinator.go` (2 s loop, DB keys `fleet.coordination` / `fleet.session.completed`, pushes `~/set_fleet_assignment`, publishes `/fleet/peers`); design in `docs/MULTI_ROBOT.md` |
 | Regenerate Go/TS msg types after a `.msg`/`.srv` change | `gui/generate_go_msgs.sh` → `gui/pkg/msgs/*/…_generated.go`; `gui/generate_ts_types.sh` → `gui/web/src/types/ros.generated.ts`; drift gate `.github/workflows/msg-codegen-drift.yml` |
 
 ## Files
@@ -109,7 +111,7 @@ See `docs/UPDATE_CHECKS.md` for the behavior.
 | `gui/pkg/providers/db.go` | 203 | bitcask DB, env fallbacks, defaults, corruption backup+recovery |
 | `gui/pkg/providers/irrisense_wetness.go` | 145 | Pure wetness rule (`EvaluateWetness`, `EvaluateZones`) |
 | `gui/pkg/providers/mqtt.go` | 144 | Embedded MQTT broker (`system.mqtt.host`, default `:1883`) bridging topics + 4 service calls |
-| `gui/pkg/providers/firmware_manifest.go` | 133 | Release `manifest.json` fetch, permutation lookup, sha256 download |
+| `gui/pkg/providers/firmware_manifest.go` | 190 | Release `manifest.json` fetch — from THIS installation's release (`buildinfo.Version` = `deployment-*` or `vX.Y.Z`; deployments attach their firmware in `deployment-release.yml`), falling back to `releases/latest` — permutation lookup, sha256 download. `AvailableFirmware` (`firmware.go`) serves `GET /api/setup/firmware/available` for the Updates page flash button |
 | `gui/pkg/providers/cmd_vel_relay.go` | 132 | Persistent WS client to `ws://localhost:8766` |
 | `gui/pkg/providers/irrisense_client.go` | 116 | HTTP client for `/api/ha/gardens[/{id}]` (401/404/429 mapped) |
 | `gui/pkg/providers/homekit.go` | 111 | HAP switch accessory ("MowgliNext"), on→START(1) / off→HOME(2) |
@@ -155,7 +157,7 @@ See `docs/UPDATE_CHECKS.md` for the behavior.
 | `POST /mowglinext/call/:command` | `gui/pkg/api/mowglinext.go:542` | see command table below |
 | `POST /mowglinext/map/area/add` | `mowglinext.go:99` | `/map_server_node/add_area` |
 | `DELETE /mowglinext/map` | `mowglinext.go:134` | `/map_server_node/clear_map` |
-| `PUT /mowglinext/map` | `mowglinext.go:211` | clear → add×N → `save_areas`, budget `mapWriteBudget` (60 s + 5 s/area, cap 6 min) |
+| `PUT /mowglinext/map` | `mowglinext.go` `ReplaceMapRoute` → `map_replace.go` | `get_mowing_area`×N (snapshot) → clear → add×N → `save_areas`; 60 s per call, overall `mapWriteBudget` (60 s + 5 s/area, cap 6 min); on failure the snapshot is restored and the 500 body says which step failed and what state the robot is in |
 | `POST /mowglinext/map/docking` | `mowglinext.go:253` | `/map_server_node/set_docking_point` |
 | `GET /mowglinext/subscribe/:topic` (WS) | `mowglinext.go:278` | one topic, base64 JSON text frames |
 | `GET /mowglinext/multiplex` (WS) | `mowglinext.go:361` | `{"op":"subscribe|unsubscribe","topic":key}` in, msgpack `{topic,data}` binary frames out |
@@ -254,6 +256,7 @@ Tests (what each pins):
 - `HighLevelControl` command numbers (`Command: 1/2`) in `scheduler.go`, `homekit.go` mirror `HighLevelControl.srv` constants — see `docs/claude/high-level-api.md`.
 - Host power actions need `pid: host` + `privileged` in `install/compose/docker-compose.gui.yml` and `util-linux` in `gui/Dockerfile`.
 - Swagger annotations (`// @Router`) feed `gui/docs/*` (swaggo) — regenerate when routes change (no script in repo invokes `swag`).
+- mowglinext#637 phase 3: `mowgli.MapArea.Id` (phase 1's stable id) must round-trip through `PUT /mowglinext/map`'s `MowgliMapArea` for `on_add_area` to preserve it — this is why `gui/docs/{swagger.json,swagger.yaml,docs.go}` and `web/src/api/Api.ts` all carry `MowgliMapArea.id` now (hand-added, `swag` isn't run). `splitMapAreas`/`pollMap` (`ros.go`) already pass every `MapArea` field through untouched, so the id needs no other backend wiring — only `WorkingAreaIndices` (the array position) is backend-computed, and it is NOT a stable identity.
 
 ## Pitfalls
 - `getSchema` opens `asserts/mower_config.schema.json` **relative to the process CWD** (`settings.go:1043`); run the binary from `gui/` (Dockerfile sets `WORKDIR /app`) or every settings route 500s. Tests call `chdirToGuiRoot`.

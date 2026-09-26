@@ -26,6 +26,35 @@ the bundled frontend) and not the GUI's own separate embedded MQTT broker
 3. Restart the ROS2 stack for the new params to take effect (`mqtt_bridge_node`'s parameters are
    read once at startup, like every other node here).
 
+### Home Assistant auto-discovery
+
+Turn on **Home Assistant auto-discovery** in the same settings section to publish one retained
+device discovery record at `homeassistant/device/<derived-id>/config`. Home Assistant then creates
+a single MowgliNext device containing:
+
+- lawn-mower state and the standard start, pause and dock controls;
+- one explicit **Mow &lt;area name&gt;** button for every current mowable area;
+- battery, coverage, GPS quality, RTK state and GPS location;
+- charging, emergency and rain indicators;
+- blade speed/current, battery voltage and charge current.
+
+The bridge republishes the record whenever it reconnects and whenever Home Assistant announces
+`online` on `homeassistant/status`. It also refreshes discovery when the polled mowable-area list
+changes, so area buttons appear, rename and disappear with the map. A button press publishes the
+area's current positional index to `<prefix>/start_area`; changing a map can reassign those indices,
+so each button's discovery identity includes both its index and name. Home Assistant replaces the
+button rather than silently leaving an existing automation aimed at a different physical area.
+
+An area is an explicit button instead of a select entity because changing an MQTT select sends its
+command immediately; choosing an item in a dropdown must not unexpectedly start a physical mower.
+Turning discovery off publishes an empty retained record for the current topic prefix, which removes
+the discovered device. Home Assistant's default discovery prefix (`homeassistant`) is used. Give
+each mower connected to one broker a distinct `mqtt_topic_prefix`; that prefix also supplies its
+stable Home Assistant device and entity IDs.
+
+Changing a mower's topic prefix changes its discovery ID. Turn discovery off and restart once
+before changing the prefix if the old retained device should be removed automatically.
+
 ## Security
 
 The bundled broker (`install/config/mqtt/mosquitto.conf`) allows **anonymous connections on both
@@ -41,16 +70,19 @@ unless noted otherwise. QoS 1 throughout.
 
 | Topic | Direction | Retained | Source | Rate |
 |-------|-----------|----------|--------|------|
-| `<prefix>/status` | out | yes | `/hardware_bridge/status` | on change |
-| `<prefix>/power` | out | yes | `/hardware_bridge/power` | on change |
-| `<prefix>/emergency` | out | yes | `/hardware_bridge/emergency` | on change |
-| `<prefix>/high_level_status` | out | yes | `/behavior_tree_node/high_level_status` | on change |
+| `<prefix>/status` | out | yes | `/hardware_bridge/status` | latest value, at most `publish_rate` Hz |
+| `<prefix>/power` | out | yes | `/hardware_bridge/power` | latest value, at most `publish_rate` Hz |
+| `<prefix>/emergency` | out | yes | `/hardware_bridge/emergency` | every ROS message (not rate-limited) |
+| `<prefix>/high_level_status` | out | yes | `/behavior_tree_node/high_level_status` | every ROS message (~1 Hz, not rate-limited) |
 | `<prefix>/position` | out | no | `/wheel_odom` (**odom frame**, not GPS) | `publish_rate` Hz |
 | `<prefix>/gps` | out | no | `/gps/fix` (raw `NavSatFix`) | `publish_rate` Hz |
-| `<prefix>/rtk_status` | out | yes | `/gps/status` (`GnssStatus`) | on change |
+| `<prefix>/pose` | out | no | `/odometry/filtered_map` (fused localizer pose, **map frame**) | latest value, at most `publish_rate` Hz |
+| `<prefix>/rtk_status` | out | yes | `/gps/status` (`GnssStatus`) | latest value, at most `publish_rate` Hz |
 | `<prefix>/area_boundary` | out | yes | `/map_server_node/get_mowing_area` (polled) | on change, polled every 10 s |
+| `<prefix>/coverage_path` | out | yes | `/coverage/full_plan` (latched) | on change |
 | `<prefix>/diagnostics` | out | no | `/diagnostics` | on change |
 | `<prefix>/available` | out | yes | connection state (LWT) | on connect/disconnect |
+| `<prefix>/host` | out | yes | the bridge's own LAN IP | once, on the first successful connect |
 | `<prefix>/areas` | out | yes | `/map_server_node/get_mowing_area` (polled) | ~every 10s |
 | `<prefix>/command` | **in** | no (retained deliveries rejected) | → `/behavior_tree_node/high_level_control` | — |
 | `<prefix>/start_area` | **in** | no (retained deliveries rejected) | → `/behavior_tree_node/start_in_area` | — |
@@ -203,9 +235,16 @@ directly, whose own population is backend-dependent and not guaranteed to be on 
       "boundary": [[1.234, -0.567], [10.0, -0.567], [10.0, 8.0], [1.234, 8.0]],
       "obstacles": [[[3.0, 2.0], [4.0, 2.0], [4.0, 3.0], [3.0, 3.0]]]
     }
-  ]
+  ],
+  "dock": {"x": 12.5, "y": -3.25, "yaw": 1.5708}
 }
 ```
+
+`dock` is the charging dock's pose in the same map frame (`dock_pose_x/y/yaw` from
+`mowgli_robot.yaml`; `yaw` in radians, the heading the robot has when docked). It is **omitted**
+when no dock is calibrated (all three values still at their `0/0/0` default) or any value is not
+finite. The bridge reads it at startup, like the other consumers of these keys, so a dock
+re-calibration shows up after a restart.
 
 Polygon geometry for every recorded mowing area, so an external tool (e.g. a Home Assistant map
 card) can render the boundary and obstacles the robot's own GUI shows. `datum_lat`/`datum_lon` are
@@ -226,6 +265,56 @@ not `index`, if you need to correlate with `<prefix>/areas`. The bridge polls
 `/map_server_node/get_mowing_area` every 10 seconds (index 0, 1, 2, … until the service reports
 `success: false`, capped at 100 areas) and only republishes (retained) when the serialised geometry
 actually changed, so a static map does not spam the broker.
+
+### `<prefix>/pose`
+
+```json
+{"x": 12.5, "y": -3.25, "yaw": 1.5708}
+```
+
+The mower's fused pose in the **map frame** — the same frame as the polygons in
+`<prefix>/area_boundary` and the `dock` there: `x` east, `y` north, in metres from the datum, `yaw`
+in radians counter-clockwise from east (−π…π]. It is `/odometry/filtered_map`, the localizer's
+canonical global pose, so it is smoother than the raw `<prefix>/gps` fix (which jitters, especially
+at the dock) and it carries a heading, which `<prefix>/gps` does not. It needs no datum to be
+placed on the `area_boundary` geometry. Not retained; a localizer that has not converged yet (non-
+finite values) publishes nothing.
+
+### `<prefix>/host`
+
+```json
+{"ip": "192.168.12.10"}
+```
+
+The mower's own LAN IP address, so an external tool can link to its GUI (`http://<ip>:4006`)
+without the operator having to enter it by hand. Detected once at startup (the same address a UDP
+socket would use to reach the internet, via a routing-table lookup that sends nothing and needs no
+actual connectivity — works offline) and published once, retained, on the first successful connect
+(a bridge reconnect does not republish it — the broker already retains the value). **Omitted
+entirely** when the robot has no default route at all (a fully static, isolated LAN) — treat a
+missing/absent topic, not an empty `ip`, as "not published"; an empty string is not sent either
+way, since the bridge skips publishing rather than sending one.
+
+### `<prefix>/coverage_path`
+
+```json
+{"points": [[1.234, -0.567], [2.5, -0.567], [2.5, 3.0], "..."]}
+```
+
+The current **planned** coverage path — headland rings, then serpentine swaths, concatenated — in
+the same map frame (metres, no datum needed) as `<prefix>/area_boundary`'s polygons, `<prefix>/pose`
+and `<prefix>/gps`'s projected position, so it overlays directly on them. Relay of
+`/coverage/full_plan` (`nav_msgs/Path`, latched by `behavior_tree_node` right after a
+`plan_coverage` call succeeds) — the same source the robot's own GUI map view draws, retained on
+this topic too so a client that connects mid-mow still gets the current plan immediately, and only
+republished when the plan actually changes (a new area, or a resumed/replanned run).
+
+**Gap caveat**: this is a raw concatenation of segments, not the joined `drivable_subpaths` the
+robot actually drives — consecutive points can be far apart where the plan jumps between segments
+that are not driven directly across (e.g. between a ring and the first swath, or across a
+hole/obstacle). Split the polyline wherever the distance between consecutive points exceeds a
+threshold (the GUI itself uses 0.75 m, `gui/web/src/pages/MapPage.tsx`'s `SUBPATH_GAP_M`) before
+drawing it, rather than connecting every point in order.
 
 ### `<prefix>/diagnostics`
 
@@ -328,5 +417,6 @@ Read once at startup (`ros2/src/mowgli_monitoring/include/mowgli_monitoring/mqtt
 | `mqtt_username` / `mqtt_password` | `""` / `""` | `mqtt_username` / `mqtt_password` |
 | `mqtt_topic_prefix` | `mowgli` | `mqtt_topic_prefix` |
 | `use_ssl` | `false` | `mqtt_use_ssl` |
+| `home_assistant_discovery_enabled` | `false` | `mqtt_home_assistant_discovery_enabled` |
 | `mqtt_client_id` | `mowgli_ros2` | package-share `mqtt_bridge.yaml` only (not on the GUI) |
-| `publish_rate` | `1.0` Hz | package-share `mqtt_bridge.yaml` only — also the position/gps rate limit and the MQTT network-loop tick period |
+| `publish_rate` | `1.0` Hz | package-share `mqtt_bridge.yaml` only — also the rate limit for position/gps/status/power/rtk_status. The MQTT network loop runs on its own fixed 50 ms timer, independent of this |

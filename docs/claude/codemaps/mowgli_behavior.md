@@ -20,6 +20,7 @@
 | Coverage loop (area iteration, plan, follow, resume) | `src/coverage_nodes.cpp`: `GetNextUnmowedArea` :1461+, `PlanCoverageArea` :1888+, `FollowStrip` :147-1240, `TransitToStrip` :1247+ |
 | Resume cursor / restart persistence | `src/coverage_persistence.cpp` (`saveCoverageResumeState` / `loadCoverageResumeState` / `clearCoverageResumeState`, file header `mowgli_coverage_resume v2`) + `behavior_tree_node.cpp` :91-118 (auto-continue on boot) |
 | Blade on/off during coverage & transit gap guard | `src/coverage_nodes.cpp` `FollowStrip::sendCurrentSwath` :600-690 (`kSegmentTransitGap` from `mowgli_interfaces/coverage_geometry.hpp:26`), `setBladeEnabled` :1118 |
+| Coverage-completion plausibility cross-check (issue #680) | `include/mowgli_behavior/mow_coverage_plausibility.hpp` (pure: `ComputeMowedFraction`, `PointInPolygon`, `kMinPlausibleMowedFraction`); `FollowStrip::checkCoveragePlausibility` (`src/coverage_nodes.cpp`, called from `advance()` when every swath is done) compares `ctx->latest_mow_progress` (subscribed `behavior_tree_node.cpp`, `/map_server_node/mow_progress`) against `ctx->current_area_polygon`/`current_area_obstacles` (populated by `PlanCoverageArea` alongside `current_strip_*`); sets `ctx->coverage_plausibility_warning`, folded into `HighLevelStatus.sub_state_name` as `"COVERAGE_INCOMPLETE"` by `status_snapshot.cpp`'s live-override projection; cleared by `EndSession` |
 | Obstacle detour inside a sub-path | `include/mowgli_behavior/detour_resume.hpp` (`decideDetour`, `footprintClear`) + `FollowStrip::tryStartDetour` `src/coverage_nodes.cpp` :1133+ |
 | LocalizationGuard signal (`WAITING_FOR_RTK`) | `include/mowgli_behavior/localization_health.hpp` (`LocalizationHealthMonitor`, `PersistentLatch`) + `behavior_tree_node.cpp` :285-295, :330-340, :427-474, `updateLocalizationHealthLocked` :658 |
 | BoundaryGuard soft recovery | `src/navigation_nodes.cpp` `NavigateInsideBoundary` :410-760 (get_recovery_point → keepout off → clear → nav → BackUp fallback → keepout on) |
@@ -42,7 +43,7 @@
 | File | Lines | Purpose |
 |------|-------|---------|
 | **`ros2/src/mowgli_behavior/`** | | |
-| `CMakeLists.txt` | 612 | One executable `behavior_tree_node`; 19 `ament_add_gtest` targets (each links only the `.cpp` it needs; two get `MOWGLI_MAIN_TREE_PATH` for structural XML checks) |
+| `CMakeLists.txt` | 612 | One executable `behavior_tree_node`; 20 `ament_add_gtest` targets (each links only the `.cpp` it needs; two get `MOWGLI_MAIN_TREE_PATH` for structural XML checks) |
 | `package.xml` | 41 | Deps: ament_index_cpp, rclcpp(_action), behaviortree_cpp, tf2*, nav2_msgs, nav_msgs, geometry_msgs, sensor_msgs, std_msgs, std_srvs, action_msgs, rcl_interfaces, mowgli_interfaces |
 | `config/behavior_tree.yaml` | 11 | `behavior_params` for both launch files: `tree_file`, `tick_rate`, `battery_low_pct`, `battery_critical_pct` (the two `_pct` keys are NOT declared param names — ignored) |
 | `config/behavior_tree_small_garden.yaml` | 12 | Same + `dock_pose` string; not referenced by any launch file |
@@ -50,9 +51,10 @@
 | `trees/navigate_to_pose.xml` | 79 | Nav2 `bt_navigator` tree: ControllerSelector/GoalCheckerSelector/PlannerSelector + replan only if path invalid, RoundRobin recovery |
 | **`include/mowgli_behavior/`** | | |
 | `action_nodes.hpp` | 33 | Umbrella header; declares `registerAllNodes()` |
-| `bt_context.hpp` | ~680 | `BTContext` shared via blackboard key `"context"`; `clearSingleAreaMode()`; dispatch budgets `kMaxAreaAttempts=5`, `kMaxStartBlockedAttempts=3`, `kMaxGuardHaltedPasses=200` |
+| `bt_context.hpp` | ~885 | `BTContext` shared via blackboard key `"context"`; `clearSingleAreaMode()`; dispatch budgets `kMaxAreaAttempts=5`, `kMaxStartBlockedAttempts=3`, `kMaxGuardHaltedPasses=30`; live `coverage_scan_paused` and `coverage_plausibility_warning` status overlays |
 | `condition_nodes.hpp` | 830 | 25 `BT::ConditionNode` classes + ports |
-| `coverage_nodes.hpp` | 600 | `FollowStrip`, `TransitToStrip`, `DetourAroundObstacle`, `GetNextUnmowedArea`, `PlanCoverageArea`; pure helpers `resolveResumeLocation`, `refreshSwathProgress`, `coveragePercentFromCursor`, `forwardSkipIndex`; `kMowAngleAutoDeg=-1` |
+| `coverage_nodes.hpp` | ~610 | `FollowStrip`, `TransitToStrip`, `DetourAroundObstacle`, `GetNextUnmowedArea`, `PlanCoverageArea`; pure helpers `resolveResumeLocation`, `refreshSwathProgress`, `coveragePercentFromCursor`, `forwardSkipIndex`; `kMowAngleAutoDeg=-1` |
+| `mow_coverage_plausibility.hpp` | ~180 | Pure, ROS-free: `ComputeMowedFraction`, `PointInPolygon`, `MowProgressGridView`, `kMinPlausibleMowedFraction=0.5`, `kMowedCellThreshold=50` (issue #680, coverage-completion cross-check) |
 | `navigation_nodes.hpp` | 389 | `StopMoving`, `ClearCostmap`, `SetNav2Lifecycle`, `NavigateToPose`, `BackUp`, `SetNavMode`, `NavigateInsideBoundary` (phase enum) |
 | `docking_nodes.hpp` | 147 | `DockRobot`, `UndockRobot`, `RecordResumeUndockFailure` |
 | `escape_nodes.hpp` | 147 | `EscapeStartBlocked` (`kBladeStateMaxAgeSec=2`, `kMaxTickDtSec=0.5`, `kSignalHoldoffSec=1`) |
@@ -65,6 +67,7 @@
 | `scan_pause.hpp` | 105 | Header-only blade pause across a SHORT LiDAR dropout (`ScanPauseStep`, `kScanPauseMaxAgeSec=1.0`, `kScanResumeFreshSec=0.5`): blade OFF, coverage goal kept, blade back after a continuous fresh window. Driven by `FollowStrip::stepScanPause`; the Root `IsScanStale` halt (`max_age_sec=20`) is the second stage. Field 2026-09-12 |
 | `transit_failure.hpp` | 178 | `TransitFailure` enum + `classifyTransitFailure(nav2 error_code)`; `isStartPoseBlocked` |
 | `detour_resume.hpp` | 233 | Header-only costmap footprint test + resume-pose search (`DetourCostmap`, `decideDetour`) |
+| `strip_progress.hpp` | ~130 | Header-only `advanceProgressCursor`: FollowStrip's monotonic progress cursor may advance at most `kMaxProgressAdvanceM` (1.0 m) of ARC LENGTH per update — a pose-count window (400 poses) jumped onto the neighbouring serpentine swath whenever the robot skirted more than half a spacing off its line (field 2026-09-22: units booked MOWED at ~80 %, ~20 m² never driven). Drives `path_progress_idx_` (resume cursor, 95 % completion, detour stuck index). Plus `findControllerRejoin`: when FTC's turn fallback rejoins the unit past a skipped turn it republishes the rest of the unit on `/controller_server/FollowCoveragePath/global_plan`; FollowStrip subscribes to that topic (`ControllerRejoin`, only messages stamped after the goal was sent) and jumps the cursor to the EXACT matching pose ahead (position + orientation within 1e-6, ≤ 12 m of arc) — the bounded search cannot follow such a jump (at a U-turn the cursor's own pose, abeam on the other swath, stays nearest for the rest of the unit). Tests: `test_strip_progress.cpp`, `test_follow_strip_dig.cpp::ControllerRejoinMovesTheProgressCursorPastTheSkippedTurn` |
 | `dig_skip.hpp` | ~245 | Header-only session dig skip zones (Invariant 16, the issue-#500 re-dig protection): `DigPoint`, `recordDigPoint`, `insideDigZone`, `nextDrivableRun` (drivable run outside every zone, by arc length), `DigSettleStep` (wait for the bridge's bounded reverse). Driven by `FollowStrip::stepDigRecovery` / `skipUnitFrontPastDigZones` |
 | `dock_alignment.hpp` | 129 | Header-only along/cross-track dock delta + `EvaluateDockYawDrift` (`kDockStagingRunwayM=1.5`, σ floor 0.035 rad) |
 | `coverage_persistence.hpp` | 59 | save/load/clear resume-state API |
@@ -81,7 +84,7 @@
 | `calibration_nodes.cpp` | 433 | Undock line-fit yaw → `/fusion_graph_node/set_pose`; forward-drive yaw seed |
 | `recording_nodes.cpp` | 515 | Area recording, DP simplification, save via `/map_server_node/add_area` |
 | `status_nodes.cpp` | 240 | Status publish, `EndSession` (session-scoped clears :159-215), `ClearCommand` |
-| `status_snapshot.cpp` | 58 | Tree-owned vs live field split for `HighLevelStatus` |
+| `status_snapshot.cpp` | ~88 | Tree-owned vs live field split for `HighLevelStatus`; three exceptions to `sub_state_name`'s passthrough, live-overridden from `BTContext`, in ascending priority: `"COVERAGE_INCOMPLETE"` from `coverage_plausibility_warning` (issue #680), `"TRANSIT"` from `transiting` (set by `FollowStrip`, `coverage_nodes.cpp`, consumed by `mowgli_leds`' `kTransit` ring pattern), and `"SCAN_PAUSED"` while stale LiDAR owns the blade-off hold — the safety state wins over a possibly one-tick-stale `TRANSIT` snapshot |
 | `utility_nodes.cpp` | 267 | Blade service, waits, `SaveObstacles`, `ResetEmergency` |
 | `coverage_persistence.cpp` | 219 | Text file `coverage_resume.txt` (atomic tmp+rename): `current_command`, `single_area_target`, `current_area`, `completed_areas`, per-`area` rows (pose_count, fingerprint, resume, completed swaths) |
 | `battery_filter.cpp` | 85 | Rate-independent low-pass on `v_battery` |
@@ -90,7 +93,7 @@
 | `test_obstacle_recovery.cpp` | 305 | 13 tests: `IsObstacleStuck` timing/cap/cooldown against latched collision state |
 | `test_docking_boundary_exempt.cpp` | 232 | 8 tests: `IsDocking` + BoundaryGuard blade-off dock-transit exemption |
 | `test_set_nav2_lifecycle.cpp` | 243 | 7 tests: `SetNav2Lifecycle` gating + fake `manage_nodes` transition |
-| `test_get_next_unmowed_area.cpp` | ~640 | 17 tests: nav-only areas skipped, START_OCCUPIED + guard-halted (`MarkGuardHalt`) passes exempt from the no-progress budget, targeted (`~/start_in_area`) runs stay clipped, `EndSession` boundary |
+| `test_get_next_unmowed_area.cpp` | ~1200 | 34 tests: nav-only areas skipped, START_OCCUPIED + guard-halted (`MarkGuardHalt`) passes exempt from the no-progress budget, targeted (`~/start_in_area`) runs stay clipped, `EndSession` boundary, fleet coordination (excluded areas skipped, preferred-start rotation + wrap, yielded pass exempt, `FollowStrip` yields mid-pass) |
 | `test_start_occupied_retry.cpp` | 348 | 13 tests: `classifyTransitFailure`, consume-once `IsCoverageStartBlocked`, structural check of `StartPoseBlockedRetry` in `main_tree.xml` |
 | `test_coverage_persistence.cpp` | 248 | 10 tests: round-trip, header/version, malformed rows, `current_command` restore |
 | `test_gnss_status_authority.cpp` | 56 | 2 tests: `mowgli_interfaces::gnss_status_utils` fix-type mapping the BT relies on |
@@ -104,9 +107,10 @@
 | `test_localization_health.cpp` | 419 | 16 tests: pivot σ inflation must NOT pause; plain-GPS fallback must; stale feed |
 | `test_battery_critical_resume.cpp` | 225 | 3 tests: critical-battery tail auto-continues, only dead charger ends session |
 | `test_guard_fallthrough.cpp` | ~360 | 6 tests: guard handlers return FAILURE + structural `<AlwaysFailure/>` check on every blocking guard in `main_tree.xml` + `<MarkGuardHalt/>` is the first handler child in `SensorSafetyGuard` / `LocalizationGuard` |
-| `test_high_level_status_snapshot.cpp` | 156 | 6 tests: republished status carries live battery/progress, tree-owned state untouched |
+| `test_high_level_status_snapshot.cpp` | ~250 | 12 tests: republished status carries live battery/progress, tree-owned state untouched, `transiting` overrides `sub_state_name` to `"TRANSIT"`, `coverage_plausibility_warning` overrides it to `"COVERAGE_INCOMPLETE"` (issue #680), and `coverage_scan_paused` overrides both with `"SCAN_PAUSED"` |
 | `test_battery_filter.cpp` | 243 | 13 tests: sag immunity, rate independence, invalid reading never → 0 % |
 | `test_dock_alignment.cpp` | 191 | 11 tests: along/cross decomposition, yaw-drift band |
+| `test_mow_coverage_plausibility.cpp` | ~185 | 8 tests: `PointInPolygon` inside/outside/degenerate; `ComputeMowedFraction` — headland-only band falls below the floor, fully-mowed interior is plausible, obstacle holes excluded from the denominator, degenerate polygon / empty grid data both read as not-plausible |
 
 ## Runtime surface
 
@@ -125,6 +129,7 @@ Blackboard: `"context"` = `std::shared_ptr<BTContext>`; keys seeded at startup (
 | `/hardware_bridge/power` | `mowgli_interfaces/msg/Power` | sub | 10 | battery filter → `battery_percent`; `charger_enabled` = `IsCharging` (:204) |
 | `/cmd_vel` | `geometry_msgs/msg/TwistStamped` | sub | 10 | twist_mux merged output; last-motion sign for #487 escape (:171) |
 | `/map_server_node/replan_needed`, `/boundary_violation`, `/lethal_boundary_violation` | `std_msgs/msg/Bool` | sub | 1 / 10 / 10 | `map_server_node` (:232-269) |
+| `/map_server_node/mow_progress` | `nav_msgs/msg/OccupancyGrid` | sub | 1, transient_local | `map_server_node`; `ctx->latest_mow_progress` for `FollowStrip::checkCoveragePlausibility` (issue #680) — no other consumer in this node |
 | `/hardware_bridge/dig_event` | `mowgli_interfaces/msg/DigEvent` | sub | depth 10, **VOLATILE** (publisher is transient_local — a replayed dig from a previous session must not become a skip zone) | `hardware_bridge_node` → `session_dig_points` / `dig_event_count` for `FollowStrip` (`dig_skip.hpp`) |
 | `/odometry/filtered_map` | `nav_msgs/msg/Odometry` | sub | 5 | `fusion_graph_node`; σ_xy backstop only (:330) |
 | `/gps/absolute_pose` | `mowgli_interfaces/msg/AbsolutePose` | sub | 10 | `navsat_to_absolute_pose_node`; `gps_x/y`, undock sample buffer, legacy fix fallback (:345) |
@@ -143,7 +148,7 @@ Blackboard: `"context"` = `std::shared_ptr<BTContext>`; keys seeded at startup (
 | `/cmd_vel_nav` | `geometry_msgs/msg/TwistStamped` | pub | 10 | `EscapeStartBlocked` (`escape_nodes.cpp` :160) — lowest twist_mux lane, through collision_monitor |
 
 ### Services & actions
-Served (`behavior_tree_node.cpp` :547-638): `~/high_level_control` (`mowgli_interfaces/srv/HighLevelControl`), `~/start_in_area` (`mowgli_interfaces/srv/StartInArea`), `~/clear_coverage_resume` (`std_srvs/srv/Trigger`, applied at the top of `tickTree` :1004). GUI callers: `gui/pkg/api/mowglinext.go` :564/:594/:691, `gui/pkg/providers/scheduler.go` :166, `homekit.go` :44, `mqtt.go` :118.
+Served (`behavior_tree_node.cpp`, with blade control in `blade_control_service.hpp`): `~/blade_control` (`mowgli_interfaces/srv/BladeControl`, map-menu policy acceptance/forwarding/message), `~/high_level_control` (`mowgli_interfaces/srv/HighLevelControl`), `~/start_in_area` (`mowgli_interfaces/srv/StartInArea`), `~/clear_coverage_resume` (`std_srvs/srv/Trigger`, applied at the top of `tickTree` :1004), `~/set_fleet_assignment` (`mowgli_interfaces/srv/SetFleetAssignment`, deferred to the tick thread the same way; fills `BTContext::fleet_excluded_areas` / `fleet_preferred_start`, docs/MULTI_ROBOT.md). Also publishes `~/coverage_session` (`mowgli_interfaces/msg/CoverageSession`, 1 Hz) for the fleet coordinator. GUI callers: `gui/pkg/api/mowglinext.go` :564/:594/:691, `gui/pkg/providers/scheduler.go` :166, `homekit.go` :44, `mqtt.go` :118.. GUI callers: `gui/pkg/api/mowglinext.go` :564/:594/:691, `gui/pkg/providers/scheduler.go` :166, `homekit.go` :44, `mqtt.go` :118.
 
 Clients (node → file:line):
 | Target | Type | Used by |
@@ -168,14 +173,14 @@ Clients (node → file:line):
 ### Registered BT nodes (source of truth: `src/register_nodes.cpp`)
 | Group / file | Nodes |
 |--------------|-------|
-| Conditions — `condition_nodes.{hpp,cpp}` | `IsEmergency`, `IsCharging`, `IsBatteryLow`(threshold, voltage_threshold), `IsRainDetected`, `NeedsDocking`(threshold %), `IsBatteryAbove`, `IsManualResumeRequested`(min_battery_pct — consumes `ctx->manual_resume_requested`, the Play-while-charging token; refuses + clears it below the floor or after `kManualResumeMaxAgeSec`), `IsCommand`(command), `IsGPSFixed`, `IsCoverageComplete`, `ReplanNeeded`†, `IsBoundaryViolation`, `IsLocalizationDegraded`, `IsLethalBoundaryViolation`, `IsDocking`, `IsNewRain`, `IsRainModeAtLeast`(mode), `IsResumeUndockAllowed`(max_attempts), `IsChargingProgressing`, `PreFlightCheck`(min_battery, min_gps_fix_type, tf_timeout_sec), `Nav2Active`(timeout_sec), `IsObstacleStuck`(min_duration_sec, max_count, cooldown_sec), `WasRecentlyInCollisionStop`(max_age_sec), `IsScanStale`(max_age_sec), `IsCollisionStopSustained`(min_duration_sec, max_state_age_sec), `IsCoverageStartBlocked` |
+| Conditions — `condition_nodes.{hpp,cpp}` | `IsEmergency`, `IsCharging`, `IsBatteryLow`(threshold, voltage_threshold), `IsRainDetected`, `NeedsDocking`(threshold %), `IsBatteryAbove`, `IsChargeCurrentBelow`, `IsManualResumeRequested`(min_battery_pct — consumes `ctx->manual_resume_requested`, the Play-while-charging token; refuses + clears it below the floor or after `kManualResumeMaxAgeSec`), `IsCommand`(command), `IsGPSFixed`, `IsCoverageComplete`, `ReplanNeeded`†, `IsBoundaryViolation`, `IsLocalizationDegraded`, `IsLethalBoundaryViolation`, `IsDocking`, `IsNewRain`, `IsRainModeAtLeast`(mode), `IsResumeUndockAllowed`(max_attempts), `IsChargingProgressing`, `PreFlightCheck`(min_battery, min_gps_fix_type, tf_timeout_sec), `Nav2Active`(timeout_sec), `IsObstacleStuck`(min_duration_sec, max_count, cooldown_sec), `WasRecentlyInCollisionStop`(max_age_sec), `IsScanStale`(max_age_sec), `IsCollisionStopSustained`(min_duration_sec, max_state_age_sec), `IsCoverageStartBlocked` |
 | Utility — `utility_nodes.{hpp,cpp}` | `SetMowerEnabled`(enabled), `WaitForDuration`(duration_sec), `WaitForGpsFix`(timeout_sec, min_fix_type), `SaveObstacles`, `ResetEmergency` |
 | Navigation — `navigation_nodes.{hpp,cpp}` | `StopMoving`(duration_sec), `ClearCostmap`, `SetNav2Lifecycle`(command PAUSE/RESUME), `NavigateToPose`†(goal "x;y;yaw"), `BackUp`(backup_dist, backup_speed), `SetNavMode`(mode precise/degraded), `NavigateInsideBoundary` |
 | Escape — `escape_nodes.{hpp,cpp}` | `EscapeStartBlocked` |
 | Status — `status_nodes.{hpp,cpp}` | `PublishHighLevelStatus`(state, state_name), `WasRainingAtStart`, `ClearCommand`, `MarkGuardHalt`(reason), `EndSession`, `IncrementSkippedSwaths`† |
 | Calibration — `calibration_nodes.{hpp,cpp}` | `RecordUndockStart`, `CalibrateHeadingFromUndock`(min_displacement_m), `SeedYawFromMotion`(distance_m, speed_ms, timeout_sec, min_displacement_m) |
 | Docking — `docking_nodes.{hpp,cpp}` | `DockRobot`(dock_id, dock_type), `UndockRobot`†(dock_type), `RecordResumeUndockFailure` |
-| Coverage — `coverage_nodes.{hpp,cpp}` | `GetNextUnmowedArea`(max_areas → out `area_index`), `FollowStrip`(max_detours_per_segment, detour_footprint_radius_m), `TransitToStrip`, `DetourAroundObstacle`†(forward_m, lateral_m), `PlanCoverageArea`(area_index) |
+| Coverage — `coverage_nodes.{hpp,cpp}` | `GetNextUnmowedArea`(max_areas → out `area_index`), `FollowStrip`(max_detours_per_segment, detour_footprint_radius_m), `TransitToStrip`(timeout_sec, ≤ 0 = `transitDeadlineSec(gap)`; a non-START_OCCUPIED failure is recorded in `BTContext::transit_to_strip_failed_at` so FollowStrip skips — not repeats — that first transit), `DetourAroundObstacle`†(forward_m, lateral_m), `PlanCoverageArea`(area_index) |
 | Recording — `recording_nodes.{hpp,cpp}` | `RecordArea`(simplification_tolerance, min_vertices, min_area, record_rate_hz, is_exclusion_zone) |
 
 † registered but not referenced by `trees/main_tree.xml`.
@@ -196,6 +201,7 @@ All declared in `behavior_tree_node.cpp` with `declare_parameter`, read ONCE at 
 | `battery_full_voltage` / `battery_empty_voltage` | 28.0 / 24.0 (:906-908) | :288-289 | `batteryPercentFromVoltage` |
 | `battery_low_percent` / `battery_critical_percent` / `battery_full_percent` / `battery_critical_voltage` / `battery_critical_recovery_percent` | 20 / 10 / 95 / 0 / 30 (:913-925) | :290-294 | XML `{battery_low_pct}` `{battery_critical_pct}` `{battery_full_pct}` `{battery_critical_voltage}`; `battery_critical_recovery_pct` is seeded but unused by XML (CriticalBatteryDock resumes at `{battery_full_pct}`, `main_tree.xml` :394) |
 | `battery_manual_resume_percent` | 30.0, clamped to `battery_low_percent + 5` if not above it | :296 | XML `{battery_manual_resume_pct}` → `IsManualResumeRequested` in BOTH charge wait loops (`ChargeOrAbort`, `CriticalChargeOrAbort`); the token is set by the `~/high_level_control` handler on a `COMMAND_START` while `last_high_level_status.state_name` is a charge-hold state (`isChargeHoldState`) |
+| `battery_charge_tail_current_a` | 0.08 | :394 | XML `{battery_charge_tail_current_a}` → `IsChargeCurrentBelow`, ANDed with `IsBatteryAbove` in BOTH charge wait loops' AUTO exit (issue #759 follow-up — `battery_full_percent` alone reads "full" off raw pack voltage, which stays elevated for the whole CC/CV charge, not just a transient, while the charger is actively pushing current in; mirrors the firmware's own `CHARGE_END_LIMIT_CURRENT`, `board_defaults.h`). Does not gate the manual-resume override (`IsManualResumeRequested`) |
 | `loc_gnss_acc_pause_m` / `loc_gnss_acc_resume_m` / `loc_gnss_stale_s` / `loc_sigma_pause_persist_s` / `loc_sigma_resume_persist_s` / `loc_sigma_pause_m` / `loc_sigma_resume_m` / `loc_sigma_backstop_persist_s` | 0.30 / 0.15 / 5 / 3 / 2 / 5 / 2 / 10 (:286-294) | :148-163 | `LocalizationHealthMonitor` → `IsLocalizationDegraded` |
 | `start_blocked_escape_enabled` / `_speed` / `_distance` / `_timeout_s` / `_min_signal_speed` / `_signal_max_age_s` | false / 0.10 / 0.40 / 6 / 0.03 / 90 (:309-316), clamped by `SanitizeEscapeCfg` | :546-558 | `EscapeStartBlocked`, `/cmd_vel` tracker; motion is opt-in after the 2026-09-09 field failure |
 | `mow_angle_deg` | -1 = AUTO (:947) | :338 | `PlanCoverageArea::buildGoal` → `PlanCoverage.mow_angle_deg` |
@@ -243,7 +249,7 @@ Publishes none. `ctx->tf_buffer` (`behavior_tree_node.cpp` :82) is used to look 
 - `SaveObstacles` targets `/obstacle_tracker/save_obstacles`, which nothing in the repo serves — it always logs "service unavailable, skipping" and returns SUCCESS (`utility_nodes.cpp` :219-224).
 - Undock is `BackUp` via `/backup`, not `UndockRobot` (Invariant 10); `undock_distance` must exceed `CalibrateHeadingFromUndock` `min_displacement_m` (`main_tree.xml` :534 passes 0.5; the C++ port default is 0.20) or the yaw refinement is skipped — and if the charger is STILL on at that point the node returns FAILURE and the whole undock sequence retries (`calibration_nodes.cpp` :124-152).
 - `PreFlightCheck` requires only `min_gps_fix_type=2` on the dock; RTK-Fixed is enforced after undock by `WaitForGpsFix(min_fix_type=4)` (`main_tree.xml` :489-528). Do not raise the dock gate (chicken-and-egg under the canopy).
-- `GetNextUnmowedArea` skips `is_navigation_area` areas (`coverage_nodes.cpp` :1693-1698) and retires an area after `kMaxAreaAttempts=5` no-progress dispatches (+`kMaxStartBlockedAttempts=3` exempted START_OCCUPIED passes, +`kMaxGuardHaltedPasses=200` exempted guard-interrupted passes flagged by `MarkGuardHalt`) — `bt_context.hpp` :141-235. A guard that halts the Root mid-pass WITHOUT `MarkGuardHalt` charges every pause to that budget: field 2026-09-07/08, a flaky LiDAR link tripped `IsScanStale` 3× in 25 s and the area retired with 0 swaths.
+- `GetNextUnmowedArea` skips `is_navigation_area` areas (`coverage_nodes.cpp`) and retires an area after `kMaxAreaAttempts=5` no-progress dispatches (+`kMaxStartBlockedAttempts=3` exempted START_OCCUPIED passes, +`kMaxGuardHaltedPasses=30` exempted guard-interrupted/fleet-yield passes flagged by `MarkGuardHalt`). A retired incomplete area is tracked separately and routes to coverage failure, never `MOWING_COMPLETE`. A one-second scan blip pauses the blade inside `FollowStrip`; Root `IsScanStale` waits >20 s, so the shared cap allows at least ten minutes of blind intervals before normal retirement resumes.
 - `BoundaryGuard`/`LocalizationGuard` whitelist commands 7/3/5/6/2 and the blade-off dock transit (`IsCommand 1` + `IsDocking`); dropping 5/6 from the whitelist silently loses every finished recording (`main_tree.xml` :146-154).
 - `GUI` state maps: `WAITING_FOR_RTK` is emitted but present in none of `constants.ts` / `utils.tsx` / `BTStateGraph.tsx`; `SKIP_STRIP` is listed there but never emitted.
 
