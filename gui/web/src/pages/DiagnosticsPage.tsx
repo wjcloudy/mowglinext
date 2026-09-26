@@ -29,6 +29,7 @@ import {
     PlayCircleOutlined,
     ReloadOutlined,
     SettingOutlined,
+    SlidersOutlined,
     SoundOutlined,
     StopOutlined,
     ThunderboltOutlined,
@@ -40,6 +41,7 @@ import {useHighLevelStatus} from "../hooks/useHighLevelStatus.ts";
 import {useEmergency} from "../hooks/useEmergency.ts";
 import {usePower} from "../hooks/usePower.ts";
 import {useStatus} from "../hooks/useStatus.ts";
+import {BladeDirectionDisplay} from "../components/BladeDirectionDisplay.tsx";
 import {useGPS} from "../hooks/useGPS.ts";
 import {useGnssStatus} from "../hooks/useGnssStatus.ts";
 import {useFusionOdom} from "../hooks/useFusionOdom.ts";
@@ -59,7 +61,8 @@ import {
     displayHorizontalAccuracyM,
     deriveGpsStatus,
 } from "../utils/gpsStatus.ts";
-import {useEffect, useMemo, useState} from "react";
+import {lazy, Suspense, useEffect, useMemo, useState} from "react";
+import {useSearchParams} from "react-router-dom";
 import {App} from "antd";
 import {useTranslation} from "react-i18next";
 import {useSettings} from "../hooks/useSettings.ts";
@@ -154,6 +157,15 @@ function BoolStatusTag({label, ok}: {label: string; ok: boolean}) {
 
 // ── main page ────────────────────────────────────────────────────────────────
 
+// The raw ROS parameter editor is for advanced users: it lives under
+// Diagnostics instead of the main menu, and loads only when opened.
+const ParametersPage = lazy(() => import("./ParametersPage.tsx"));
+const sectionParameters = (
+    <Suspense fallback={null}>
+        <ParametersPage/>
+    </Suspense>
+);
+
 export const DiagnosticsPage = () => {
     const {colors} = useThemeMode();
     const {t} = useTranslation();
@@ -186,8 +198,12 @@ export const DiagnosticsPage = () => {
     const {diagnostics} = useDiagnostics();
     // Mobile uses collapsible panels; desktop shows sensors in the Robot tab.
     // Subscribe to the high-rate IMU stream only in the visible sensor view.
-    const [openPanels, setOpenPanels] = useState<string[]>([]);
-    const [activeTab, setActiveTab] = useState("system");
+    // ?tab=parameters opens the advanced ROS parameters editor (formerly its
+    // own page in the main menu; /parameters redirects here).
+    const [searchParams] = useSearchParams();
+    const requestedTab = searchParams.get("tab");
+    const [openPanels, setOpenPanels] = useState<string[]>(requestedTab ? [requestedTab] : []);
+    const [activeTab, setActiveTab] = useState(requestedTab ?? "system");
     const sensorsPanelOpen = isMobile ? openPanels.includes("sensors") : activeTab === "robot";
     const imu = useImu(sensorsPanelOpen);
     const {settings} = useSettings();
@@ -1840,6 +1856,9 @@ export const DiagnosticsPage = () => {
                         <Col xs={12} lg={4}>
                             <Statistic title={t('diagnosticsPage.motorRpm')} value={status.mower_motor_rpm} precision={0}/>
                         </Col>
+                        <Col xs={24} lg={8}>
+                            <BladeDirectionDisplay/>
+                        </Col>
                     </Row>
                     <Flex wrap gap="small" style={{marginTop: 12}}>
                         <BoolStatusTag label={t('diagnosticsPage.rpiPower')} ok={!!status.raspberry_pi_power}/>
@@ -1998,6 +2017,11 @@ export const DiagnosticsPage = () => {
                             label: t('diagnosticsPage.rosDiagnostics'),
                             children: sectionRosDiagnostics,
                         },
+                        {
+                            key: "parameters",
+                            label: <Space><SlidersOutlined/> {t('diagnosticsPage.tabParameters')}</Space>,
+                            children: openPanels.includes("parameters") ? sectionParameters : null,
+                        },
                     ]}
                 />
             </div>
@@ -2041,6 +2065,11 @@ export const DiagnosticsPage = () => {
                 {sectionCrossChecks}
                 {sectionCalibrationStatus}
             </Space>,
+        },
+        {
+            key: "parameters",
+            label: <Space><SlidersOutlined/> {t('diagnosticsPage.tabParameters')}</Space>,
+            children: activeTab === "parameters" ? sectionParameters : null,
         },
     ];
 
