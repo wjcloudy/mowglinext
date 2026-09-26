@@ -7,6 +7,20 @@ import { useContainerRestart } from "./useContainerRestart.ts";
 import { getQuaternionFromHeading } from "../utils/map.tsx";
 import { ContentType } from "../api/Api.ts";
 import { valuesMatch } from "../utils/settingsValues.ts";
+import {
+    AREA_RECORDING_GROUP,
+    BEHAVIOR_TREE_GROUP,
+    CHARGE_LIMITS_GROUP,
+    DOCK_CALIBRATION_GROUP,
+    DOCK_DETECTION_GROUP,
+    FIRMWARE_SAFETY_GROUP,
+    LOCALIZATION_GUARD_GROUP,
+    REVERSE_ESCAPE_GROUP,
+    START_ESCAPE_GROUP,
+    TURN_SPEED_GROUP,
+    YAW_LOOP_GROUP,
+    groupKeys,
+} from "../components/settings/settingsFieldGroups.ts";
 
 /** A section that saves outside mowgli_robot.yaml but wants the page's Save button. */
 export interface ExternalSaver {
@@ -33,10 +47,9 @@ export type SettingsSection =
     | "safety"
     | "obstacles"
     | "navigation"
-    | "rain"
+    | "weather"
     | "leds"
     | "mqtt"
-    | "irrisense"
     | "remote_access"
     | "notifications"
     | "advanced";
@@ -70,7 +83,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
         icon: "tool",
         description: "settingsSections.hardware.description",
         keys: [
-            "mower_model", "wheel_radius", "wheel_track", "wheel_width",
+            "robot_name", "mower_model", "wheel_radius", "wheel_track", "wheel_width",
             "wheel_x_offset", "chassis_center_x", "chassis_length", "chassis_width",
             "chassis_height", "chassis_mass_kg", "caster_radius", "caster_track",
             "ticks_per_meter", "tool_width", "blade_radius",
@@ -84,6 +97,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
         keys: [
             "wheel_pid_kp", "wheel_pid_ki", "wheel_pid_kd",
             "wheel_pid_integral_limit", "wheel_pid_pwm_per_mps",
+            ...groupKeys(YAW_LOOP_GROUP),
         ],
     },
     {
@@ -134,6 +148,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "use_lidar_map_anchor", "lidar_anchor_shadow_mode",
             "use_magnetometer",
             "enable_mag_cal", "declination_deg", "min_horizontal_uT", "mag_yaw_variance",
+            ...groupKeys(LOCALIZATION_GUARD_GROUP),
         ],
     },
     {
@@ -151,7 +166,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             // coverage_server, and the BT hardcodes mow_angle_deg=-1.0 "auto"),
             // so they were dead controls. swath_overlap (a real coverage_server
             // param) is surfaced here instead.
-            "mowing_enabled", "mowing_speed", "transit_speed",
+            "mowing_enabled", "blade_auto_reverse", "mowing_speed", "transit_speed",
             // Blade-load slowdown (FollowCoveragePath.blade_load_*, injected by
             // navigation.launch.py): slow the feed when the blade RPM sags.
             "blade_load_slowdown_enabled", "blade_load_rpm_full",
@@ -159,6 +174,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "headland_width", "num_headland_passes", "swath_overlap",
             "chassis_safety_inset", "min_turning_radius", "mow_direction", "mow_cross_hatch",
             "connector_max_headland_passes",
+            ...groupKeys(TURN_SPEED_GROUP),
         ],
     },
     {
@@ -171,6 +187,8 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "dock_max_retries", "dock_use_charger_detection",
             "dock_charging_threshold",
             "dock_approach_overshoot", "dock_pose_yaw_sigma_rad",
+            ...groupKeys(DOCK_DETECTION_GROUP),
+            ...groupKeys(DOCK_CALIBRATION_GROUP),
         ],
     },
     {
@@ -182,6 +200,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "battery_full_voltage", "battery_empty_voltage", "battery_critical_voltage",
             "battery_full_percent", "battery_low_percent", "battery_critical_percent",
             "battery_critical_recovery_percent", "battery_manual_resume_percent",
+            ...groupKeys(CHARGE_LIMITS_GROUP),
         ],
     },
     {
@@ -202,6 +221,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             // that mode is on. Listing them here is what keeps them out of
             // AdvancedSection's free-form editor, exactly as before.
             "lift_blade_resume_delay_sec", "lift_recovery_mode",
+            ...groupKeys(FIRMWARE_SAFETY_GROUP),
         ],
     },
     {
@@ -215,6 +235,7 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "obstacle_wait_timeout_s",
             "obstacle_margin", "obstacle_slowdown_ratio", "dig_obstacle_enabled",
             "dig_sensitivity",
+            ...groupKeys(REVERSE_ESCAPE_GROUP),
         ],
     },
     {
@@ -226,13 +247,18 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             "xy_goal_tolerance", "yaw_goal_tolerance", "coverage_xy_tolerance",
             "progress_timeout_sec",
             "boundary_inner_margin_m", "dock_inner_margin_exempt_radius_m",
+            ...groupKeys(AREA_RECORDING_GROUP),
+            ...groupKeys(BEHAVIOR_TREE_GROUP),
+            ...groupKeys(START_ESCAPE_GROUP),
         ],
     },
     {
-        id: "rain",
-        label: "settingsSections.rain.label",
+        // Rain sensor behaviour + the IrriSense soil-moisture skip: both
+        // decide whether the weather lets the robot mow.
+        id: "weather",
+        label: "settingsSections.weather.label",
         icon: "cloud",
-        description: "settingsSections.rain.description",
+        description: "settingsSections.weather.description",
         keys: ["rain_mode", "rain_delay_minutes", "rain_debounce_sec"],
     },
     {
@@ -264,16 +290,8 @@ const SECTION_DEFINITIONS: SectionMeta[] = [
             // above (a raw broker password with no context).
             "mqtt_enabled", "mqtt_host", "mqtt_port", "mqtt_username",
             "mqtt_password", "mqtt_topic_prefix", "mqtt_use_ssl",
+            "mqtt_home_assistant_discovery_enabled",
         ],
-    },
-    {
-        id: "irrisense",
-        label: "settingsSections.irrisense.label",
-        icon: "cloud-sync",
-        description: "settingsSections.irrisense.description",
-        // No yaml keys: the IrriSense settings (token included) live in the
-        // GUI's key-value DB and the section loads/saves them itself.
-        keys: [],
     },
     {
         id: "remote_access",

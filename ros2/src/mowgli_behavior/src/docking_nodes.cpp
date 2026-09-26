@@ -16,6 +16,7 @@
 #include "mowgli_behavior/docking_nodes.hpp"
 
 #include "action_msgs/msg/goal_status.hpp"
+#include "mowgli_behavior/cancel_goal.hpp"
 #include "mowgli_behavior/dock_alignment.hpp"
 
 namespace mowgli_behavior
@@ -74,6 +75,7 @@ void DockRobot::log_contact_delta(const std::shared_ptr<BTContext>& ctx, uint16_
 BT::NodeStatus DockRobot::onStart()
 {
   auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
+  ctx->last_dock_succeeded = false;
 
   std::string dock_id = "home_dock";
   if (auto res = getInput<std::string>("dock_id"))
@@ -168,6 +170,7 @@ BT::NodeStatus DockRobot::onRunning()
   {
     case action_msgs::msg::GoalStatus::STATUS_SUCCEEDED:
       RCLCPP_INFO(ctx->node->get_logger(), "DockRobot: docking succeeded");
+      ctx->last_dock_succeeded = true;
       ctx->docking_active = false;
       return BT::NodeStatus::SUCCESS;
 
@@ -198,7 +201,7 @@ void DockRobot::onHalted()
   if (goal_handle_)
   {
     RCLCPP_INFO(ctx->node->get_logger(), "DockRobot: canceling active goal");
-    action_client_->async_cancel_goal(goal_handle_);
+    cancelGoalQuietly(action_client_, goal_handle_, ctx->node->get_logger(), "DockRobot");
     goal_handle_.reset();
   }
 }
@@ -293,7 +296,7 @@ void UndockRobot::onHalted()
   {
     auto ctx = config().blackboard->get<std::shared_ptr<BTContext>>("context");
     RCLCPP_INFO(ctx->node->get_logger(), "UndockRobot: canceling active goal");
-    action_client_->async_cancel_goal(goal_handle_);
+    cancelGoalQuietly(action_client_, goal_handle_, ctx->node->get_logger(), "UndockRobot");
     goal_handle_.reset();
   }
 }

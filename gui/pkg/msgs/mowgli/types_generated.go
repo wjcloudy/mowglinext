@@ -29,6 +29,15 @@ type CoveragePath struct {
 	Path                      nav.Path                       `json:"path"`
 }
 
+// CoverageSession matches mowgli_interfaces/msg/CoverageSession.
+type CoverageSession struct {
+	SessionActive             bool                           `json:"session_active"`
+	CurrentArea               int16                          `json:"current_area"`
+	CompletedAreas            []uint32                       `json:"completed_areas"`
+	AttemptedAreas            []uint32                       `json:"attempted_areas"`
+	ExcludedAreas             []uint32                       `json:"excluded_areas"`
+}
+
 // DigEvent matches mowgli_interfaces/msg/DigEvent.
 type DigEvent struct {
 	Header                    geometry.Header                `json:"header"`
@@ -69,6 +78,32 @@ type Emergency struct {
 	LiftWarning               bool                           `json:"lift_warning"`
 	LiftDurationSec           float32                        `json:"lift_duration_sec"`
 	Reason                    string                         `json:"reason"`
+}
+
+// FirmwareParam matches mowgli_interfaces/msg/FirmwareParam.
+type FirmwareParam struct {
+	Id                        uint16                         `json:"id"`
+	Name                      string                         `json:"name"`
+	RequestedValid            bool                           `json:"requested_valid"`
+	Requested                 float32                        `json:"requested"`
+	Reported                  bool                           `json:"reported"`
+	Applied                   float32                        `json:"applied"`
+	DefaultValue              float32                        `json:"default_value"`
+	MinValue                  float32                        `json:"min_value"`
+	MaxValue                  float32                        `json:"max_value"`
+	Status                    uint8                          `json:"status"`
+	Persisted                 bool                           `json:"persisted"`
+	IsVolatile                bool                           `json:"is_volatile"`
+}
+
+// FirmwareParams matches mowgli_interfaces/msg/FirmwareParams.
+type FirmwareParams struct {
+	Stamp                     geometry.Stamp                 `json:"stamp"`
+	FirmwareIncompatible      bool                           `json:"firmware_incompatible"`
+	BootSource                uint8                          `json:"boot_source"`
+	LastCommit                uint8                          `json:"last_commit"`
+	RecordsLeft               uint16                         `json:"records_left"`
+	Params                    []FirmwareParam                `json:"params"`
 }
 
 // GnssStatus matches mowgli_interfaces/msg/GnssStatus.
@@ -220,6 +255,7 @@ type Status struct {
 	MowerMotorTemperature     float32                        `json:"mower_motor_temperature"`
 	MowerMotorRpm             float32                        `json:"mower_motor_rpm"`
 	BladeStatusStamp          geometry.Stamp                 `json:"blade_status_stamp"`
+	BladeRequestedDirection   string                         `json:"blade_requested_direction"`
 	FirmwareVersion           string                         `json:"firmware_version"`
 	FirmwareProtocolVersion   uint8                          `json:"firmware_protocol_version"`
 	FirmwareCompatible        bool                           `json:"firmware_compatible"`

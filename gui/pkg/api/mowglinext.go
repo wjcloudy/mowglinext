@@ -84,8 +84,8 @@ func topicSubscribeInterval(topic string) (int, bool) {
 	case "diagnostics", "status", "highLevelStatus", "btLog", "map",
 		"path", "plan", "power", "emergency", "dockingSensor",
 		"robotDescription", "recordingTrajectory",
-		"coverageResumeAvailable",
-		"fusionDiag", "dockCalibrationStatus":
+		"coverageResumeAvailable", "coverageSession",
+		"fusionDiag", "dockCalibrationStatus", "firmwareParams":
 		return -1, true
 	default:
 		return -1, false
@@ -152,58 +152,6 @@ func ClearMapRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 	})
 }
 
-// mapWriteBudget returns the context timeout for a clear_map → add_area×N →
-// save_areas sequence. clear_map + save_areas are fixed-cost, but each add_area
-// RASTERISES its polygon into the map_server grid, which on a large area takes
-// seconds — and on a slow SBC (RPi4) a multi-area map easily blows a fixed
-// budget, leaving the map half-written (issue #341: "can't save a big map,
-// ~30 s timeout"). Scale it: a 60 s base plus per-area headroom, capped at
-// 6 min. Map writes are rare and operator-driven, so a generous ceiling beats a
-// false timeout. Shared by ReplaceMapRoute (map editor "Save Map") and the
-// OpenMower importer so the two never drift.
-func mapWriteBudget(nAreas int) time.Duration {
-	budget := 60*time.Second + time.Duration(nAreas)*5*time.Second
-	if budget > 6*time.Minute {
-		budget = 6 * time.Minute
-	}
-	return budget
-}
-
-// replaceMapInternal is the ROS-side flow shared by the public PUT
-// handler and the OpenMower importer. It does clear_map → add_area×N →
-// save_areas; the wrapping (HTTP body decode / response codes) is the
-// caller's job.
-//
-// The save_areas error is annotated so callers can distinguish a
-// partial-success (areas live but not persisted to disk) from a hard
-// failure earlier in the sequence.
-func replaceMapInternal(ctx context.Context, provider types.IRosProvider, req *mowgli.ReplaceMapReq) error {
-	if req == nil {
-		return errors.New("replaceMapInternal: nil request")
-	}
-	if err := provider.CallService(ctx, "/map_server_node/clear_map", &mowgli.ClearMapReq{}, &mowgli.ClearMapRes{}, "std_srvs/srv/Trigger"); err != nil {
-		return err
-	}
-	for _, element := range req.Areas {
-		// Ensure Obstacles is an empty slice, not nil — the bridge rejects
-		// null for repeated fields ("msg is not a list type").
-		if element.Area.Obstacles == nil {
-			element.Area.Obstacles = []geometry.Polygon{}
-		}
-		areaReq := mowgli.AddMowingAreaReq{
-			Area:             element.Area,
-			IsNavigationArea: element.IsNavigationArea,
-		}
-		if err := provider.CallService(ctx, "/map_server_node/add_area", &areaReq, &mowgli.AddMowingAreaRes{}, "mowgli_interfaces/srv/AddMowingArea"); err != nil {
-			return err
-		}
-	}
-	if err := provider.CallService(ctx, "/map_server_node/save_areas", &mowgli.ClearMapReq{}, &mowgli.ClearMapRes{}, "std_srvs/srv/Trigger"); err != nil {
-		return fmt.Errorf("areas added but save_areas failed: %w", err)
-	}
-	return nil
-}
-
 // ReplaceMapRoute clear the map and insert areas
 //
 // @Summary Delete the current map and replace all areas
@@ -218,8 +166,7 @@ func replaceMapInternal(ctx context.Context, provider types.IRosProvider, req *m
 func ReplaceMapRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 	group.PUT("/map", func(c *gin.Context) {
 		// Decode BEFORE choosing the timeout so the budget can scale with the
-		// area count (each add_area rasterises — a fixed 30 s timed out saving a
-		// big edited map on RPi4, issue #341).
+		// area count (issue #341). The flow itself lives in map_replace.go.
 		var CallReq mowgli.ReplaceMapReq
 		if err := unmarshalROSMessage[*mowgli.ReplaceMapReq](c.Request.Body, &CallReq); err != nil {
 			c.JSON(500, ErrorResponse{Error: err.Error()})
@@ -237,13 +184,24 @@ func ReplaceMapRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 }
 
 // setDockingPointInternal is the ROS-side call shared by the public
-// POST handler and the OpenMower importer. Single service round-trip,
-// no wrapping logic.
+// POST handler and the OpenMower importer. Single service round-trip.
+//
+// CallService only fails on transport/serialization errors. map_server
+// answers a GATED update (not on the dock, GPS not accurate enough, yaw not
+// converged…) with {success:false, message}: the dock pose was NOT
+// committed, so that is an error too, carrying map_server's reason (#703).
 func setDockingPointInternal(ctx context.Context, provider types.IRosProvider, req *mowgli.SetDockingPointReq) error {
 	if req == nil {
 		return errors.New("setDockingPointInternal: nil request")
 	}
-	return provider.CallService(ctx, "/map_server_node/set_docking_point", req, &mowgli.SetDockingPointRes{}, "mowgli_interfaces/srv/SetDockingPoint")
+	var res mowgli.SetDockingPointRes
+	if err := provider.CallService(ctx, "/map_server_node/set_docking_point", req, &res, "mowgli_interfaces/srv/SetDockingPoint"); err != nil {
+		return err
+	}
+	if !res.Success {
+		return fmt.Errorf("dock pose rejected by map_server: %s", res.Message)
+	}
+	return nil
 }
 
 // SetDockingPointRoute set the docking point
@@ -569,7 +527,11 @@ func ServiceRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 				c.JSON(400, ErrorResponse{Error: err.Error()})
 				return
 			}
-			err = provider.CallService(ctx, "/behavior_tree_node/high_level_control", &CallReq, &mowgli.HighLevelControlRes{}, "mowgli_interfaces/srv/HighLevelControl")
+			var res mowgli.HighLevelControlRes
+			err = provider.CallService(ctx, "/behavior_tree_node/high_level_control", &CallReq, &res, "mowgli_interfaces/srv/HighLevelControl")
+			if err == nil && !res.Success {
+				err = errors.New("high_level_control rejected the command")
+			}
 		case "emergency":
 			var CallReq mowgli.EmergencyStopReq
 			err = c.BindJSON(&CallReq)
@@ -590,6 +552,9 @@ func ServiceRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 				return
 			}
 			err = provider.CallService(ctx, "/hardware_bridge/mower_control", &CallReq, &mowgli.MowerControlRes{}, "mowgli_interfaces/srv/MowerControl")
+		case "blade_control":
+			handleBladeControl(c, provider)
+			return
 		case "coverage_orientation":
 			var req mowgli.CoverageOrientationReq
 			if err = c.BindJSON(&req); err != nil {
@@ -614,7 +579,11 @@ func ServiceRoute(group *gin.RouterGroup, provider types.IRosProvider) {
 				c.JSON(400, ErrorResponse{Error: err.Error()})
 				return
 			}
-			err = provider.CallService(ctx, "/behavior_tree_node/start_in_area", &CallReq, &mowgli.StartInAreaRes{}, "mowgli_interfaces/srv/StartInArea")
+			var res mowgli.StartInAreaRes
+			err = provider.CallService(ctx, "/behavior_tree_node/start_in_area", &CallReq, &res, "mowgli_interfaces/srv/StartInArea")
+			if err == nil && !res.Success {
+				err = errors.New("start_in_area rejected the command")
+			}
 		case "set_datum":
 			type TriggerRes struct {
 				Success bool   `json:"success"`

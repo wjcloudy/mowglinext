@@ -219,6 +219,11 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_rtk_wrongfix_gate fusion_graph_core)
 
+  ament_add_gtest(test_gps_stuck_gate
+    test/test_gps_stuck_gate.cpp
+  )
+  target_link_libraries(test_gps_stuck_gate fusion_graph_core)
+
   ament_add_gtest(test_dock_gps_consistency
     test/test_dock_gps_consistency.cpp
   )
@@ -262,6 +267,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_lidar_submap_store fusion_graph_core)
   ament_add_gtest(test_lidar_compute_gate test/test_lidar_compute_gate.cpp)
   target_link_libraries(test_lidar_compute_gate fusion_graph_core)
+  ament_add_gtest(test_lidar_anchor_decision test/test_lidar_anchor_decision.cpp)
+  target_link_libraries(test_lidar_anchor_decision fusion_graph_core)
 
   ament_add_gtest(test_lidar_scan_history test/test_lidar_scan_history.cpp)
   target_link_libraries(test_lidar_scan_history fusion_graph_core)

@@ -30,10 +30,14 @@ set(msg_files
   "msg/TrackedObstacle.msg"
   "msg/DockCalibrationStatus.msg"
   "msg/DigEvent.msg"
+  "msg/CoverageSession.msg"
+  "msg/FirmwareParam.msg"
+  "msg/FirmwareParams.msg"
 )
 
 # Declare service files
 set(srv_files
+  "srv/BladeControl.srv"
   "srv/AddMowingArea.srv"
   "srv/ClearMap.srv"
   "srv/ClearObstacle.srv"
@@ -48,6 +52,7 @@ set(srv_files
   "srv/GetRecoveryPoint.srv"
   "srv/StartInArea.srv"
   "srv/CoverageOrientation.srv"
+  "srv/SetFleetAssignment.srv"
   "srv/PromoteObstacle.srv"
 )
 

@@ -260,3 +260,34 @@ that this September combination has been tested on the mower.
 Existing SOC limitations remain: the accounting convention above is unresolved,
 and firmware still transmits battery percentage as zero. The ROS battery gauge remains voltage-derived, not an LFP coulomb-counting
 gauge. This merge preserves the charging work without claiming those are solved.
+
+## Upstream dev refresh — 2026-09-26
+
+Merged upstream `ea634cd902cedd3b606e66e70a88069db0c4b9f1` into the three LFP
+lineages without changing their ADC implementation, charge regulator/protection,
+1390 PWM ceiling, -0.20 A offset, PC3 temperature input or optional recorder.
+Upstream now uses USB protocol **7** and saves runtime parameters to flash.
+Install a matching protocol-7 ROS2 host before returning the mower to service.
+The upstream emergency generation/physical-input reset protections are retained.
+
+The LFP overlay in `fw_param_catalog.h` derives its charge envelope from
+`board_defaults.h`: 24–28.5 V and 0.1–1.8 A. This protects compiled defaults,
+USB SET_PARAM and records loaded from flash, and reports the actual bounds to
+the host. Stock 500/500B builds retain upstream's 25.2–29.4 V / 0.1–1.2 A envelope.
+`test_fw_params.py` checks stock and LFP profiles, lower-current persistence,
+out-of-profile saved values and the reported upper bound. Reapply this overlay
+when merging future catalog changes; do not change parameter IDs.
+
+On 500B, sector 5 at `0x08020000` is reserved for parameters. Keep the image below
+128 KiB, preserve this sector on later flashes, and include all 256 KiB in a
+preflash backup. First v7 boot may erase foreign data in that reserved sector.
+Use the documented ITM-off flash procedure; do not enable periodic SWD polling.
+
+HARDWARE_PENDING after software verification: on .118 (500B/8S LFP), record the
+exact image SHA256, commit, host image digest and protocol. With blades removed,
+stationary mower, clear wheels/rotor and accessible cutoff, verify startup stays
+IDLE with zero wheel/blade motion, compatible USB telemetry, advancing IMU and
+healthy onboard tilt. Supervise redocking and require zero duty off-dock and
+bounded fresh-input restart; verify the 28.5 V / 1.8 A limits. Overnight charging
+and physical blade reversal remain separate acceptance runs on that exact build;
+no prior hardware measurement proves their result after this merge.

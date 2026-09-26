@@ -26,7 +26,10 @@
 #include <utility>
 #include <vector>
 
+#include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/point32.hpp"
+#include "geometry_msgs/msg/polygon.hpp"
+#include "mowgli_behavior/blade_direction.hpp"
 #include "mowgli_behavior/cross_hatch.hpp"
 #include "mowgli_behavior/dig_skip.hpp"
 #include "mowgli_behavior/start_blocked_escape.hpp"
@@ -34,6 +37,9 @@
 #include "mowgli_interfaces/msg/high_level_status.hpp"
 #include "mowgli_interfaces/msg/power.hpp"
 #include "mowgli_interfaces/msg/status.hpp"
+#include "mowgli_interfaces/srv/get_mowing_area.hpp"
+#include "mowgli_interfaces/srv/mower_control.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "tf2_ros/buffer.hpp"
@@ -61,6 +67,13 @@ struct BTContext
   // -----------------------------------------------------------------------
 
   mowgli_interfaces::msg::Status latest_status;
+  /// Latest ~/mow_progress sample (map_server_node), used ONLY by
+  /// FollowStrip's end-of-pass coverage-plausibility cross-check (issue
+  /// #680) — see BTContext::coverage_plausibility_warning. transient_local
+  /// on the subscription (bt matches the publisher) so this is populated
+  /// before the first pass ever completes, not just after the first publish
+  /// tick following node start.
+  nav_msgs::msg::OccupancyGrid latest_mow_progress;
   /// Arrival time of the most recent /hardware_bridge/status message.
   /// Default-constructed = none has ever arrived, so latest_status is all
   /// zeroes and describes nothing. EscapeStartBlocked (issue #487) needs this:
@@ -83,7 +96,7 @@ struct BTContext
   ///
   /// Does NOT cover the coverage-tracking fields below (command state +
   /// swath-completion model: target_area_index, single_area_target,
-  /// attempted_areas, area_attempt_count, area_last_coverage,
+  /// attempted_areas, incomplete_retired_areas, area_attempt_count, area_last_coverage,
   /// area_completed_swaths,
   /// area_swath_count, area_resume_pose_index, area_path_pose_count,
   /// area_plan_fingerprint, completed_areas, coverage_all_complete). Those
@@ -116,6 +129,39 @@ struct BTContext
   /// COMMAND_RESET_EMERGENCY=254, …).
   uint8_t current_command{0};
 
+  /// Blade policy is owned by the default MutuallyExclusive group: tick,
+  /// operator service and explicit start handlers. Direction resets only at
+  /// EndSession; operator inhibition also clears on an explicit mowing start.
+  bool blade_auto_reverse{false};
+  BladeDirection blade_direction;
+  // One DDS request writer preserves ordering between coverage, manual and
+  // operator blade requests. Access only from the owning callback group.
+  rclcpp::Client<mowgli_interfaces::srv::MowerControl>::SharedPtr blade_command_client;
+
+  rclcpp::Client<mowgli_interfaces::srv::MowerControl>::SharedPtr bladeClient()
+  {
+    if (!blade_command_client)
+      blade_command_client = node->create_client<mowgli_interfaces::srv::MowerControl>(
+          "/hardware_bridge/mower_control");
+    return blade_command_client;
+  }
+  // ONE get_mowing_area client for the lifetime of the context. A service
+  // client is only "ready" once ITS OWN request writer and response reader have
+  // matched the server's endpoints, which takes a discovery round-trip after
+  // create_client(). GetNextUnmowedArea used to create its client in the node
+  // instance, so every tree (re)build started with a client that reported "not
+  // available" until discovery caught up — a spurious FAILURE on the first tick,
+  // and the reason test_get_next_unmowed_area failed at random on loaded CI
+  // runners (three different tests in three runs, 2026-09-20).
+  rclcpp::Client<mowgli_interfaces::srv::GetMowingArea>::SharedPtr mowing_area_client;
+
+  rclcpp::Client<mowgli_interfaces::srv::GetMowingArea>::SharedPtr mowingAreaClient()
+  {
+    if (!mowing_area_client)
+      mowing_area_client = helper_node->create_client<mowgli_interfaces::srv::GetMowingArea>(
+          "/map_server_node/get_mowing_area");
+    return mowing_area_client;
+  }
   /// Operator-forced resume from a mid-session charge hold. Set by the
   /// ~/high_level_control handler when a COMMAND_START arrives while the tree
   /// is parked in a charge hold (last published state_name CHARGING or
@@ -134,6 +180,27 @@ struct BTContext
   bool manual_resume_requested{false};
   std::chrono::steady_clock::time_point manual_resume_requested_time{};
   static constexpr double kManualResumeMaxAgeSec = 30.0;
+
+  /// Latched after COMMAND_STOP is observed in CriticalBatteryDock's
+  /// post-dock charge hold. The critical-battery branch otherwise re-enters
+  /// on every root tick and would send another DockRobot goal before reaching
+  /// StopHoldSequence. Explicit new commands clear this latch. Protected by
+  /// context_mutex.
+  bool critical_charge_stop_latched{false};
+
+  /// Outcome of the most recent DockRobot attempt. Reset when an action starts
+  /// and set only after its action result reports success. Used by the
+  /// critical-battery tree to avoid treating a failed navigation attempt as
+  /// arrival at the charger.
+  bool last_dock_succeeded{false};
+
+  /// Latches a failed critical-battery dock attempt. The mower stays stopped
+  /// until an operator sends a new command, rather than retrying at BT rate.
+  bool critical_dock_failure_latched{false};
+
+  /// Set by LatchCriticalDockFailure and consumed by the node after the current
+  /// tree tick, so persistence remains serialized with coverage-map access.
+  bool critical_dock_failure_persistence_requested{false};
 
   /// Set by the ~/start_in_area service to REQUEST mowing a single, specific
   /// area instead of iterating all areas. This is the one-shot *request*:
@@ -168,6 +235,14 @@ struct BTContext
   /// per-area attempt counter (area_attempt_count) hit kMaxAreaAttempts.
   /// Cleared by EndSession.
   std::set<uint32_t> attempted_areas;
+
+  /// Areas skipped for the rest of this session because they exhausted the
+  /// bounded no-progress budget without completing. Kept separate from
+  /// attempted_areas so an exhausted candidate cannot be reported as a clean
+  /// MOWING_COMPLETE merely because no dispatchable areas remain. Cleared by
+  /// EndSession and an explicit "Start fresh"; an explicit target re-mow
+  /// clears that target only.
+  std::set<uint32_t> incomplete_retired_areas;
 
   /// Per-area count of CONSECUTIVE GetNextUnmowedArea dispatches that
   /// made NO coverage progress. Reset to 0 whenever a dispatch shows the
@@ -248,13 +323,41 @@ struct BTContext
   /// Cleared by EndSession.
   std::map<uint32_t, uint32_t> area_guard_halt_count;
   /// Maximum guard-halted dispatches exempted from area_attempt_count per
-  /// area. Deliberately GENEROUS: a permanently dead sensor is not this cap's
-  /// problem — the guard itself holds the whole tree (blade off, stopped) for
-  /// as long as the fault lasts, so nothing dispatches at all. The cap only
-  /// bounds the FLAPPING case (a fault that clears and re-trips every few
-  /// seconds) so a pathological flap cannot re-dispatch the same area forever;
-  /// past it the normal no-progress budget takes over and the area retires.
-  static constexpr uint32_t kMaxGuardHaltedPasses = 200;
+  /// area. A one-second scan blip is absorbed inside FollowStrip; the Root
+  /// scan guard only halts after >20 s. Thirty exemptions therefore allow at
+  /// least ten minutes of actual blind intervals before the normal five-pass
+  /// retirement budget resumes. Fleet yields share this bounded counter.
+  static constexpr uint32_t kMaxGuardHaltedPasses = 30;
+
+  /// Live FollowStrip overlay: true only while an active coverage goal is held
+  /// blade-off for a short stale-/scan_collision interval. It is deliberately
+  /// context-owned so the 1 Hz HighLevelStatus republisher can expose it
+  /// without a tree transition. FollowStrip and EndSession clear it on every
+  /// lifecycle and terminal path; it never changes the numeric state or goal.
+  bool coverage_scan_paused{false};
+
+  // -----------------------------------------------------------------------
+  // Fleet coordination (docs/MULTI_ROBOT.md)
+  // -----------------------------------------------------------------------
+  /// Areas that currently belong to ANOTHER fleet member (another robot is
+  /// mowing them, or finished them this fleet session). Written ONLY on the
+  /// tick thread from the deferred ~/set_fleet_assignment handling in
+  /// tickTree(), read by GetNextUnmowedArea (skipped like completed /
+  /// attempted areas) and by FollowStrip (a pass whose area becomes excluded
+  /// mid-mow yields). Deliberately NOT cleared by EndSession: the GUI fleet
+  /// coordinator owns its lifetime and sends an empty list when it stops.
+  std::set<uint32_t> fleet_excluded_areas;
+  /// Where the ascending area scan should START (it wraps to the lower
+  /// indices afterwards), so idle fleet members do not all race for area 0.
+  /// nullopt = plain ascending order. Ignored during a targeted run.
+  std::optional<uint32_t> fleet_preferred_start;
+  /// Areas whose most recent FollowStrip pass ended because the area became
+  /// excluded mid-mow (fleet yield, resume cursor saved). Consumed per area by
+  /// the next GetNextUnmowedArea dispatch of that area, which exempts the pass
+  /// from the no-progress budget exactly like a guard halt (bounded by
+  /// kMaxGuardHaltedPasses through area_guard_halt_count). Cleared by
+  /// EndSession and by ~/clear_coverage_resume.
+  std::set<uint32_t> fleet_yielded_areas;
 
   // -----------------------------------------------------------------------
   // Start-pose escape motion (issue #487, follow-up to the above)
@@ -357,6 +460,20 @@ struct BTContext
   /// Areas whose every swath is completed-or-skipped this session. Skipped by
   /// GetNextUnmowedArea. Cleared by EndSession.
   std::set<uint32_t> completed_areas;
+
+  /// Set when FollowStrip's swath-completion bookkeeping reported an area
+  /// fully mowed, but the mow_progress cross-check found the actually-
+  /// stamped interior fraction below mowgli_behavior::kMinPlausibleMowedFraction
+  /// (mow_coverage_plausibility.hpp) — issue #680: the robot drove only the
+  /// headland ring, reported clean success, and nothing told the operator.
+  /// Folded into HighLevelStatus.sub_state_name as "COVERAGE_INCOMPLETE" by
+  /// withLiveStatusFields (status_snapshot.cpp). Deliberately NOT auto-
+  /// cleared on the next area's completion — a warning from earlier in the
+  /// session must survive to the final report, not just flash briefly.
+  /// Cleared by EndSession so the next COMMAND_START starts without a stale
+  /// warning from a previous, unrelated session.
+  bool coverage_plausibility_warning{false};
+
   /// Filesystem path the coverage RESUME state (the four maps above +
   /// completed_areas + current_area) is persisted to, so an interrupted session
   /// survives a full process/container restart — not just the in-RAM BT
@@ -681,9 +798,23 @@ struct BTContext
   /// sub-path) instead of the single current_strip_path.
   std::vector<nav_msgs::msg::Path> current_strip_subpaths;
 
+  /// The planned area's outer boundary + obstacle holes, populated by
+  /// PlanCoverageArea alongside current_strip_* (from the same
+  /// ~/get_mowing_area response). Used ONLY by FollowStrip's end-of-pass
+  /// coverage-plausibility cross-check (issue #680,
+  /// coverage_plausibility_warning above) — everything else that needs the
+  /// area's geometry already has its own copy from planning.
+  geometry_msgs::msg::Polygon current_area_polygon;
+  std::vector<geometry_msgs::msg::Polygon> current_area_obstacles;
+
   /// Transit goal to reach the coverage path start (populated by
   /// PlanCoverageArea, consumed by TransitToStrip).
   geometry_msgs::msg::PoseStamped current_transit_goal;
+  /// Where TransitToStrip last FAILED to take the robot (map frame), if it did.
+  /// FollowStrip consumes it to skip — not repeat — the identical transit to its
+  /// first unit (field 2026-09-21: 53 s in TransitToStrip, then 43 s more in
+  /// FollowStrip on the same unreachable start). BT-tick-thread only.
+  std::optional<geometry_msgs::msg::Point> transit_to_strip_failed_at;
 
   /// Latest coverage percentage.
   float coverage_percent{0.0f};
@@ -696,6 +827,18 @@ struct BTContext
   int total_swaths{0};
   int completed_swaths{0};
   int skipped_swaths{0};
+
+  /// True while FollowStrip is driving a blade-off transit between sub-paths
+  /// (its own transit_active_/transit_pending_ members, snapshotted at the
+  /// start of every onRunning() tick — see coverage_nodes.cpp), false otherwise. Reset in
+  /// onStart()/onHalted() so a stale true value can never survive past the
+  /// FollowStrip invocation that set it. Read by withLiveStatusFields
+  /// (status_snapshot.cpp) to fold "TRANSIT" into HighLevelStatus's
+  /// sub_state_name — a LIVE override of that otherwise tree-owned field,
+  /// because a transit begins/ends mid-FollowStrip, between tree ticks, so
+  /// only the live-field projection (not PublishHighLevelStatus, which does
+  /// not re-tick while FollowStrip runs) can track it accurately.
+  bool transiting{false};
 
   // -----------------------------------------------------------------------
   // High-level status publishing (shared publisher + last-published cache)
@@ -741,6 +884,14 @@ struct BTContext
 ///     lawn. The GUI's "mow this area" button calls ~/start_in_area, which
 ///     sets current_command itself and never goes through that handler, so
 ///     clearing there cannot cancel a targeted request.
+///     EXCEPTION, guarded at the call site with isResumableHoldState(): a
+///     plain COMMAND_START received while parked in StopHoldSequence's IDLE
+///     (the operator paused a run with "Pause" and pressed Resume/Start
+///     again) does NOT call this — Resume must continue the SAME targeted
+///     area, not silently widen to the whole lawn (mowglinext field report,
+///     2026-09-18: a paused single-area run restarted at area 0 instead of
+///     finishing the paused area). The charge-hold/emergency case above still
+///     clears unconditionally; only the plain-pause case is exempted.
 /// Also drops an unconsumed target_area_index: a request that was never
 /// picked up (e.g. start_in_area during an emergency) must not silently
 /// hijack a later plain start.
@@ -751,7 +902,7 @@ inline void clearSingleAreaMode(BTContext& ctx)
 }
 
 /// True for the HighLevelStatus state_name values published while the tree
-/// is parked in a battery charge hold: BatteryDockAndResume's "CHARGING" and
+/// is parked in a battery charge hold: BatteryGuardHandler's "CHARGING" and
 /// CriticalBatteryDock's "CRITICAL_BATTERY_CHARGING" (main_tree.xml). A
 /// COMMAND_START received in one of these states is an operator asking to
 /// resume the mow before the pack reaches battery_full_pct — see
@@ -759,6 +910,28 @@ inline void clearSingleAreaMode(BTContext& ctx)
 inline bool isChargeHoldState(const std::string& state_name)
 {
   return state_name == "CHARGING" || state_name == "CRITICAL_BATTERY_CHARGING";
+}
+
+/// True only for "IDLE" — StopHoldSequence's stop-in-place (COMMAND_STOP=8,
+/// "Pause": mower off, halt where it stands, Nav2 left up so the mission can
+/// resume promptly; main_tree.xml). A plain COMMAND_START received here is
+/// the operator continuing the SAME run they just paused, targeted single
+/// area included, not asking for the whole lawn — see the exception this
+/// carves out of clearSingleAreaMode's unconditional-clear-on-Start rule at
+/// the call site in behavior_tree_node.cpp.
+///
+/// Deliberately narrower than "not a charge hold": IDLE_DOCKED (a finished /
+/// never-started session — EndSession already cleared the target, so this is
+/// moot) and the charge-hold states (isChargeHoldState — a low-battery dock
+/// or emergency that kept the session alive without EndSession, where the
+/// operator pressing Start explicitly does expect the whole lawn per
+/// clearSingleAreaMode's doc comment) must both keep the historical clear.
+/// StopHoldSequence is the only branch that publishes IDLE without also
+/// being reachable from a charge hold or a session end, so the state_name
+/// alone disambiguates without needing extra context fields.
+inline bool isResumableHoldState(const std::string& state_name)
+{
+  return state_name == "IDLE";
 }
 
 }  // namespace mowgli_behavior
