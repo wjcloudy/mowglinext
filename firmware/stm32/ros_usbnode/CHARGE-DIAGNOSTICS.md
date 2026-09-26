@@ -1,5 +1,18 @@
 # Charging diagnostic firmware for mower .118
 
+**Current build selection (26 September 2026):** maintain `codex/lfp-firmware`.
+Use `Yardforce500B_LFP_DMA_DIAG` (legacy alias `Yardforce500B_LFP_DIAG`) or
+`Yardforce500B_LFP_IRQ_DIAG`. Both use protocol 7 and the 29,688-byte ABI-2
+recorder; sections describing protocol 6 / ABI 1 below are historical.
+See [LFP.md](LFP.md) for the target matrix and qualification procedure.
+
+IRQ monitoring records one full five-channel scan after the NTC conversion;
+`batch_tick` in decoded output is scan completion time and `batch_row=65535`
+identifies IRQ acquisition. DMA retains rows 0–3 and batch-service timestamps.
+Neither timestamp represents simultaneous acquisition of all channels. Capture
+duration depends on the selected sampler; do not apply the DMA history duration
+to IRQ captures. Both raw writers continue contact protection after logging freezes.
+
 **Current recorder (ABI 2):** see [CHARGING-EARLY-CAPTURE.md](CHARGING-EARLY-CAPTURE.md)
 for the 7 September failure evidence, earlier trigger, longer history and
 maximum-duty investigation. The sections below describe the original ABI 1

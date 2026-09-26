@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the production DMA IRQ, recorder and unchanged ADC safety behavior."""
+"""Exercise both production ADC paths, recorder and unchanged safety behavior."""
 import argparse
 import os
 from pathlib import Path
@@ -185,6 +185,50 @@ int main(void) {
 '''
 
 
+IRQ_EXTRA = r'''
+#include <string.h>
+int main(void) {
+    baseline_main(); /* Same freshness/fault-cutoff suite with monitoring on. */
+    reset();
+    memset((void *)&charge_diag, 0, sizeof(charge_diag));
+    charge_diag.magic = 0x43484447u; charge_diag.version = CHARGE_DIAG_VERSION;
+    charge_diag.raw_capacity = CHARGE_DIAG_RAW_COUNT;
+    charge_diag.control_capacity = CHARGE_DIAG_CONTROL_COUNT;
+    charge_diag.slow_capacity = CHARGE_DIAG_SLOW_COUNT;
+    charge_diag.event_capacity = CHARGE_DIAG_EVENT_COUNT;
+    const uint16_t scan[] = {3120, 2200, 3200, 2300, 1200};
+    for (unsigned i = 0; i < 4; ++i) {
+        test_tick++;
+        test_adc.DR = scan[i];
+        HAL_ADC_ConvCpltCallback(&ADC_Charging_Handle);
+        assert(charge_diag.raw_count == 0); /* Never record a partial scan. */
+    }
+    test_tick++; test_adc.DR = scan[4];
+    HAL_ADC_ConvCpltCallback(&ADC_Charging_Handle);
+    assert(charge_diag.raw_count == 1 && charge_diag.raw_seq == 2);
+    assert(charge_diag.raw[0].tick == 5 && charge_diag.raw[0].row == UINT16_MAX);
+    for (unsigned i = 0; i < 5; ++i) assert(charge_diag.raw[0].adc[i] == scan[i]);
+    ADC_input(); assert(ADC_ChargingHealthy());
+    for (unsigned i=0; i<1100; ++i) fresh();
+    assert(charge_diag.raw_count == 1101);
+    ChargeDiag_Freeze(test_tick, 2);
+    unsigned count = charge_diag.raw_count;
+    /* Recording stopped, but a contact loss must still zero PWM immediately. */
+    charge_protection.inhibited = 0; charge_protection.starts = 1;
+    TIM1->CCR1 = chargecontrol_pwm_val = 1390;
+    adc_charging_eChannelSelection = ADC_CHARGING_CHANNEL_CHARGERINPUTVOLTAGE;
+    test_adc.DR = 0; HAL_ADC_ConvCpltCallback(&ADC_Charging_Handle);
+    assert(charge_protection.inhibited && TIM1->CCR1 == 0);
+    adc_charging_eChannelSelection = ADC_CHARGING_CHANNEL_CURRENT;
+    fresh(); assert(charge_diag.raw_count == count);
+    FILE *f = fopen("irq.bin", "wb"); assert(f);
+    assert(fwrite((const void *)&charge_diag, sizeof(charge_diag), 1, f) == 1); fclose(f);
+    puts("PASS: IRQ complete-scan capture, timestamp provenance, wrap, freeze and independent contact cutoff");
+    return 0;
+}
+'''
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cc', default=os.environ.get('CC', 'cc'))
@@ -210,7 +254,7 @@ def main():
         (out / 'charger_under_test.c').write_text(without_timer_init((FW / 'src/charger.c').read_text()))
         (out / 'diag_under_test.c').write_text((FW / 'src/charge_diag.c').read_text())
         (out / 'test.c').write_text(test + '\n#include "diag_under_test.c"\n' + EXTRA)
-        defs = ['CHARGE_DIAGNOSTICS=1', 'BOARD_YARDFORCE500_VARIANT_B=1', 'BOARD_YARDFORCE500B_LFP=1']
+        defs = ['CHARGE_DIAGNOSTICS=1', 'ADC_CHARGING_DMA=1', 'BOARD_YARDFORCE500_VARIANT_B=1', 'BOARD_YARDFORCE500B_LFP=1']
         binary = out / ('test.exe' if os.name == 'nt' else 'test')
         if Path(args.cc).stem.lower() == 'cl':
             cmd = [args.cc, '/nologo', '/std:c11', '/utf-8', '/W3', '/I' + str(FW / 'include'),
@@ -262,6 +306,14 @@ def main():
             else:
                 raise AssertionError('invalid/live/moving dump accepted')
         print('PASS: decoder reads production C layout and rejects truncated/live/moving/invalid dumps')
+        irq_test = adc.TEST.replace('int main(void)', 'int baseline_main(void)')
+        (out / 'test.c').write_text(irq_test + '\n#include "diag_under_test.c"\n' + IRQ_EXTRA)
+        irq_cmd = [part.replace('ADC_CHARGING_DMA=1', 'ADC_CHARGING_DMA=0') for part in cmd]
+        subprocess.run(irq_cmd, cwd=out, check=True)
+        subprocess.run([str(binary)], cwd=out, check=True)
+        irq = decode((out / 'irq.bin').read_bytes())
+        assert len(irq['raw']) == 1024 and all(row['batch_row'] == 65535 for row in irq['raw'])
+        print('PASS: ABI-2 decoder preserves IRQ scan provenance')
 
 
 if __name__ == '__main__':

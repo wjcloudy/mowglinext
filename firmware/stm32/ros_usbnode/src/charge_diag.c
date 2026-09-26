@@ -15,7 +15,7 @@ volatile charge_diag_t charge_diag = {
     .event_capacity = CHARGE_DIAG_EVENT_COUNT
 };
 
-/* The DMA IRQ is the sole raw writer; foreground is the sole control writer.
+/* The selected ADC IRQ is the sole raw writer; foreground is the control writer.
  * Independent sequence counters let an external reader reject a moving dump.
  * No logging, allocation, register writes or charging decisions here. */
 void ChargeDiag_RawBatch(uint32_t now, const uint16_t samples[20])
@@ -39,6 +39,24 @@ void ChargeDiag_RawBatch(uint32_t now, const uint16_t samples[20])
 void ChargeDiag_MissedBatch(void)
 {
     if (!charge_diag.freeze_reason) ++charge_diag.missed_batches;
+}
+
+/* IRQ acquisition records a complete scan only after the final NTC channel.
+ * Keep the ABI-2 layout; row=UINT16_MAX identifies its different timestamp
+ * provenance. This observes samples and never changes charge regulation. */
+void ChargeDiag_RawScan(uint32_t now, const uint16_t samples[5])
+{
+    if (charge_diag.freeze_reason) return;
+    ++charge_diag.raw_seq;
+    __DMB();
+    volatile charge_diag_raw_t *r = &charge_diag.raw[
+        charge_diag.raw_count % CHARGE_DIAG_RAW_COUNT];
+    r->tick = now;
+    for (unsigned channel = 0; channel < 5; ++channel) r->adc[channel] = samples[channel];
+    r->row = UINT16_MAX;
+    ++charge_diag.raw_count;
+    __DMB();
+    ++charge_diag.raw_seq;
 }
 
 void ChargeDiag_Freeze(uint32_t now, uint32_t reason)

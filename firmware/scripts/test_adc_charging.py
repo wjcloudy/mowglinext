@@ -216,8 +216,11 @@ def main():
             (FW / 'src/charger.c').read_text(encoding='utf-8')), encoding='utf-8')
         (out / 'test.c').write_text(TEST, encoding='utf-8')
         binary = out / ('test.exe' if os.name == 'nt' else 'test')
-        for defs in [['BOARD_YARDFORCE500_VARIANT_B=1', 'BOARD_YARDFORCE500B_LFP=1'],
-                     ['BOARD_YARDFORCE500_VARIANT_B=1'], ['BOARD_YARDFORCE500_VARIANT_ORIG=1']]:
+        for defs in [['BOARD_YARDFORCE500_VARIANT_B=1', 'BOARD_YARDFORCE500B_LFP=1', 'ADC_CHARGING_DMA=0'],
+                     ['BOARD_YARDFORCE500_VARIANT_B=1', 'BOARD_YARDFORCE500B_LFP=1', 'ADC_CHARGING_DMA=1'],
+                     ['BOARD_YARDFORCE500_VARIANT_B=1'],
+                     ['BOARD_YARDFORCE500_VARIANT_B=1', 'ADC_CHARGING_DMA=1'],
+                     ['BOARD_YARDFORCE500_VARIANT_ORIG=1']]:
             if Path(args.cc).stem.lower() == 'cl':
                 cmd = [args.cc, '/nologo', '/std:c11', '/utf-8', '/W3', '/I' + str(FW / 'include'),
                        *('/D' + d for d in defs), 'test.c', '/Fe:' + str(binary)]
@@ -227,6 +230,21 @@ def main():
                        *('-D' + d for d in defs), 'test.c', '-lm', '-o', str(binary)]
             subprocess.run(cmd, cwd=out, check=True)
             subprocess.run([str(binary)], cwd=out, check=True)
+
+        # Reject unsupported hardware/flag combinations before any HAL code.
+        (out / 'test.c').write_text('#include "firmware_features.h"\nint main(void) { return 0; }\n')
+        prefix = '/D' if Path(args.cc).stem.lower() == 'cl' else '-D'
+        base_cmd = [part for part in cmd if not part.startswith(prefix)]
+        for defs, error in [
+            (['ADC_CHARGING_DMA=1', 'BOARD_YARDFORCE500_VARIANT_ORIG=1'], 'STM32F401'),
+            (['CHARGE_DIAGNOSTICS=1', 'BOARD_YARDFORCE500_VARIANT_B=1'], '500B LFP'),
+            (['ADC_CHARGING_DMA=2'], 'must be 0 or 1'),
+            (['CHARGE_DIAGNOSTICS=2'], 'must be 0 or 1'),
+        ]:
+            result = subprocess.run(base_cmd + [prefix + d for d in defs], cwd=out,
+                                    text=True, capture_output=True)
+            assert result.returncode != 0 and error in result.stdout + result.stderr
+        print('PASS: unsupported ADC/monitoring combinations are rejected at compile time')
 
 
 if __name__ == '__main__':

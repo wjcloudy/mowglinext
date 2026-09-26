@@ -5,7 +5,7 @@ on:
     # Build-check feature branches too (the GUI flashes firmware FROM the branch
     # source via `platformio run`, so a branch must compile before it can be
     # flashed). Mirrors ros2-ci.yml's branch set.
-    branches: [main, dev, 'feat/**', 'fix/**', 'refactor/**', 'chore/**', 'perf/**']
+    branches: [main, dev, 'feat/**', 'fix/**', 'refactor/**', 'chore/**', 'perf/**', 'codex/lfp-firmware']
     # Tag pushes additionally publish prebuilt binaries (see the `release` job).
     tags:
       - "v*.*.*"
@@ -37,6 +37,12 @@ jobs:
       - name: Exercise ADC freshness and charger fault cutoff
         run: python3 firmware/scripts/test_adc_charging.py
 
+      - name: Test charge protection and both monitoring backends
+        run: |
+          python3 firmware/scripts/test_charge_protection.py
+          python3 firmware/scripts/test_adc_gpio.py
+          python3 firmware/scripts/test_charge_diag.py
+
       - name: Test blade direction and stopped reversal on both board variants
         run: python3 firmware/scripts/test_blade_reverse.py
 
@@ -55,7 +61,11 @@ jobs:
         environment:
           - Yardforce500
           - Yardforce500B
-          - Yardforce500B_LFP
+          - Yardforce500B_LFP_IRQ
+          - Yardforce500B_LFP_DMA
+          - Yardforce500B_LFP_IRQ_DIAG
+          - Yardforce500B_LFP_DMA_DIAG
+          - Yardforce500B_LFP_DEBUG
           - Yardforce500_COASTDOWN_VALIDATION
     steps:
       - uses: actions/checkout@v6

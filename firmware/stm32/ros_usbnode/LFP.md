@@ -1,22 +1,65 @@
 # Custom Yardforce 500B LFP firmware
 
-All three branches include upstream `dev` at `e36ecea9` and the blade reversal
-fix from PR #559 at `ac5d167b` (19 September 2026). The LFP charging profile,
-ADC selection and custom 500B hardware behavior remain branch-specific.
+Maintain **`codex/lfp-firmware`** in `wjcloudy/mowglinext` from now on. It combines
+the three former firmware branches, including upstream dev `ea634cd9`, protocol
+7, LFP charging, sensor recovery, temperature correction and blade reversal.
+Acquisition and monitoring are independent compile-time choices.
 
-## Branches and builds
+## Build targets
 
-| Branch | Purpose | Build environment |
+| Acquisition | Charge monitoring | Build environment |
 | --- | --- | --- |
-| `fix/wheel-pi-ticks-lfp` | Interrupt ADC; average each 10 ms window | `Yardforce500B_LFP` |
-| `fix/wheel-pi-ticks-lfp-adc` | Circular DMA; average 8 voltage scans | `Yardforce500B_LFP` |
-| `codex/lfp-charge-early-capture` | DMA plus charge diagnostics / early-capture investigation; .118 deployment line | `Yardforce500B_LFP_DIAG` |
+| Interrupt; average each foreground window | Off | `Yardforce500B_LFP_IRQ` |
+| Circular DMA; average 8 voltage scans | Off | `Yardforce500B_LFP_DMA` |
+| Interrupt | On | `Yardforce500B_LFP_IRQ_DIAG` |
+| Circular DMA | On | `Yardforce500B_LFP_DMA_DIAG` |
 
-Select the environment explicitly with `pio run -e <environment>`; the default
-remains the stock 500. The interrupt branch also retains `Yardforce500B_LFP_DEBUG`.
-The diagnostics environment retains recorder ABI 2 and the PWM ceiling of 1390.
+From `firmware/stm32/ros_usbnode`, use `pio run -e <environment>`. The default
+remains stock 500. `Yardforce500B_LFP` is the base IRQ target with monitoring off;
+`Yardforce500B_LFP_DIAG` remains a compatibility alias for **DMA + monitoring**.
+`Yardforce500B_LFP_DEBUG` retains the old IRQ remote-debug configuration.
+All LFP targets retain PWM ceiling 1390. Monitoring uses recorder ABI 2.
 Use its matching ELF when obtaining recorder addresses; never reuse an address
 from another build. Plain LFP builds omit the diagnostic recorder.
+
+`include/firmware_features.h` defaults both `ADC_CHARGING_DMA` and
+`CHARGE_DIAGNOSTICS` to 0. Each must be 0 or 1. DMA is supported on 500B only;
+monitoring requires 500B LFP, with either sampler. Standard 500/500B targets
+select IRQ and no monitoring. Neither flag selects battery chemistry or changes
+charge limits: those remain selected by `BOARD_YARDFORCE500B_LFP`.
+
+### Former branches (frozen reference points)
+
+| Former branch / commit | Replacement target |
+| --- | --- |
+| `fix/wheel-pi-ticks-lfp` / `79eae808` | `Yardforce500B_LFP_IRQ` |
+| `fix/wheel-pi-ticks-lfp-adc` / `01517f87` | `Yardforce500B_LFP_DMA` |
+| `codex/lfp-charge-early-capture` / `629ae37f` | `Yardforce500B_LFP_DMA_DIAG` |
+
+Keep these old branches as deployment history; merge future upstream dev work
+only into `codex/lfp-firmware`. No deployment is implied by this consolidation:
+.118 was last flashed from `629ae37f`, firmware 1.11.92/protocol 7. The new IRQ
+monitoring combination has software coverage but no physical qualification yet.
+
+### Upstream maintenance
+
+Keep both ADC paths in shared `adc.c`; select DMA hardware setup, timer period,
+scan ranks, IRQ handling and averaging with `ADC_CHARGING_DMA`, not board type.
+The actual MCU still selects HAL constants. Keep charge protection active whether
+monitoring is disabled, live or frozen. Run the native harnesses and CI build
+matrix (four LFP combinations plus stock boards and retained debug target).
+Do not publish LFP binaries under stock release manifest entries; release packaging
+and GUI build selection can be proposed separately upstream.
+
+HARDWARE_PENDING for the consolidated targets: use .118/500B LFP, record the exact
+commit, binary SHA256, target/flags and host digest; use a matching protocol 7 host.
+With blades removed, clear rotor/wheels and accessible cutoff, verify IDLE/zero
+motion, progressing ADC/IMU data, healthy tilt, correct temperature and 28.5 V/1.8 A
+charge ceilings. Supervised redocking must cut duty on input loss and restart only
+on fresh stable input. For monitoring builds, require a frozen dump with the correct
+sample provenance and no loss of charging protection. Overnight charging and blade
+reversal require separate field acceptance; earlier images' measurements do not
+qualify these newly built targets.
 
 ## Blade reversal synchronization
 

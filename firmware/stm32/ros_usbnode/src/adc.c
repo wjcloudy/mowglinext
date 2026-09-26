@@ -21,7 +21,7 @@
 #include "charge_diag.h"
 #include "charge_protection.h"
 
-#define ADC_CHARGING_USES_DMA BOARD_YARDFORCE500_VARIANT_B
+#define ADC_CHARGING_USES_DMA ADC_CHARGING_DMA
 /******************************************************************************
  * Module Preprocessor Constants
  *******************************************************************************/
@@ -50,7 +50,7 @@ typedef enum
  *******************************************************************************/
 TIM_HandleTypeDef TIM2_Handle; // Time Base for ADC
 ADC_HandleTypeDef ADC_Charging_Handle;
-#if BOARD_YARDFORCE500_VARIANT_B
+#if ADC_CHARGING_USES_DMA
 DMA_HandleTypeDef hdma_adc1; // CLOUDY: charging ADC1 via DMA2_Stream0 (background scan)
 #endif
 RTC_HandleTypeDef hrtc = {0};
@@ -62,7 +62,7 @@ volatile uint16_t adc_u16Current              = 0;
 volatile uint16_t adc_u16ChargerVoltage       = 0;
 volatile uint16_t adc_u16ChargerInputVoltage  = 0;
 volatile uint16_t adc_u16Input_NTC            = 0;
-#if BOARD_YARDFORCE500_VARIANT_B
+#if ADC_CHARGING_USES_DMA
 /* CLOUDY: how many full channel scans the circular DMA buffer holds. On LFP we
  * keep N recent scans so ADC_input() can boxcar-average the noisy battery and
  * charge-voltage columns (~sqrt(N) noise rejection ahead of the IIR); the F401
@@ -75,6 +75,17 @@ volatile uint16_t adc_u16Input_NTC            = 0;
 #endif
 // CLOUDY: circular-DMA target for the full channel scan(s); ADC_input() reads it directly
 volatile uint16_t adc_inputDmaBuf[ADC_DMA_OVERSAMPLE * ADC_CHARGING_CHANNEL_MAX] = {0};
+#endif
+
+#if !ADC_CHARGING_USES_DMA && BOARD_YARDFORCE500B_LFP
+/* CLOUDY: boxcar oversampling for the two noisy charge rails. The ISR sums
+ * every raw conversion as it lands; ADC_input() averages and clears the
+ * accumulator each 10ms window, giving ~sqrt(N) noise reduction before the
+ * IIR filter runs (the F401 has no hardware oversampler). */
+volatile uint32_t adc_u32BatteryAcc           = 0;
+volatile uint16_t adc_u16BatteryCnt           = 0;
+volatile uint32_t adc_u32ChargerAcc           = 0;
+volatile uint16_t adc_u16ChargerCnt           = 0;
 #endif
 
 float battery_voltage;
@@ -97,11 +108,6 @@ static volatile uint8_t adc_scan_seen;
 static volatile uint32_t adc_last_scan_ms;
 static uint8_t adc_input_ready;
 static uint32_t adc_last_input_ms;
-#if CHARGE_DIAGNOSTICS
-#if !BOARD_YARDFORCE500B_LFP || !BOARD_YARDFORCE500_VARIANT_B
-#error Charge diagnostics require the 500B LFP DMA profile
-#endif
-#endif
 uint8_t ADC_ChargingFaulted(void) { return adc_charging_fault; }
 #if BOARD_YARDFORCE500B_LFP && ADC_CHARGING_USES_DMA
 /* CLOUDY: LFP always uses this IRQ, including non-diagnostic builds. Timestamp
@@ -247,7 +253,7 @@ void TIM2_Init(void)
     TIM2_Handle.Instance = TIM2;
     TIM2_Handle.Init.Prescaler = 18 - 1; // 72Mhz -> 4Mhz
     TIM2_Handle.Init.CounterMode = TIM_COUNTERMODE_UP;
-#if BOARD_YARDFORCE500_VARIANT_B
+#if ADC_CHARGING_USES_DMA
     TIM2_Handle.Init.Period = 4000 - 1; // CLOUDY slower trigger so a full multi-channel DMA scan fits comfortably
 #else
     TIM2_Handle.Init.Period = 1000 - 1; /*1khz*/
@@ -345,14 +351,18 @@ void ADC_Charging_Init(void)
 	ADC_Charging_Handle.Init.NbrOfConversion = 1;
 
 #if BOARD_YARDFORCE500_VARIANT_B
-	ADC_Charging_Handle.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
-	ADC_Charging_Handle.Init.Resolution = ADC_RESOLUTION_12B;
-	ADC_Charging_Handle.Init.ScanConvMode = ENABLE;                      // CLOUDY scan all channels per trigger
-	ADC_Charging_Handle.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
-    ADC_Charging_Handle.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_CC2;
-	ADC_Charging_Handle.Init.NbrOfConversion = ADC_CHARGING_CHANNEL_MAX; // CLOUDY full scan -> DMA buffer
-	ADC_Charging_Handle.Init.DMAContinuousRequests = ENABLE;             // CLOUDY keep DMA fed across triggers (circular)
-	ADC_Charging_Handle.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+    ADC_Charging_Handle.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    ADC_Charging_Handle.Init.Resolution = ADC_RESOLUTION_12B;
+    ADC_Charging_Handle.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
+#if ADC_CHARGING_USES_DMA
+    ADC_Charging_Handle.Init.ScanConvMode = ENABLE;
+    ADC_Charging_Handle.Init.NbrOfConversion = ADC_CHARGING_CHANNEL_MAX;
+    ADC_Charging_Handle.Init.DMAContinuousRequests = ENABLE;
+    ADC_Charging_Handle.Init.EOCSelection = ADC_EOC_SEQ_CONV;
+#else
+    ADC_Charging_Handle.Init.DMAContinuousRequests = DISABLE;
+    ADC_Charging_Handle.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+#endif
 #endif
 
     if (HAL_ADC_Init(&ADC_Charging_Handle) != HAL_OK)
@@ -361,7 +371,7 @@ void ADC_Charging_Init(void)
     }
 
 	adc_charging_eChannelSelection = ADC_CHARGING_CHANNEL_CURRENT;
-#if BOARD_YARDFORCE500_VARIANT_B
+#if ADC_CHARGING_USES_DMA
 	// CLOUDY put every channel into the scan sequence (ranks 1..MAX)
 	while (adc_charging_eChannelSelection < ADC_CHARGING_CHANNEL_MAX)
 	{
@@ -373,16 +383,27 @@ void ADC_Charging_Init(void)
 	adc_charging_SetChannel(adc_charging_eChannelSelection);
 #endif
 
+#if !ADC_CHARGING_USES_DMA
 #if BOARD_YARDFORCE500_VARIANT_ORIG
 	IRQn_Type used_ADC_irq = ADC1_2_IRQn;
+#elif BOARD_YARDFORCE500_VARIANT_B
+	IRQn_Type used_ADC_irq = ADC_IRQn;
+#endif
+
     HAL_NVIC_SetPriority(used_ADC_irq, 0, 0);
     HAL_NVIC_EnableIRQ(used_ADC_irq);
 
+#if BOARD_YARDFORCE500_VARIANT_ORIG
     // calibrate  - important for accuracy !
     HAL_ADCEx_Calibration_Start(&ADC_Charging_Handle);
+
+	// TODO: The STM32f4 does not have a function to calibrate the ADC,
+	//		 so we either need manual calibration or just assume it is
+	// 		 calibrated correctly all the time
+#endif
     if (HAL_ADC_Start_IT(&ADC_Charging_Handle) != HAL_OK)
         adc_charging_fault = 1;
-#elif BOARD_YARDFORCE500_VARIANT_B
+#else
     // CLOUDY: drive the charging ADC by DMA instead of per-conversion interrupts.
     // ADC1 -> DMA2_Stream0 (channel 0), circular; one full channel scan per TIM2 trigger
     // lands in adc_inputDmaBuf[]. ADC_input() polls completion/error flags and
@@ -464,7 +485,7 @@ void ADC_input(void)
     if (!adc_scan_seen) return;
 #endif
 
-#if BOARD_YARDFORCE500_VARIANT_B
+#if ADC_CHARGING_USES_DMA
     /* TC is sticky even though the circular NDTR counter wraps. Equal NDTR
      * readings across 10 ms therefore cannot hide a stopped DMA stream. */
 #if BOARD_YARDFORCE500B_LFP
@@ -545,7 +566,22 @@ void ADC_input(void)
     uint16_t raw_current       = adc_u16Current;
     uint16_t raw_chargerInput  = adc_u16ChargerInputVoltage;
     uint16_t raw_ntc           = adc_u16Input_NTC;
+#if BOARD_YARDFORCE500B_LFP
+    /* Snapshot and clear the boxcar accumulators atomically with the raw reads */
+    uint32_t batt_acc = adc_u32BatteryAcc; uint16_t batt_cnt = adc_u16BatteryCnt;
+    uint32_t chg_acc  = adc_u32ChargerAcc; uint16_t chg_cnt  = adc_u16ChargerCnt;
+    adc_u32BatteryAcc = 0; adc_u16BatteryCnt = 0;
+    adc_u32ChargerAcc = 0; adc_u16ChargerCnt = 0;
+#endif
     __enable_irq();
+
+#if BOARD_YARDFORCE500B_LFP
+    /* Use the mean of every conversion taken since the last call; fall back to
+     * the latest single sample on the (practically impossible) empty window. */
+    if (batt_cnt) raw_battery = (uint16_t)(batt_acc / batt_cnt);
+    if (chg_cnt)  raw_charger = (uint16_t)(chg_acc  / chg_cnt);
+#endif
+
 #endif
 
     /* Start the IIRs at measured values, not zero, before enabling charging. */
@@ -610,11 +646,9 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
     }
 #endif
 
+#if !ADC_CHARGING_USES_DMA
     if (hadc == &ADC_Charging_Handle)
     {
-#if BOARD_YARDFORCE500_VARIANT_ORIG
-        /* CLOUDY VARIANT_B reads the charging ADC via the DMA buffer, so this
-           per-conversion ISR path is ORIG-only. */
         uint16_t l_u16Rawdata = ADC_Charging_Handle.Instance->DR;
 
         switch (adc_charging_eChannelSelection)
@@ -625,18 +659,36 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         case ADC_CHARGING_CHANNEL_CHARGEVOLTAGE:
             adc_u16ChargerVoltage = l_u16Rawdata;
+#if BOARD_YARDFORCE500B_LFP
+            adc_u32ChargerAcc += l_u16Rawdata;
+            adc_u16ChargerCnt++;
+#endif
             break;
 
         case ADC_CHARGING_CHANNEL_BATTERYVOLTAGE:
             adc_u16BatteryVoltage = l_u16Rawdata;
+#if BOARD_YARDFORCE500B_LFP
+            adc_u32BatteryAcc += l_u16Rawdata;
+            adc_u16BatteryCnt++;
+#endif
             break;
 
         case ADC_CHARGING_CHANNEL_CHARGERINPUTVOLTAGE:
             adc_u16ChargerInputVoltage = l_u16Rawdata;
+#if BOARD_YARDFORCE500B_LFP
+            /* CLOUDY: keep the IRQ sampler; publish input at channel completion
+             * so contact bounce cannot hide behind ADC_input's 11 ms cadence. */
+            Charger_InputSample(l_u16Rawdata, HAL_GetTick());
+#endif
             break;
 
         case ADC_CHARGING_CHANNEL_NTC:
             adc_u16Input_NTC = l_u16Rawdata;
+#if CHARGE_DIAGNOSTICS
+            const uint16_t scan[5] = {adc_u16Current, adc_u16ChargerVoltage,
+                adc_u16BatteryVoltage, adc_u16ChargerInputVoltage, adc_u16Input_NTC};
+            ChargeDiag_RawScan(HAL_GetTick(), scan);
+#endif
             adc_last_scan_ms = HAL_GetTick();
             adc_scan_seen = 1;
 
@@ -653,10 +705,16 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 			adc_charging_eChannelSelection = ADC_CHARGING_CHANNEL_CURRENT;
 		adc_charging_SetChannel(adc_charging_eChannelSelection);
 
-        if (HAL_ADC_Start_IT(&ADC_Charging_Handle) != HAL_OK)
+        if (HAL_ADC_Start_IT(&ADC_Charging_Handle) != HAL_OK) {
             adc_charging_fault = 1;
+#if BOARD_YARDFORCE500B_LFP
+            Charger_InputInvalid();
 #endif
+        }
     }
+#else
+    (void)hadc;
+#endif
 }
 
 
@@ -674,7 +732,11 @@ void adc_charging_SetChannel(ADC_Charging_channelSelection_e channel)
 	uint32_t rank = 1;
 #elif BOARD_YARDFORCE500_VARIANT_B
 	uint32_t adc_SampleTime = ADC_SAMPLETIME_480CYCLES;
-	uint32_t rank = 1 + (uint32_t)channel; // CLOUDY scan-sequence position for the DMA multi-channel scan
+#if ADC_CHARGING_USES_DMA
+    uint32_t rank = 1 + (uint32_t)channel;
+#else
+    uint32_t rank = 1;
+#endif
 #endif
 
     switch (channel)

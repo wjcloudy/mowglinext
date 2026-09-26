@@ -1,6 +1,7 @@
 #ifndef CHARGE_DIAG_H
 #define CHARGE_DIAG_H
 #include <stdint.h>
+#include "firmware_features.h"
 
 #if CHARGE_DIAGNOSTICS
 #define CHARGE_DIAG_RAW_COUNT 1024u
@@ -9,9 +10,9 @@
 #define CHARGE_DIAG_EVENT_COUNT 32u
 #define CHARGE_DIAG_VERSION 2u
 typedef struct {
-    uint32_t tick; /* DMA batch service time, NOT individual conversion time */
+    uint32_t tick; /* DMA batch service or IRQ scan completion time */
     uint16_t adc[5]; /* current, output, battery, input, NTC */
-    uint16_t row; /* row within the four-scan DMA half */
+    uint16_t row; /* DMA half row 0..3; UINT16_MAX for one IRQ scan */
 } charge_diag_raw_t;
 typedef struct {
     uint32_t tick, gap_ms;
@@ -49,6 +50,7 @@ typedef struct {
 } charge_diag_t;
 extern volatile charge_diag_t charge_diag;
 void ChargeDiag_RawBatch(uint32_t now, const uint16_t samples[20]);
+void ChargeDiag_RawScan(uint32_t now, const uint16_t samples[5]);
 void ChargeDiag_MissedBatch(void);
 /* Foreground only: 1 ADC, 2 failed output, 3 legacy restart budget,
  * 4 early output loss (observation only; NOT a charger protection fault). */
