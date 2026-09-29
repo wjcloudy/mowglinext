@@ -70,10 +70,10 @@
 /// PWM safety ceiling (TIM1 period is 1400; stock cap was 1350).
 /// An 8S LFP at ~28.5V on the ~29-30V rail has little buck headroom, so it
 /// needs more duty to reach full current ("different charge-current/PWM curve").
-/// CLOUDY 2026-09-07 trial: reduce 1395 to 1390, preserving near-full headroom.
+/// CLOUDY 2026-09-29 trial: reduce 1390 to 1385 after .118 lost charge at 1390.
 /// This still suppresses OC1N with DTG=40; it is a peak-duty experiment, not a
 /// dead-time fix. Keep the ABI-2 recorder and compare overnight stability.
-#define MAX_PWM_VALUE 1390
+#define MAX_PWM_VALUE 1385
 /// PWM floor kept while still actively regulating (was the magic value 39)
 #define MIN_PWM_VALUE 39
 /// Fixed current-sensor offset [A]. Replaces auto-zeroing at dock, which is wrong

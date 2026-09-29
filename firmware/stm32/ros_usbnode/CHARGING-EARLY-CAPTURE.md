@@ -1,5 +1,14 @@
 # Early charging capture: .118, 7 September 2026
 
+**1385 trial update (29 September):** the 1390 image on .118 again lost charge
+after extended operation. Its frozen diagnostic trace held requested and timer
+PWM at 1390 while regulated output and charge current fell; dock input stayed
+present. The user selected a further five-count reduction to 1385. This remains
+an unproven peak-duty experiment: with ARR=1400 and DTG=40, 16 counts before
+dead time still suppress the complementary pulse. Keep the recorder and compare
+an overnight charge against the 1390 failure baseline. The 7 September and
+1390 findings below are historical observations, not 1385 acceptance evidence.
+
 **1390 trial update:** following the observation-only 1.9.123 deployment, the
 user selected a five-count reduction from 1395 to 1390 to preserve near-full
 headroom. This revision changes only the LFP maximum PWM, retaining ABI 2 and
