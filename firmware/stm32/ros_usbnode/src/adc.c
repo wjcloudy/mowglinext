@@ -28,6 +28,14 @@
 const float f_RTO = 10000;
 const float beta = 3380;
 
+/* DR1-4 hold two IEEE-754 values, DR5 is reserved for the watchdog
+ * breadcrumb, and DR6 is available on both supported RTC implementations.
+ * Keep the marker within the F1's 16-bit backup-register width. */
+#define RTC_BACKUP_FORMAT_MARKER 0x4D47u
+#define RTC_BACKUP_MAX_AMPERE_HOURS 2.8f
+#define RTC_BACKUP_CURRENT_OFFSET_MIN_A ((0.0f - 2.5f) * (100.0f / 12.0f))
+#define RTC_BACKUP_CURRENT_OFFSET_MAX_A ((3.3f - 2.5f) * (100.0f / 12.0f))
+
 /******************************************************************************
  * Module Preprocessor Macros
  *******************************************************************************/
@@ -223,6 +231,23 @@ void HAL_ADC_ErrorCallback(ADC_HandleTypeDef *hadc)
  *******************************************************************************/
 void adc_charging_SetChannel(ADC_Charging_channelSelection_e channel);
 
+static uint8_t rtc_backup_float_is_valid(float value, float minimum, float maximum)
+{
+    return isfinite(value) && value >= minimum && value <= maximum;
+}
+
+static void rtc_backup_reset_charge_state(void)
+{
+    ampere_acc.f = 0.0f;
+    charge_current_offset.f = 0.0f;
+
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, ampere_acc.u[0]);
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR2, ampere_acc.u[1]);
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR3, charge_current_offset.u[0]);
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR4, charge_current_offset.u[1]);
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR6, RTC_BACKUP_FORMAT_MARKER);
+}
+
 /******************************************************************************
  *  Public Functions
  *******************************************************************************/
@@ -310,8 +335,8 @@ void ADC_Charging_Init(void)
 	ADC_TypeDef *Charging_ADC = ADC1;
 #endif
     __HAL_RCC_GPIOA_CLK_ENABLE();
-    // ADC channel 13 is PC3 on both F103 and F401. Configure its port before
-    // acquisition; later TF4 initialization is too late to enable this clock.
+    // The blade NTC uses GPIOC: PC3 on 500 and the measured LFP 500B,
+    // PC2 on the stock F401 profiles. Enable the clock before acquisition.
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -320,13 +345,17 @@ void ADC_Charging_Init(void)
     PA2     ------> Charge Voltage
     PA3     ------> Battery Voltage
     PA7     ------> Charger Voltage
-    PC3     ------>  Blade NTC (ADC channel 13)
+    PC2/PC3 ------>  Blade NTC (profile-specific ADC channel 12/13)
     */
     GPIO_InitStruct.Pin = GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_7;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+#if BOARD_YARDFORCE500_VARIANT_B && !BOARD_YARDFORCE500B_LFP
+    GPIO_InitStruct.Pin = GPIO_PIN_2;
+#else
     GPIO_InitStruct.Pin = GPIO_PIN_3;
+#endif
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
@@ -443,26 +472,58 @@ void ADC_Charging_Init(void)
     if (HAL_TIM_OC_Start(&TIM2_Handle, TIM_CHANNEL_2) != HAL_OK)
         adc_charging_fault = 1;
 
+    /* RTC backup storage is shared with charger persistence and watchdog
+     * breadcrumbs. The F1 HAL ignores the handle for backup registers, but
+     * the F4 HAL dereferences hrtc.Instance. Initialize it before the first
+     * backup-register access on either target. */
+    hrtc.Instance = RTC;
+
     /* USER CODE BEGIN RTC_MspInit 0 */
     __HAL_RCC_PWR_CLK_ENABLE();
     /* USER CODE END RTC_MspInit 0 */
     /* Enable BKP CLK enable for backup registers */
 
 #if BOARD_YARDFORCE500_VARIANT_ORIG
-	// The STM32f4 seems to not require this, but the STM32f1 does
-	// TODO: Check if this is true
+    /* STM32F1 has a separate BKP peripheral clock. */
     __HAL_RCC_BKP_CLK_ENABLE();
 #endif
+
+    /* DBP protects backup-domain configuration, including RTC clock enable. */
+    HAL_PWR_EnableBkUpAccess();
+
     /* Peripheral clock enable */
     __HAL_RCC_RTC_ENABLE();
     /* USER CODE BEGIN RTC_MspInit 1 */
-    HAL_PWR_EnableBkUpAccess();
 
-    ampere_acc.u[0] = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1);
-    ampere_acc.u[1] = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2);
+    if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR6) != RTC_BACKUP_FORMAT_MARKER)
+    {
+        /* Erased or older data has no format guarantee: initialize DR1-4
+         * before publishing the marker. DR5 remains the watchdog breadcrumb. */
+        rtc_backup_reset_charge_state();
+    }
+    else
+    {
+        ampere_acc.u[0] = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR1);
+        ampere_acc.u[1] = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR2);
+        charge_current_offset.u[0] = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR3);
+        charge_current_offset.u[1] = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR4);
 
-    charge_current_offset.u[0] = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR3);
-    charge_current_offset.u[1] = HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR4);
+        /* ChargeController treats the accumulator as 0..2.8 Ah. The offset
+         * is calibrated from the existing ADC conversion over its 0..3.3 V
+         * input range, so reject non-finite and physically impossible values. */
+        if (!rtc_backup_float_is_valid(ampere_acc.f, 0.0f, RTC_BACKUP_MAX_AMPERE_HOURS) ||
+            !rtc_backup_float_is_valid(charge_current_offset.f,
+                                       RTC_BACKUP_CURRENT_OFFSET_MIN_A,
+                                       RTC_BACKUP_CURRENT_OFFSET_MAX_A))
+        {
+            /* Repair both halves of the persisted charge state together so a
+             * corrupt marked payload is not re-read on the next boot. */
+            rtc_backup_reset_charge_state();
+        }
+    }
+
+    /* Runtime writers explicitly open and close backup-domain access. */
+    HAL_PWR_DisableBkUpAccess();
 }
 
 /**
@@ -782,7 +843,11 @@ void adc_charging_SetChannel(ADC_Charging_channelSelection_e channel)
         break;
 
     case ADC_CHARGING_CHANNEL_NTC:
+#if BOARD_YARDFORCE500_VARIANT_B && !BOARD_YARDFORCE500B_LFP
+        sConfig.Channel = ADC_CHANNEL_12; // PC2 on stock F401 profiles
+#else
         sConfig.Channel = ADC_CHANNEL_13; // PC3 Blade NTC; PC2 is channel 12
+#endif
         sConfig.Rank = rank;
         sConfig.SamplingTime = adc_SampleTime;
         if (HAL_ADC_ConfigChannel(&ADC_Charging_Handle, &sConfig) != HAL_OK)

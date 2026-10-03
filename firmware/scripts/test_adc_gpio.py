@@ -50,18 +50,25 @@ static void HAL_GPIO_Init(GPIO_TypeDef *port, GPIO_InitTypeDef *init) {
 
 TEST = r'''
 int main(void) {
-    // Start PC3 in digital input with a pull to catch missing mode/pull setup.
-    port_c.pull[3] = 1;
-    port_c.mode[2] = 2; // unrelated PC2 must not be reconfigured
+    // Start both candidate NTC pins in digital input with pulls. Only the
+    // selected board/profile pin may be reconfigured for analogue sampling.
+    port_c.pull[2] = port_c.pull[3] = 1;
+    port_c.mode[2] = port_c.mode[3] = 2;
     ADC_Charging_Init();
     assert(port_a.clock && port_c.clock);
+#if BOARD_YARDFORCE500_VARIANT_B && !BOARD_YARDFORCE500B_LFP
+    assert(port_c.mode[2] == GPIO_MODE_ANALOG);
+    assert(port_c.pull[2] == GPIO_NOPULL);
+    assert(port_c.mode[3] == 2 && port_c.pull[3] == 1);
+#else
     assert(port_c.mode[3] == GPIO_MODE_ANALOG);
     assert(port_c.pull[3] == GPIO_NOPULL);
-    assert(port_c.mode[2] == 2);
+    assert(port_c.mode[2] == 2 && port_c.pull[2] == 1);
+#endif
     const unsigned pins[] = {1, 2, 3, 7};
     for (unsigned i = 0; i < 4; ++i)
         assert(port_a.mode[pins[i]] == GPIO_MODE_ANALOG);
-    puts("PASS: ADC GPIO clocks, PC3 analogue/no-pull, PA inputs, PC2 preserved");
+    puts("PASS: ADC GPIO clocks, profile NTC pin analogue/no-pull, other pin preserved");
 }
 '''
 
@@ -81,6 +88,7 @@ def main():
         binary = out / ('test.exe' if os.name == 'nt' else 'test')
         for defs in [['BOARD_YARDFORCE500_VARIANT_ORIG=1'],
                      ['BOARD_YARDFORCE500_VARIANT_B=1'],
+                     ['BOARD_YARDFORCE500_VARIANT_B=1', 'BOARD_BILTEMA_RM1000=1'],
                      ['BOARD_YARDFORCE500_VARIANT_B=1', 'BOARD_YARDFORCE500B_LFP=1']]:
             if Path(args.cc).stem.lower() == 'cl':
                 cmd = [args.cc, '/nologo', '/std:c11', '/utf-8', '/W3',

@@ -1,7 +1,7 @@
 # Custom Yardforce 500B LFP firmware
 
 Maintain **`codex/lfp-firmware`** in `wjcloudy/mowglinext` from now on. It combines
-the three former firmware branches, including upstream dev `ea634cd9`, protocol
+the three former firmware branches, now including upstream dev `b189aa4f`, protocol
 7, LFP charging, sensor recovery, temperature correction and blade reversal.
 Acquisition and monitoring are independent compile-time choices.
 
@@ -37,9 +37,10 @@ charge limits: those remain selected by `BOARD_YARDFORCE500B_LFP`.
 | `codex/lfp-charge-early-capture` / `629ae37f` | `Yardforce500B_LFP_DMA_DIAG` |
 
 Keep these old branches as deployment history; merge future upstream dev work
-only into `codex/lfp-firmware`. No deployment is implied by this consolidation:
-.118 was last flashed from `629ae37f`, firmware 1.11.92/protocol 7. The new IRQ
-monitoring combination has software coverage but no physical qualification yet.
+only into `codex/lfp-firmware`. The 29 September image on .118 was built from
+`f985802e` (`Yardforce500B_LFP_DMA_DIAG`, firmware 1.11.94/protocol 7, PWM
+1385). This 3 October upstream merge has not been flashed; the new IRQ monitoring
+combination has software coverage but no physical qualification yet.
 
 ### Upstream maintenance
 
@@ -334,3 +335,30 @@ healthy onboard tilt. Supervise redocking and require zero duty off-dock and
 bounded fresh-input restart; verify the 28.5 V / 1.8 A limits. Overnight charging
 and physical blade reversal remain separate acceptance runs on that exact build;
 no prior hardware measurement proves their result after this merge.
+
+## Upstream dev refresh — 2026-10-03
+
+Merged upstream `b189aa4fd0cc32363d4c7220af0eee7b8a6197d8`. The shared
+actuator authorization, IDLE/re-arm gates, motor and blade safety checks, F401
+RTC initialization, USB re-enumeration and nonblocking SWO handling are retained.
+Upstream's RM1000 targets remain separate from the LFP profile. The wire protocol
+stays at version 7.
+
+The LFP overlay keeps the **1385** PWM ceiling, -0.20 A current offset, 8S charge
+limits, two ADC paths and optional ABI-2 recorder. The measured .118 LFP blade
+temperature input remains **PC3 / ADC channel 13**; stock F401 and RM1000 use
+upstream's **PC2 / channel 12**. `test_adc_gpio.py` checks each profile's pin and
+leaves the other pin alone. Do not use the stock F401 selection for .118 without
+a physical wiring check.
+
+This merged firmware has **not** been flashed to .118. HARDWARE_PENDING: first
+record the exact clean-build commit, binary and ELF hashes, target, host digest,
+robot board/ESC revisions and parameter-store state. With blades removed, wheels
+secured and an accessible cutoff, verify IDLE, zero wheel/blade output, fresh
+IMU/ADC/temperature, protocol compatibility, the 28.5 V / 1.8 A envelope and
+safe charge cutoff/restart on contact loss. Confirm that a new zero command is
+required after each safety stop and that blade reversal waits for physical stop.
+For the DMA diagnostic target, confirm recorder ABI/provenance and preserve a
+frozen trace before any reset. A short postflash charge reading would not prove
+the delayed PWM fault is gone; compare at least one day on the dock with the
+29 September `f985802e` / 1.11.94 baseline.
