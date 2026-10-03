@@ -335,8 +335,9 @@ void ADC_Charging_Init(void)
 	ADC_TypeDef *Charging_ADC = ADC1;
 #endif
     __HAL_RCC_GPIOA_CLK_ENABLE();
-    // The blade NTC uses GPIOC: PC3 on 500 and the measured LFP 500B,
-    // PC2 on the stock F401 profiles. Enable the clock before acquisition.
+    // The blade NTC uses GPIOC: PC3 on 500 and the measured .118 LFP 500B.
+    // TODO: Upstream selects PC2 on stock F401 profiles; that wiring is
+    // unverified and suspected wrong. Verify a stock board before changing it.
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
@@ -844,7 +845,7 @@ void adc_charging_SetChannel(ADC_Charging_channelSelection_e channel)
 
     case ADC_CHARGING_CHANNEL_NTC:
 #if BOARD_YARDFORCE500_VARIANT_B && !BOARD_YARDFORCE500B_LFP
-        sConfig.Channel = ADC_CHANNEL_12; // PC2 on stock F401 profiles
+        sConfig.Channel = ADC_CHANNEL_12; // Upstream stock F401 PC2; see wiring TODO above
 #else
         sConfig.Channel = ADC_CHANNEL_13; // PC3 Blade NTC; PC2 is channel 12
 #endif

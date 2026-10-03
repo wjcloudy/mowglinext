@@ -36,8 +36,8 @@ charge limits: those remain selected by `BOARD_YARDFORCE500B_LFP`.
 | `fix/wheel-pi-ticks-lfp-adc` / `01517f87` | `Yardforce500B_LFP_DMA` |
 | `codex/lfp-charge-early-capture` / `629ae37f` | `Yardforce500B_LFP_DMA_DIAG` |
 
-Keep these old branches as deployment history; merge future upstream dev work
-only into `codex/lfp-firmware`. The 29 September image on .118 was built from
+The former branch commits are reference points; maintain and merge future upstream
+dev work only into `codex/lfp-firmware`. The 29 September image on .118 was built from
 `f985802e` (`Yardforce500B_LFP_DMA_DIAG`, firmware 1.11.94/protocol 7, PWM
 1385). This 3 October upstream merge has not been flashed; the new IRQ monitoring
 combination has software coverage but no physical qualification yet.
@@ -346,10 +346,11 @@ stays at version 7.
 
 The LFP overlay keeps the **1385** PWM ceiling, -0.20 A current offset, 8S charge
 limits, two ADC paths and optional ABI-2 recorder. The measured .118 LFP blade
-temperature input remains **PC3 / ADC channel 13**; stock F401 and RM1000 use
-upstream's **PC2 / channel 12**. `test_adc_gpio.py` checks each profile's pin and
-leaves the other pin alone. Do not use the stock F401 selection for .118 without
-a physical wiring check.
+temperature input remains **PC3 / ADC channel 13**; stock F401 and RM1000 currently
+select upstream's **PC2 / channel 12**. That stock-board wiring is unverified and
+suspected wrong; a physical stock-board check is needed before proposing an upstream
+change. `test_adc_gpio.py` checks each profile's current selection and leaves the
+other pin alone. Do not use the stock F401 selection for .118.
 
 This merged firmware has **not** been flashed to .118. HARDWARE_PENDING: first
 record the exact clean-build commit, binary and ELF hashes, target, host digest,
