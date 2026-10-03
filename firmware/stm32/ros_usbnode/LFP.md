@@ -37,9 +37,14 @@ charge limits: those remain selected by `BOARD_YARDFORCE500B_LFP`.
 | `codex/lfp-charge-early-capture` / `629ae37f` | `Yardforce500B_LFP_DMA_DIAG` |
 
 The former branch commits are reference points; maintain and merge future upstream
-dev work only into `codex/lfp-firmware`. The 29 September image on .118 was built from
+dev work only into `codex/lfp-firmware`. The three old fork/local branch refs were
+removed on 3 October; their complete history is archived on .118 at
+`/home/pi/mower-backups/192.168.1.118/source-history/lfp-former-branches-2026-10-03.bundle`
+(SHA256 `323baf60ec0f5ac6b90722743fa95b80e368ffd71723004872aae9ce6b9df578`).
+The 29 September image on .118 was built from
 `f985802e` (`Yardforce500B_LFP_DMA_DIAG`, firmware 1.11.94/protocol 7, PWM
-1385). This 3 October upstream merge has not been flashed; the new IRQ monitoring
+1385). On 3 October .118 was flashed from clean commit `0238f4b9` using
+`Yardforce500B_LFP_DMA_DIAG`, firmware 1.11.226/protocol 7; the new IRQ monitoring
 combination has software coverage but no physical qualification yet.
 
 ### Upstream maintenance
@@ -327,13 +332,13 @@ On 500B, sector 5 at `0x08020000` is reserved for parameters. Keep the image bel
 preflash backup. First v7 boot may erase foreign data in that reserved sector.
 Use the documented ITM-off flash procedure; do not enable periodic SWD polling.
 
-HARDWARE_PENDING after software verification: on .118 (500B/8S LFP), record the
-exact image SHA256, commit, host image digest and protocol. With blades removed,
-stationary mower, clear wheels/rotor and accessible cutoff, verify startup stays
-IDLE with zero wheel/blade motion, compatible USB telemetry, advancing IMU and
-healthy onboard tilt. Supervise redocking and require zero duty off-dock and
-bounded fresh-input restart; verify the 28.5 V / 1.8 A limits. Overnight charging
-and physical blade reversal remain separate acceptance runs on that exact build;
+The exact image SHA256, commit, host image digest and protocol are recorded in the
+3 October deployment folder. With blades removed, stationary mower, clear wheels/
+rotor and accessible cutoff, the initial check passed: startup stayed IDLE with
+zero wheel/blade motion, compatible USB telemetry and advancing IMU. HARDWARE_PENDING:
+supervise redocking and require zero duty off-dock and bounded fresh-input restart;
+verify the 28.5 V / 1.8 A limits. Overnight charging, onboard tilt response and
+physical blade reversal remain separate acceptance runs on that exact build;
 no prior hardware measurement proves their result after this merge.
 
 ## Upstream dev refresh — 2026-10-03
@@ -352,13 +357,20 @@ suspected wrong; a physical stock-board check is needed before proposing an upst
 change. `test_adc_gpio.py` checks each profile's current selection and leaves the
 other pin alone. Do not use the stock F401 selection for .118.
 
-This merged firmware has **not** been flashed to .118. HARDWARE_PENDING: first
-record the exact clean-build commit, binary and ELF hashes, target, host digest,
-robot board/ESC revisions and parameter-store state. With blades removed, wheels
-secured and an accessible cutoff, verify IDLE, zero wheel/blade output, fresh
-IMU/ADC/temperature, protocol compatibility, the 28.5 V / 1.8 A envelope and
-safe charge cutoff/restart on contact loss. Confirm that a new zero command is
-required after each safety stop and that blade reversal waits for physical stop.
+The 3 October .118 flash record is in
+`/home/pi/mower-backups/192.168.1.118/deployments/2026-10-03_lfp-upstream-0238f4b9/README.md`.
+Its immediate postflash check confirmed protocol 7, IDLE, zero motion/blade RPM,
+fresh IMU, no emergency and positive charge current; it does not establish
+long-duration charging reliability. The recorder ABI-2 symbol is
+`charge_diag` at **0x20000018** in the matching ELF. HARDWARE_PENDING: on this
+exact .118/image/ROS2 baseline, observe charging over the previously problematic
+day-long interval and through contact loss/recovery; pass requires charge output
+and current to remain controlled without a latched failure. If it fails, capture
+the frozen recorder before resetting the MCU. With blades removed, wheels secured
+and an accessible cutoff, separately validate a new zero command after each
+safety stop and blade reversal only after the motor physically stops. Board/ESC
+revisions and the persisted parameter-store values still need recording for a
+complete physical qualification.
 For the DMA diagnostic target, confirm recorder ABI/provenance and preserve a
 frozen trace before any reset. A short postflash charge reading would not prove
 the delayed PWM fault is gone; compare at least one day on the dock with the
