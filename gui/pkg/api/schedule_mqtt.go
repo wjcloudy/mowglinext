@@ -159,6 +159,13 @@ func (b *ScheduleMqttBridge) handleSet(payload []byte, retained bool) {
 		logrus.Error(fmt.Errorf("schedule mqtt bridge: invalid schedules/set payload: %w", err))
 		return
 	}
+	// Which area keys the client actually sent. An integration written before
+	// per-area schedules knows neither and would otherwise reset a per-area
+	// schedule to "all areas" the moment it toggles `enabled`.
+	var sent map[string]json.RawMessage
+	_ = json.Unmarshal(payload, &sent)
+	_, sentAreaID := sent["areaId"]
+	_, sentAreaName := sent["areaName"]
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -167,6 +174,14 @@ func (b *ScheduleMqttBridge) handleSet(payload []byte, retained bool) {
 		return
 	}
 	if existing, err := getSchedule(b.dbProvider, sched.ID); err == nil && existing != nil {
+		// Omitted means "unchanged"; an explicit areaId (including 0 = all areas)
+		// always wins. A name is only carried over for the SAME area.
+		if !sentAreaID {
+			sched.AreaID = existing.AreaID
+			sched.AreaName = existing.AreaName
+		} else if !sentAreaName && sched.AreaID == existing.AreaID {
+			sched.AreaName = existing.AreaName
+		}
 		sched.CreatedAt = existing.CreatedAt
 		sched.LastRun = existing.LastRun
 		sched.LastSkipReason = existing.LastSkipReason
@@ -175,7 +190,7 @@ func (b *ScheduleMqttBridge) handleSet(payload []byte, retained bool) {
 		sched.ID = fmt.Sprintf("%d", time.Now().UnixNano())
 		sched.CreatedAt = time.Now()
 	}
-	if err := saveSchedule(b.dbProvider, &sched); err != nil {
+	if err := saveScheduleChecked(b.dbProvider, &sched); err != nil {
 		logrus.Error(fmt.Errorf("schedule mqtt bridge: saving schedule: %w", err))
 		return
 	}

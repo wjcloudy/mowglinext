@@ -211,8 +211,8 @@ TEST(HomeAssistantDiscovery, EmptyPrefixFallsBackToMowgliDataTopics)
 TEST(HomeAssistantDiscovery, AddsExplicitMowButtonForEachCurrentArea)
 {
   const std::vector<MqttBridgeNode::AreaSummary> areas{
-      {2, "Back \"Garden\""},
-      {7, "Side lawn"},
+      {2, "Back \"Garden\"", 3},
+      {7, "Side lawn", 5},
   };
   const std::string json = MqttBridgeNode::serialise_home_assistant_discovery("garden", areas);
 
@@ -303,8 +303,8 @@ TEST(SerialiseStatus, ProducesExpectedJson)
 TEST(SerialisePower, ProducesExpectedJsonAndDerivesBatteryPercent)
 {
   mowgli_interfaces::msg::Power msg{};
-  msg.v_charge = 16.5f;
-  msg.v_battery = 14.4f;  // midpoint of the 12.0-16.8V 4S LiPo range -> 50.0%
+  msg.v_charge = 28.0f;
+  msg.v_battery = 26.0f;  // midpoint of the configured-default 24-28V range -> 50.0%
   msg.charge_current = 0.75f;
   msg.charger_enabled = true;
   msg.charger_status = "bulk";
@@ -312,18 +312,18 @@ TEST(SerialisePower, ProducesExpectedJsonAndDerivesBatteryPercent)
   const std::string json = MqttBridgeNode::serialise_power(msg);
 
   EXPECT_EQ(json,
-            "{\"v_charge\":16.500,\"v_battery\":14.400,\"charge_current\":0.750,"
+            "{\"v_charge\":28.000,\"v_battery\":26.000,\"charge_current\":0.750,"
             "\"charger_enabled\":true,\"charger_status\":\"bulk\",\"battery_pct\":50.0}");
 }
 
 TEST(SerialisePower, ClampsBatteryPercentToZeroAndHundred)
 {
   mowgli_interfaces::msg::Power below{};
-  below.v_battery = 5.0f;  // below kVEmpty (12.0)
+  below.v_battery = 20.0f;  // below the default empty voltage (24.0)
   EXPECT_NE(MqttBridgeNode::serialise_power(below).find("\"battery_pct\":0.0"), std::string::npos);
 
   mowgli_interfaces::msg::Power above{};
-  above.v_battery = 20.0f;  // above kVFull (16.8)
+  above.v_battery = 30.0f;  // above the default full voltage (28.0)
   EXPECT_NE(MqttBridgeNode::serialise_power(above).find("\"battery_pct\":100.0"),
             std::string::npos);
 }
@@ -559,18 +559,21 @@ TEST(SerialiseAreas, ProducesExpectedJsonWithRawIndices)
   // 0..N-1 position — a navigation-only area between two mowing areas would
   // leave a gap here, matching what GetMowingArea/StartInArea expect.
   std::vector<MqttBridgeNode::AreaSummary> areas{
-      {0, "Front Lawn"},
-      {2, "Back Garden"},
+      {0, "Front Lawn", 11},
+      {2, "Back Garden", 7},
   };
 
+  // "id" is the stable MapArea.id: it does not move when other areas are edited.
   EXPECT_EQ(MqttBridgeNode::serialise_areas(areas),
-            "[{\"index\":0,\"name\":\"Front Lawn\"},{\"index\":2,\"name\":\"Back Garden\"}]");
+            "[{\"index\":0,\"name\":\"Front Lawn\",\"id\":11},"
+            "{\"index\":2,\"name\":\"Back Garden\",\"id\":7}]");
 }
 
 TEST(SerialiseAreas, EscapesAreaName)
 {
-  std::vector<MqttBridgeNode::AreaSummary> areas{{1, R"(Side "yard")"}};
-  EXPECT_EQ(MqttBridgeNode::serialise_areas(areas), R"([{"index":1,"name":"Side \"yard\""}])");
+  std::vector<MqttBridgeNode::AreaSummary> areas{{1, R"(Side "yard")", 4}};
+  EXPECT_EQ(MqttBridgeNode::serialise_areas(areas),
+            R"([{"index":1,"name":"Side \"yard\"","id":4}])");
 }
 
 // ===========================================================================

@@ -176,18 +176,20 @@ state and every `sub_state_name`.
 
 ```json
 {
-  "v_charge": 16.500,
-  "v_battery": 15.800,
+  "v_charge": 28.000,
+  "v_battery": 26.000,
   "charge_current": 0.000,
   "charger_enabled": false,
   "charger_status": "idle",
-  "battery_pct": 90.9
+  "battery_pct": 50.0
 }
 ```
 
-`battery_pct` is derived from `v_battery` over the 12.0–16.8 V 4S LiPo range and clamped to
-[0, 100] — the same formula `diagnostics_node` uses. `<prefix>/high_level_status.battery_percent`
-is the BT's own estimate and is the one the GUI dashboard shows; the two normally agree closely.
+`battery_pct` is derived from `v_battery` using the configured `battery_empty_voltage` and
+`battery_full_voltage` endpoints, then clamped to [0, 100]. The default 24–28 V range gives
+50% at 26 V, as shown above. `diagnostics_node` uses the same endpoints and formula.
+`<prefix>/high_level_status.battery_percent` is the BT's filtered voltage estimate and is
+the one the GUI dashboard shows; transient values can differ because of that filtering.
 
 ### `<prefix>/emergency`
 
@@ -384,8 +386,8 @@ MQTT to do either.
 
 ```json
 [
-  {"index": 0, "name": "Front Lawn"},
-  {"index": 2, "name": "Back Garden"}
+  {"index": 0, "name": "Front Lawn", "id": 11},
+  {"index": 2, "name": "Back Garden", "id": 7}
 ]
 ```
 
@@ -394,15 +396,17 @@ until the service reports `success=false` — the same pattern the GUI backend's
 uses) and republished, retained, only when the resulting list actually changed. Navigation-only
 areas (keepout/boundary zones that are never mowed) are excluded.
 
-**⚠️ Interim, index-based contract — expect this to change.** `index` is the *raw*, purely
-*positional* index `map_server_node` uses internally — recorded areas have **no stable ID** yet
-([mowglinext#637](https://github.com/mowglinext/mowglinext/issues/637) tracks adding one). The
+`id` is the area's stable `MapArea.id` ([mowglinext#637](https://github.com/mowglinext/mowglinext/issues/637)):
+it survives edits, reorders and deletes of *other* areas, so it is what `<prefix>/schedules`
+references (`areaId`). `0` means the id has not been assigned yet.
+
+**⚠️ `<prefix>/start_area` is still index-based.** `index` is the *raw*, purely
+*positional* index `map_server_node` uses internally. The
 GUI's own area editor rebuilds its entire area list on any single-area add/edit/delete, which can
 reassign *every* area's index in the process — so **do not cache an index across a session**.
 Re-fetch `<prefix>/areas` and re-resolve the target by `name` before sending `<prefix>/start_area`
-each time. Once #637 lands, this topic is expected to grow a stable `id` field and
-`<prefix>/start_area` an id-based counterpart; this index-only shape is a stepping stone, not the
-final contract — don't build a permanent integration against it without accounting for that.
+each time. `<prefix>/start_area` is expected to grow an id-based counterpart; until then, don't
+build a permanent integration against the index without accounting for that.
 
 ### `<prefix>/start_area` (inbound — start mowing a specific area)
 
@@ -428,7 +432,8 @@ both go through the exact same validation and storage, so this is never stale re
   "schedules": [
     {
       "id": "1758901234567890000",
-      "area": 0,
+      "areaId": 7,
+      "areaName": "Back Garden",
       "time": "06:00",
       "daysOfWeek": [1, 2, 3, 4, 5],
       "enabled": true,
@@ -442,9 +447,13 @@ both go through the exact same validation and storage, so this is never stale re
 ```
 
 `id` is an opaque string (a nanosecond timestamp today — treat it as opaque, not as a sortable
-time). `area` is the *same* raw, positional index as `<prefix>/areas` — subject to the identical
-staleness caveat: re-fetch `<prefix>/areas` and resolve by name before writing a schedule for a
-specific area, don't cache the index. `daysOfWeek` is `0`=Sunday…`6`=Saturday. `lastRun` and
+time). `areaId` is the stable area `id` from `<prefix>/areas` that this schedule mows; `0` (or
+absent) means **all areas**, which is a plain Start. `areaName` is a display snapshot taken when the
+schedule was saved, kept so the label survives an area being removed. The scheduler resolves
+`areaId` to the area's *current* index each time the schedule fires (it asks the map server, so
+an edit to the area list cannot retarget it); if the area no longer exists the run is skipped and
+`lastSkipReason` says so. One schedule mows one area or all of them. `daysOfWeek` is
+`0`=Sunday…`6`=Saturday. `lastRun` and
 `lastSkipReason`/`lastSkippedAt` are written by the scheduler itself (the latter when IrriSense
 reports wet soil at a due run) — a client may read them but writing them via `schedules/set` (below)
 has no effect; they are always carried over from the existing schedule.
@@ -457,14 +466,26 @@ create a schedule that starts the mower unattended, exactly as consequential as 
 ### `<prefix>/schedules/set` (inbound — create or update a schedule)
 
 ```json
-{"area": 0, "time": "06:00", "daysOfWeek": [1, 2, 3, 4, 5], "enabled": true}
+{"areaId": 7, "areaName": "Back Garden", "time": "06:00", "daysOfWeek": [1, 2, 3, 4, 5], "enabled": true}
 ```
 
 Omit `id` (or send an `id` that does not exist yet) to **create** a schedule — the server assigns
 the `id`. Send an existing `id` to **update** that schedule; `createdAt`/`lastRun`/
 `lastSkipReason`/`lastSkippedAt` are preserved from the existing record regardless of what the
-payload contains. `time` must be `HH:mm` and `daysOfWeek` must have at least one entry in `0`–`6` —
-the same validation `POST/PUT /schedules` applies; an invalid payload is logged and dropped with no
+payload contains. `time` must be `HH:mm` and `daysOfWeek` must have at least one entry in `0`–`6`.
+
+On an update, an **omitted `areaId` means "unchanged"** (so an integration written before per-area
+schedules, which only flips `enabled`, does not reset a per-area schedule to all areas); an explicit
+`areaId` always wins, and `0` is an explicit "all areas". An omitted `areaName` is kept only while
+`areaId` is the same area. On a create, omitting `areaId` means all areas. Prefer echoing the full
+record you read from `<prefix>/schedules` when updating. `time` and `daysOfWeek` are still required
+on every update (the same validation `POST/PUT /schedules` applies).
+
+**Enabled schedules may not overlap:** two
+enabled schedules sharing a weekday must start at least 60 minutes apart (the distance wraps
+across midnight and the end of the week); a disabled schedule is never checked, so disabling is
+always accepted. `POST/PUT /schedules` answers an overlap with `409`; here, as for any invalid
+payload, it is logged and dropped with no
 error published back to MQTT (there is no ack/result topic here either — subscribe to
 `<prefix>/schedules` to see whether it took effect).
 

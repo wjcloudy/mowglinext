@@ -29,6 +29,13 @@ type CoveragePath struct {
 	Path                      nav.Path                       `json:"path"`
 }
 
+// CoveragePlanPreview matches mowgli_interfaces/msg/CoveragePlanPreview.
+type CoveragePlanPreview struct {
+	Header                    geometry.Header                `json:"header"`
+	Xy                        []float32                      `json:"xy"`
+	SubpathOffsets            []uint32                       `json:"subpath_offsets"`
+}
+
 // CoverageSession matches mowgli_interfaces/msg/CoverageSession.
 type CoverageSession struct {
 	SessionActive             bool                           `json:"session_active"`
@@ -103,6 +110,8 @@ type FirmwareParams struct {
 	BootSource                uint8                          `json:"boot_source"`
 	LastCommit                uint8                          `json:"last_commit"`
 	RecordsLeft               uint16                         `json:"records_left"`
+	ResetRequestId            uint32                         `json:"reset_request_id"`
+	StoreStatusSequence       uint32                         `json:"store_status_sequence"`
 	Params                    []FirmwareParam                `json:"params"`
 }
 
@@ -195,6 +204,20 @@ type ImuRaw struct {
 	Mz                        float64                        `json:"mz"`
 }
 
+// LidarIgnoreCorridor matches mowgli_interfaces/msg/LidarIgnoreCorridor.
+type LidarIgnoreCorridor struct {
+	Name                      string                         `json:"name"`
+	Polyline                  geometry.Polygon               `json:"polyline"`
+	WidthM                    float64                        `json:"width_m"`
+	Id                        uint32                         `json:"id"`
+}
+
+// LidarIgnoreCorridorArray matches mowgli_interfaces/msg/LidarIgnoreCorridorArray.
+type LidarIgnoreCorridorArray struct {
+	Header                    geometry.Header                `json:"header"`
+	Corridors                 []LidarIgnoreCorridor          `json:"corridors"`
+}
+
 // MapArea matches mowgli_interfaces/msg/MapArea.
 type MapArea struct {
 	Name                      string                         `json:"name"`
@@ -205,6 +228,13 @@ type MapArea struct {
 	ProposedObstacles         []geometry.Polygon             `json:"proposed_obstacles"`
 	ProposedObstacleInfo      []MapObstacleInfo              `json:"proposed_obstacle_info"`
 	Id                        uint32                         `json:"id"`
+	HasMowAngle               bool                           `json:"has_mow_angle"`
+	MowAngleDeg               float64                        `json:"mow_angle_deg"`
+	HasRingDirection          bool                           `json:"has_ring_direction"`
+	RingDirection             uint8                          `json:"ring_direction"`
+	HasStartPoint             bool                           `json:"has_start_point"`
+	StartX                    float64                        `json:"start_x"`
+	StartY                    float64                        `json:"start_y"`
 }
 
 // MapObstacleInfo matches mowgli_interfaces/msg/MapObstacleInfo.
@@ -229,6 +259,17 @@ type Power struct {
 	ChargeCurrent             float32                        `json:"charge_current"`
 	ChargerEnabled            bool                           `json:"charger_enabled"`
 	ChargerStatus             string                         `json:"charger_status"`
+}
+
+// RecordedAreaPolygon matches mowgli_interfaces/msg/RecordedAreaPolygon.
+type RecordedAreaPolygon struct {
+	Area                      geometry.Polygon               `json:"area"`
+}
+
+// RecordedAreaPolygonArray matches mowgli_interfaces/msg/RecordedAreaPolygonArray.
+type RecordedAreaPolygonArray struct {
+	Header                    geometry.Header                `json:"header"`
+	Areas                     []RecordedAreaPolygon          `json:"areas"`
 }
 
 // Status matches mowgli_interfaces/msg/Status.

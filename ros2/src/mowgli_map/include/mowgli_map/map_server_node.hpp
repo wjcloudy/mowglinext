@@ -45,6 +45,7 @@
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_listener.hpp>
 
+#include "mowgli_map/area_coverage_lines.hpp"
 #include "mowgli_map/dock_antenna_capture.hpp"
 #include "mowgli_map/map_types.hpp"
 #include "mowgli_map/mow_progress.hpp"
@@ -54,14 +55,20 @@
 #include <grid_map_msgs/msg/grid_map.hpp>
 #include <grid_map_ros/GridMapRosConverter.hpp>
 #include <mowgli_interfaces/msg/dig_event.hpp>
+#include <mowgli_interfaces/msg/lidar_ignore_corridor_array.hpp>
 #include <mowgli_interfaces/msg/map_obstacle_info.hpp>
 #include <mowgli_interfaces/msg/obstacle_array.hpp>
+#include <mowgli_interfaces/msg/recorded_area_polygon_array.hpp>
 #include <mowgli_interfaces/msg/status.hpp>
+#include <mowgli_interfaces/srv/add_lidar_ignore_corridor.hpp>
 #include <mowgli_interfaces/srv/add_mowing_area.hpp>
+#include <mowgli_interfaces/srv/clear_lidar_ignore_corridors.hpp>
 #include <mowgli_interfaces/srv/clear_obstacle.hpp>
+#include <mowgli_interfaces/srv/get_lidar_ignore_corridors.hpp>
 #include <mowgli_interfaces/srv/get_mowing_area.hpp>
 #include <mowgli_interfaces/srv/get_recovery_point.hpp>
 #include <mowgli_interfaces/srv/promote_obstacle.hpp>
+#include <mowgli_interfaces/srv/set_area_coverage_lines.hpp>
 #include <mowgli_interfaces/srv/set_docking_point.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
@@ -225,12 +232,23 @@ public:
   void add_area_for_test(const mowgli_interfaces::srv::AddMowingArea::Request::SharedPtr req,
                          mowgli_interfaces::srv::AddMowingArea::Response::SharedPtr res);
 
+  /// Test-only: directly invoke the set_area_coverage_lines service handler.
+  void set_area_coverage_lines_for_test(
+      const mowgli_interfaces::srv::SetAreaCoverageLines::Request::SharedPtr req,
+      mowgli_interfaces::srv::SetAreaCoverageLines::Response::SharedPtr res)
+  {
+    on_set_area_coverage_lines(req, res);
+  }
+
   /// Test-only: directly invoke get_mowing_area service handler.
   void get_mowing_area_for_test(const mowgli_interfaces::srv::GetMowingArea::Request::SharedPtr req,
                                 mowgli_interfaces::srv::GetMowingArea::Response::SharedPtr res);
 
   /// Test-only: round-trip persistence through save/load_areas_to_file.
   void save_areas_for_test(const std::string& path);
+  /// Same write as an implicit save (add_area, ignore-line edit): throws if it would replace
+  /// a file with areas by an empty map.
+  void save_areas_guarded_for_test(const std::string& path);
   void load_areas_for_test(const std::string& path);
 
   /// Test-only: current area-list generation (mowglinext#637 phase 2).
@@ -392,7 +410,43 @@ private:
     /// PERSISTED and must stay stable across a restart — see
     /// next_area_id_'s doc comment for how it survives one.
     uint32_t id{0};
+    /// Optional per-area overrides of the robot-wide mow_angle_deg /
+    /// mow_direction (see area_coverage_lines.hpp). Persisted in areas.dat,
+    /// served by ~/get_mowing_area, changed by ~/set_area_coverage_lines. The
+    /// default (nothing overridden) is what every area written before these
+    /// fields existed means.
+    AreaCoverageLines coverage_lines;
   };
+
+  /// An operator-drawn line along which costmap_scan_filter_node suppresses
+  /// LiDAR returns within width_m/2 — see LidarIgnoreCorridor.msg's doc
+  /// comment for the full safety contract (this is the only map primitive
+  /// that can blind collision_monitor). Deliberately NOT nested inside
+  /// AreaEntry: the operator draws it wherever a real boundary-adjacent
+  /// obstacle should stop being avoided, independent of which area (if any)
+  /// happens to be nearby.
+  struct LidarIgnoreCorridorEntry
+  {
+    std::string name;
+    /// >= 2 points; NOT a closed ring despite the Polygon type — see
+    /// LidarIgnoreCorridor.msg's `polyline` field doc comment.
+    geometry_msgs::msg::Polygon polyline;
+    /// Clamped to [kMinLidarIgnoreCorridorWidthM, kMaxLidarIgnoreCorridorWidthM]
+    /// on add — see on_add_lidar_ignore_corridor.
+    double width_m{0.40};
+    /// Same stable-id contract as AreaEntry::id, tracked by
+    /// next_lidar_corridor_id_.
+    uint32_t id{0};
+  };
+
+  /// Safety bound on LidarIgnoreCorridorEntry::width_m (metres either side of
+  /// the line): floors a fat-fingered near-zero value (pointless) and caps a
+  /// fat-fingered huge one (would blind a large swath of the field, on BOTH
+  /// the costmap AND collision_monitor paths — see the .msg doc comment).
+  /// Independent of, and does not weaken, the operator's own choice to let a
+  /// corridor affect collision_monitor at all.
+  static constexpr double kMinLidarIgnoreCorridorWidthM = 0.05;
+  static constexpr double kMaxLidarIgnoreCorridorWidthM = 1.2;
 
   // ── ROS callbacks ────────────────────────────────────────────────────────
 
@@ -466,6 +520,12 @@ private:
   void on_add_area(const mowgli_interfaces::srv::AddMowingArea::Request::SharedPtr req,
                    mowgli_interfaces::srv::AddMowingArea::Response::SharedPtr res);
 
+  /// Set or clear one area's own mow angle / perimeter winding, addressed by the
+  /// stable MapArea.id. Persists immediately; changes only that area's NEXT plan.
+  void on_set_area_coverage_lines(
+      const mowgli_interfaces::srv::SetAreaCoverageLines::Request::SharedPtr req,
+      mowgli_interfaces::srv::SetAreaCoverageLines::Response::SharedPtr res);
+
   /// Increment area_list_generation_ and publish it on
   /// area_list_generation_pub_ (mowglinext#637 phase 2). Called once per
   /// successful ~/add_area. Not called at startup: area_list_generation_
@@ -476,6 +536,35 @@ private:
 
   void on_get_mowing_area(const mowgli_interfaces::srv::GetMowingArea::Request::SharedPtr req,
                           mowgli_interfaces::srv::GetMowingArea::Response::SharedPtr res);
+
+  /// ~/add_lidar_ignore_corridor, ~/get_lidar_ignore_corridors,
+  /// ~/clear_lidar_ignore_corridors — CRUD for LidarIgnoreCorridorEntry,
+  /// mirroring on_add_area/on_get_mowing_area/on_clear_map's shape.
+  /// Defined in lidar_corridor_manager.cpp (kept out of area_manager.cpp,
+  /// which the corridor concept is deliberately independent of — see
+  /// LidarIgnoreCorridorEntry's doc comment).
+  void on_add_lidar_ignore_corridor(
+      const mowgli_interfaces::srv::AddLidarIgnoreCorridor::Request::SharedPtr req,
+      mowgli_interfaces::srv::AddLidarIgnoreCorridor::Response::SharedPtr res);
+  void on_get_lidar_ignore_corridors(
+      const mowgli_interfaces::srv::GetLidarIgnoreCorridors::Request::SharedPtr req,
+      mowgli_interfaces::srv::GetLidarIgnoreCorridors::Response::SharedPtr res);
+  void on_clear_lidar_ignore_corridors(
+      const mowgli_interfaces::srv::ClearLidarIgnoreCorridors::Request::SharedPtr req,
+      mowgli_interfaces::srv::ClearLidarIgnoreCorridors::Response::SharedPtr res);
+  /// Republish the full current list on lidar_ignore_corridors_pub_
+  /// (transient_local) — called after every add/clear/load, so a late
+  /// subscriber always has the current list.
+  void publish_lidar_ignore_corridors();
+
+  /// Republish every recorded (working + navigation) area's outer boundary
+  /// on recorded_area_polygons_pub_ (transient_local) — called after every
+  /// area-list change (add/clear/load/datum migration), same shape as
+  /// publish_lidar_ignore_corridors. Consumed by costmap_scan_filter_node's
+  /// LiDAR-ignore-corridor area-side restriction; defined in
+  /// area_manager.cpp (unlike the corridor publish above, this one needs
+  /// direct access to areas_, which area_manager.cpp already owns).
+  void publish_recorded_area_polygons();
 
   /// ~/capture_dock_antenna: average the RAW antenna position while seated on
   /// the dock (charging + RTK gates) and hold it, unpersisted, for the
@@ -656,7 +745,15 @@ private:
   static std::string polygon_to_string(const geometry_msgs::msg::Polygon& poly);
 
   /// Save areas and docking point to a YAML file.
-  void save_areas_to_file(const std::string& path);
+  /// Atomically write the areas file. Unless `allow_empty_overwrite`, REFUSES (throws) to
+  /// replace a file that holds areas by one that holds none: only the explicit save_areas
+  /// service may do that. Every implicit save (add_area, ignore-line edits, the load-time
+  /// re-stamps) runs against whatever is in memory, which is empty between clear_map and
+  /// the first add_area, or after a failed load — writing that out destroyed the operator's
+  /// map and left only the ignore lines. The file being replaced is kept as <path>.bak.
+  void save_areas_to_file(const std::string& path, bool allow_empty_overwrite = false);
+  /// area_count recorded in an areas file, or 0 when it is missing/unreadable.
+  static int count_areas_in_file(const std::string& path);
 
   /// fsync `tmp_path`, rename it over `path`, fsync the directory. Throws (and
   /// removes the temp file) if the data cannot be made durable; `path` is then
@@ -826,8 +923,9 @@ private:
   ///
   /// This was a LETHAL band in an earlier version of this change and was
   /// reworked to mid-cost after review: lethal here collides with
-  /// chassis_safety_inset (both default to 0.20 m — the outermost coverage
-  /// ring is planned exactly chassis_safety_inset inside the line, so a
+  /// chassis_safety_inset (the outermost coverage ring is planned exactly
+  /// chassis_safety_inset inside the line — ON it at the 0.0 default, 0.20 m
+  /// until 2026-09-16 — so a
   /// lethal band there plus inflation_radius would swallow the ring itself
   /// and reopen the START_OCCUPIED skip cascade, issue #487) and would also
   /// wall off any area-to-area seam narrower than 2x the inflated margin.
@@ -967,6 +1065,18 @@ private:
   /// different area, even across a clear, in case something external
   /// still holds a reference to the old one.
   uint32_t next_area_id_{1};
+
+  /// Operator-drawn LiDAR-ignore lines — see LidarIgnoreCorridorEntry's doc
+  /// comment. Independent of areas_: not classified, not part of any
+  /// keepout mask, never touches masks_dirty_/classification_dirty_ — the
+  /// ONLY consumer is costmap_scan_filter_node, over
+  /// lidar_ignore_corridors_pub_.
+  std::vector<LidarIgnoreCorridorEntry> lidar_ignore_corridors_;
+
+  /// Next id to mint for a new corridor — same contract as next_area_id_
+  /// (persisted in areas.dat, recovered on load as max(loaded ids) + 1,
+  /// never reset by ~/clear_map or ~/clear_lidar_ignore_corridors).
+  uint32_t next_lidar_corridor_id_{1};
 
   /// Bumped on every successful ~/add_area (mowglinext#637 phase 2) and
   /// published on area_list_generation_pub_ (transient_local — a late
@@ -1175,6 +1285,17 @@ private:
   // Docking pose publisher (transient_local so late subscribers get the last value)
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr docking_pose_pub_;
 
+  /// Full current corridor list, transient_local — costmap_scan_filter_node's
+  /// only input for the corridor filter. Same "always latest, no service
+  /// round-trip needed" shape as keepout_mask_pub_.
+  rclcpp::Publisher<mowgli_interfaces::msg::LidarIgnoreCorridorArray>::SharedPtr
+      lidar_ignore_corridors_pub_;
+  /// Full current set of recorded (working + navigation) area outer
+  /// boundaries, transient_local — costmap_scan_filter_node's input for the
+  /// LiDAR-ignore-corridor area-side restriction. Same "always latest, no
+  /// service round-trip" shape as lidar_ignore_corridors_pub_ above.
+  rclcpp::Publisher<mowgli_interfaces::msg::RecordedAreaPolygonArray>::SharedPtr
+      recorded_area_polygons_pub_;
   /// Area-list generation counter (mowglinext#637 phase 2) — see
   /// area_list_generation_'s doc comment. transient_local so a subscriber
   /// started after the last bump (e.g. behavior_tree_node on its own
@@ -1215,6 +1336,8 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_map_srv_;
   rclcpp::Service<mowgli_interfaces::srv::AddMowingArea>::SharedPtr add_area_srv_;
   rclcpp::Service<mowgli_interfaces::srv::GetMowingArea>::SharedPtr get_mowing_area_srv_;
+  rclcpp::Service<mowgli_interfaces::srv::SetAreaCoverageLines>::SharedPtr
+      set_area_coverage_lines_srv_;
   rclcpp::Service<mowgli_interfaces::srv::SetDockingPoint>::SharedPtr set_docking_point_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr capture_dock_antenna_srv_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_areas_srv_;
@@ -1222,6 +1345,12 @@ private:
   rclcpp::Service<mowgli_interfaces::srv::GetRecoveryPoint>::SharedPtr get_recovery_point_srv_;
   rclcpp::Service<mowgli_interfaces::srv::PromoteObstacle>::SharedPtr promote_obstacle_srv_;
   rclcpp::Service<mowgli_interfaces::srv::ClearObstacle>::SharedPtr discard_obstacle_srv_;
+  rclcpp::Service<mowgli_interfaces::srv::AddLidarIgnoreCorridor>::SharedPtr
+      add_lidar_ignore_corridor_srv_;
+  rclcpp::Service<mowgli_interfaces::srv::GetLidarIgnoreCorridors>::SharedPtr
+      get_lidar_ignore_corridors_srv_;
+  rclcpp::Service<mowgli_interfaces::srv::ClearLidarIgnoreCorridors>::SharedPtr
+      clear_lidar_ignore_corridors_srv_;
 
   // ── TF ────────────────────────────────────────────────────────────────────
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;

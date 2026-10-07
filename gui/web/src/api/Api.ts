@@ -161,7 +161,14 @@ export interface ApiOkResponse {
 }
 
 export interface ApiSchedule {
-  area?: number;
+  /**
+   * AreaID is the STABLE map area id (MapArea.id) this schedule mows; 0 means
+   * every area (a plain Start). The scheduler resolves it to the current
+   * positional index when the schedule fires. AreaName is a display snapshot
+   * so the GUI and MQTT consumers can label it, even if the area was removed.
+   */
+  areaId?: number;
+  areaName?: string;
   createdAt?: string;
   /** 0=Sunday .. 6=Saturday */
   daysOfWeek?: number[];
@@ -260,11 +267,18 @@ export interface MowgliAddMowingAreaReq {
 
 export interface MowgliMapArea {
   area?: GeometryPolygon;
+  has_mow_angle?: boolean;
+  has_ring_direction?: boolean;
+  has_start_point?: boolean;
   id?: number;
   is_navigation_area?: boolean;
+  mow_angle_deg?: number;
   name?: string;
   obstacle_info?: MowgliMapObstacleInfo[];
   obstacles?: GeometryPolygon[];
+  ring_direction?: number;
+  start_x?: number;
+  start_y?: number;
 }
 
 export interface MowgliMapObstacleInfo {

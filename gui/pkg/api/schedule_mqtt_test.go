@@ -87,7 +87,7 @@ func (f *fakeMqttClient) publishCount() int {
 
 func TestScheduleMqttBridge_PublishesCurrentSchedulesOnStart(t *testing.T) {
 	db := types.NewMockDBProvider()
-	require.NoError(t, saveSchedule(db, &Schedule{ID: "1", Area: 2, Time: "07:30", DaysOfWeek: []int{1, 3}, Enabled: true}))
+	require.NoError(t, saveSchedule(db, &Schedule{ID: "1", AreaID: 2, Time: "07:30", DaysOfWeek: []int{1, 3}, Enabled: true}))
 
 	client := newFakeMqttClient()
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
@@ -100,7 +100,7 @@ func TestScheduleMqttBridge_PublishesCurrentSchedulesOnStart(t *testing.T) {
 	require.NoError(t, json.Unmarshal(pub.payload, &resp))
 	require.Len(t, resp.Schedules, 1)
 	assert.Equal(t, "1", resp.Schedules[0].ID)
-	assert.Equal(t, 2, resp.Schedules[0].Area)
+	assert.Equal(t, uint32(2), resp.Schedules[0].AreaID)
 }
 
 func TestScheduleMqttBridge_PublishesEmptyArrayNotNullWhenThereAreNone(t *testing.T) {
@@ -122,7 +122,7 @@ func TestScheduleMqttBridge_SetWithNoIdCreatesASchedule(t *testing.T) {
 	client := newFakeMqttClient()
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 
-	client.fire(t, "mowgli/schedules/set", []byte(`{"area":0,"time":"06:00","daysOfWeek":[1,2,3,4,5],"enabled":true}`))
+	client.fire(t, "mowgli/schedules/set", []byte(`{"areaId":0,"time":"06:00","daysOfWeek":[1,2,3,4,5],"enabled":true}`))
 
 	schedules, err := getAllSchedules(db)
 	require.NoError(t, err)
@@ -135,13 +135,13 @@ func TestScheduleMqttBridge_SetWithNoIdCreatesASchedule(t *testing.T) {
 func TestScheduleMqttBridge_SetWithAnExistingIdUpdatesAndKeepsHistory(t *testing.T) {
 	db := types.NewMockDBProvider()
 	require.NoError(t, saveSchedule(db, &Schedule{
-		ID: "42", Area: 1, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true,
+		ID: "42", AreaID: 1, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true,
 		LastSkipReason: "soil wet",
 	}))
 	client := newFakeMqttClient()
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 
-	client.fire(t, "mowgli/schedules/set", []byte(`{"id":"42","area":1,"time":"08:00","daysOfWeek":[1,2],"enabled":false}`))
+	client.fire(t, "mowgli/schedules/set", []byte(`{"id":"42","areaId":1,"time":"08:00","daysOfWeek":[1,2],"enabled":false}`))
 
 	updated, err := getSchedule(db, "42")
 	require.NoError(t, err)
@@ -156,7 +156,7 @@ func TestScheduleMqttBridge_SetRejectsAnInvalidScheduleAndDoesNotSaveIt(t *testi
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 	before := client.publishCount()
 
-	client.fire(t, "mowgli/schedules/set", []byte(`{"area":0,"time":"25:99","daysOfWeek":[1]}`))
+	client.fire(t, "mowgli/schedules/set", []byte(`{"areaId":0,"time":"25:99","daysOfWeek":[1]}`))
 
 	schedules, err := getAllSchedules(db)
 	require.NoError(t, err)
@@ -169,7 +169,7 @@ func TestScheduleMqttBridge_SetPublishesTheUpdatedList(t *testing.T) {
 	client := newFakeMqttClient()
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 
-	client.fire(t, "mowgli/schedules/set", []byte(`{"area":0,"time":"06:00","daysOfWeek":[1]}`))
+	client.fire(t, "mowgli/schedules/set", []byte(`{"areaId":0,"time":"06:00","daysOfWeek":[1]}`))
 
 	pub, ok := client.lastPublished("mowgli/schedules")
 	require.True(t, ok)
@@ -184,7 +184,7 @@ func TestScheduleMqttBridge_SetPublishesTheUpdatedList(t *testing.T) {
 
 func TestScheduleMqttBridge_DeleteAcceptsAPlainIdPayload(t *testing.T) {
 	db := types.NewMockDBProvider()
-	require.NoError(t, saveSchedule(db, &Schedule{ID: "7", Area: 0, Time: "06:00", DaysOfWeek: []int{1}}))
+	require.NoError(t, saveSchedule(db, &Schedule{ID: "7", AreaID: 0, Time: "06:00", DaysOfWeek: []int{1}}))
 	client := newFakeMqttClient()
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 
@@ -196,7 +196,7 @@ func TestScheduleMqttBridge_DeleteAcceptsAPlainIdPayload(t *testing.T) {
 
 func TestScheduleMqttBridge_DeleteAcceptsAJsonIdPayload(t *testing.T) {
 	db := types.NewMockDBProvider()
-	require.NoError(t, saveSchedule(db, &Schedule{ID: "7", Area: 0, Time: "06:00", DaysOfWeek: []int{1}}))
+	require.NoError(t, saveSchedule(db, &Schedule{ID: "7", AreaID: 0, Time: "06:00", DaysOfWeek: []int{1}}))
 	client := newFakeMqttClient()
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 
@@ -208,7 +208,7 @@ func TestScheduleMqttBridge_DeleteAcceptsAJsonIdPayload(t *testing.T) {
 
 func TestScheduleMqttBridge_DeleteWithNoIdIsIgnored(t *testing.T) {
 	db := types.NewMockDBProvider()
-	require.NoError(t, saveSchedule(db, &Schedule{ID: "7", Area: 0, Time: "06:00", DaysOfWeek: []int{1}}))
+	require.NoError(t, saveSchedule(db, &Schedule{ID: "7", AreaID: 0, Time: "06:00", DaysOfWeek: []int{1}}))
 	client := newFakeMqttClient()
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 
@@ -235,7 +235,7 @@ func TestScheduleMqttBridge_AnHttpCreateAlsoRepublishesToMqtt(t *testing.T) {
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 	before := client.publishCount()
 
-	sched := Schedule{Area: 0, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true}
+	sched := Schedule{AreaID: 0, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true}
 	require.NoError(t, validateSchedule(&sched))
 	sched.ID = "999"
 	require.NoError(t, saveSchedule(db, &sched))
@@ -341,7 +341,7 @@ func TestScheduleMqttBridge_RetainedSetIsIgnored(t *testing.T) {
 	// it on every GUI start. Since an absent id CREATES, honouring the replay
 	// silently adds another enabled mowing schedule per boot — a schedule the
 	// operator deleted would come back, and multiply.
-	payload, err := json.Marshal(Schedule{Area: 1, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true})
+	payload, err := json.Marshal(Schedule{AreaID: 1, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true})
 	require.NoError(t, err)
 	client.fireRetained(t, "mowgli/schedules/set", payload, true)
 
@@ -352,7 +352,7 @@ func TestScheduleMqttBridge_RetainedSetIsIgnored(t *testing.T) {
 
 func TestScheduleMqttBridge_RetainedDeleteIsIgnored(t *testing.T) {
 	db := types.NewMockDBProvider()
-	require.NoError(t, saveSchedule(db, &Schedule{ID: "keep-me", Area: 1, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true}))
+	require.NoError(t, saveSchedule(db, &Schedule{ID: "keep-me", AreaID: 1, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true}))
 	client := newFakeMqttClient()
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 
@@ -369,7 +369,7 @@ func TestScheduleMqttBridge_LiveSetIsStillHonoured(t *testing.T) {
 	client := newFakeMqttClient()
 	newScheduleMqttBridgeWithClient(db, "mowgli", client)
 
-	payload, err := json.Marshal(Schedule{Area: 1, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true})
+	payload, err := json.Marshal(Schedule{AreaID: 1, Time: "06:00", DaysOfWeek: []int{1}, Enabled: true})
 	require.NoError(t, err)
 	client.fireRetained(t, "mowgli/schedules/set", payload, false)
 

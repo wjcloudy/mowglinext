@@ -83,7 +83,7 @@ See `docs/UPDATE_CHECKS.md` for the behavior.
 | `gui/pkg/api/calibration.go` | 213 | IMU-yaw / magnetometer / one-click dock calibration service calls (150 s budget) |
 | `gui/pkg/api/calibration_status.go` | 240 | `/calibration/status`: dock pose from yaml, IMU/mag calibration files under `/ros2_ws/maps` |
 | `gui/pkg/api/containers.go` | 234 | Docker list/start/stop/restart + WS log stream with stdcopy demux |
-| `gui/pkg/api/schedules.go` | 224 | Schedule CRUD (`schedule:<id>` DB keys, validation); calls `notifyScheduleChanged()` after every write so `schedule_mqtt.go` mirrors it |
+| `gui/pkg/api/schedules.go` | 224 | Schedule CRUD (`schedule:<id>` DB keys, validation); `areaId` (stable `MapArea.id`, 0 = all) + `areaName` snapshot; `saveScheduleChecked` rejects an ENABLED schedule that starts < 60 min from another enabled one on a shared weekday (wraps midnight/week; HTTP 409, MQTT logged+dropped; disabling always allowed); calls `notifyScheduleChanged()` after every write so `schedule_mqtt.go` mirrors it |
 | `gui/pkg/api/schedule_mqtt.go` | 323 | `ScheduleMqttBridge`: publishes `<prefix>/schedules` retained on the same external broker as `mqtt_bridge_node`, accepts `<prefix>/schedules/set`\|`/delete`, both going through `validateSchedule`/`saveSchedule` — no separate validation path |
 | `gui/pkg/api/remote_access.go` | ~180 | `/remote-access/{settings,status,apply,logout}` (auth key masked, write-only) |
 | `gui/pkg/api/irrisense.go` | 228 | IrriSense settings/status/gardens (token masked, write-only) |
@@ -96,20 +96,21 @@ See `docs/UPDATE_CHECKS.md` for the behavior.
 | `gui/pkg/api/system.go` | 101 | CPU temp, host reboot/poweroff via `nsenter` |
 | `gui/pkg/api/utils.go` | 65 | `unmarshalROSMessage` (mapstructure, case/underscore-insensitive), `snakeToCamel` |
 | `gui/pkg/api/params.go` | 64 | Live ROS2 parameter list/set |
-| `gui/pkg/api/setup.go` | 61 | `/setup/flashBoard` SSE stream around `FlashFirmware` |
+| `gui/pkg/api/setup.go` | 95 | `/setup/flashBoard` SSE stream around `FlashFirmware`; `flashStreamEvent` lifts `types.FlashStageMarker` lines out of the log as `stage` events (JSON `FlashStageEvent`), everything else is a `message` |
 | `gui/pkg/api/tiles.go` | 47 | Reverse proxy `/tiles/*` → `system.map.tileServer` |
 | `gui/pkg/api/types.go` | 31 | `OkResponse`, `ErrorResponse`, small DTOs |
 | **pkg/providers/** | | |
 | `gui/pkg/providers/ros.go` | 586 | `RosProvider` (IRosProvider): `topicMap`, lazy upstream subscribe, per-listener mailbox `RosSubscriber`, map polling, dock pose cache, param passthrough |
 | `gui/pkg/providers/transform.go` | 509 | Per-topic adapters NavSatFix→AbsolutePose, Odometry→AbsolutePose, universal GnssStatus→mowgli shape, LaserScan decimation (≤360 beams) |
-| `gui/pkg/providers/firmware.go` | 373 | Flash routing (prebuilt/custom/Vermut), openocd + platformio invocations, post-flash handshake check |
+| `gui/pkg/providers/firmware.go` | 468 | Flash routing (prebuilt/custom/Vermut), openocd + platformio invocations, post-flash handshake check |
+| `gui/pkg/providers/firmware_progress.go` | 62 | Per-path stage plans (`prebuiltFlashStages` / `customFlashStages` / `vermutFlashStages`) and `flashProgress.enter(key)`, which writes the one marker line per stage the GUI progress bar keys on; stage keys are the `flashBoard.stages.*` i18n keys |
 | `gui/pkg/providers/docker.go` | 339 | Docker SDK wrapper (list/logs/start/stop/restart/inspect/run/exec) |
 | `gui/pkg/providers/session_tracker.go` | 333 | Mowing session state machine from `highLevelStatus` + odometer from `wheelOdom`; keeps last 500 |
 | `gui/pkg/providers/remote_access.go` | ~420 | `RemoteAccessProvider`: reconcile loop for `mowgli-remote` (spec-hash label decides start vs recreate), `tailscale status --json` projection, logout |
 | `gui/pkg/providers/remote_access_config.go` | ~150 | `remoteAccess.*` DB keys, defaults, validation, masking |
 | `gui/pkg/providers/docker_service.go` | ~180 | Named service-container ops on the Docker SDK (pull, find, create + `CopyToContainer` files, remove) |
 | `gui/pkg/providers/irrisense.go` | 289 | Poll loop (10 min, backoff 1→30 min), `SoilStatus` verdict |
-| `gui/pkg/providers/scheduler.go` | 267 | 1-min ticker → `COMMAND_START` (=1) via `/behavior_tree_node/high_level_control` |
+| `gui/pkg/providers/scheduler.go` | 267 | 1-min ticker → `COMMAND_START` (=1) via `/behavior_tree_node/high_level_control` for `areaId` 0; for one area it resolves the id to map_server's CURRENT index (`/map_server_node/get_mowing_area` walk) and calls `/behavior_tree_node/start_in_area`; a vanished/navigation area or failed lookup skips the run with `lastSkipReason` (never falls back to mowing everything) |
 | `gui/pkg/providers/irrisense_config.go` | 237 | `irrisense.*` DB keys, defaults, validation, masking |
 | `gui/pkg/providers/db.go` | 203 | bitcask DB, env fallbacks, defaults, corruption backup+recovery |
 | `gui/pkg/providers/irrisense_wetness.go` | 145 | Pure wetness rule (`EvaluateWetness`, `EvaluateZones`) |
@@ -134,7 +135,7 @@ See `docs/UPDATE_CHECKS.md` for the behavior.
 | `gui/pkg/types/ros.go` | 51 | `IRosProvider`, `RosParameter` |
 | `gui/pkg/types/soil.go` | 49 | `SoilStatus.BlocksScheduledMowing()`, `ISoilProvider` |
 | `gui/pkg/types/docker.go` | 76 | `IDockerProvider`, run/exec specs |
-| `gui/pkg/types/firmware.go` | 45 | `IFirmwareProvider`, `FirmwareConfig` (JSON body of flashBoard) |
+| `gui/pkg/types/firmware.go` | 85 | `IFirmwareProvider`, `FirmwareConfig` (JSON body of flashBoard), `FlashStageMarker` + `FlashStageEvent` (stage SSE payload) |
 | `gui/pkg/types/db.go` | 15 | `IDBProvider` |
 | `gui/pkg/types/homekit.go` | 5 | `IHAProvider` |
 | `gui/pkg/types/mocks.go` | 145 | `MockDBProvider`, `MockRosProvider` (records `ServiceCalls`, `Dispatch`) used by all api/provider tests |
@@ -185,7 +186,7 @@ See `docs/UPDATE_CHECKS.md` for the behavior.
 | `GET /swagger/*any` (root) | `gui/pkg/api/api.go:62` | from `gui/docs` |
 | `GET /`, `/assets/*`, SPA fallback (root) | `gui/pkg/api/web_static.go:19-25` | |
 
-`/mowglinext/call/:command` → ROS service (`mowglinext.go:554-717`): `high_level_control`→`/behavior_tree_node/high_level_control`; `emergency`→`/hardware_bridge/emergency_stop`; `mow_enabled`→`/hardware_bridge/mower_control`; `start_in_area`→`/behavior_tree_node/start_in_area`; `set_datum`→`/navsat_to_absolute_pose/set_datum`; `promote_obstacle`→`/map_server_node/promote_obstacle`; `discard_obstacle`→`/map_server_node/discard_obstacle`; `ignore_obstacle`→`/obstacle_tracker/clear_obstacle` (dismisses the current detection; redetection can return); `fusion_graph_save|clear|clear_lidar_map`→`/fusion_graph_node/{save_graph,clear_graph,clear_lidar_map}` (`fusionGraphTriggerServices` map; `clear_lidar_map` drops only the LiDAR map-anchor occupancy grid, tested in `mowglinext_test.go` `TestServiceRoute_FusionGraphTriggers`); `coverage_clear_resume`→`/behavior_tree_node/clear_coverage_resume`; `reboot_board`→`/hardware_bridge/reboot_board`. All 10 s timeout.
+`/mowglinext/call/:command` → ROS service (`mowglinext.go:554-717`): `high_level_control`→`/behavior_tree_node/high_level_control`; `emergency`→`/hardware_bridge/emergency_stop`; `mow_enabled`→`/hardware_bridge/mower_control`; `start_in_area`→`/behavior_tree_node/start_in_area`; `set_datum`→`/navsat_to_absolute_pose/set_datum`; `promote_obstacle`→`/map_server_node/promote_obstacle`; `set_area_coverage_lines`→`/map_server_node/set_area_coverage_lines` (one area's own mow angle / winding by stable `id`, which must be non-zero else 400; a map_server refusal comes back as an error with its reason; `TestServiceRoute_SetAreaCoverageLines`); `preview_coverage`→`/coverage_server/preview_coverage` (read-only planner dry run; optional `has_start_point` / `start_x` / `start_y` for the Map page "mowing lines" overlay; omitted `mow_angle_deg`/`ring_direction` mean auto/live, sent as -1 — pointers, because 0 is a real choice; `outer_boundary` needs ≥ 3 points, else 400; a planner refusal is a normal 200 with `success:false`, tested in `mowglinext_test.go` `TestServiceRoute_PreviewCoverage`); `discard_obstacle`→`/map_server_node/discard_obstacle`; `ignore_obstacle`→`/obstacle_tracker/clear_obstacle` (dismisses the current detection; redetection can return); `fusion_graph_save|clear|clear_lidar_map`→`/fusion_graph_node/{save_graph,clear_graph,clear_lidar_map}` (`fusionGraphTriggerServices` map; `clear_lidar_map` drops only the LiDAR map-anchor occupancy grid, tested in `mowglinext_test.go` `TestServiceRoute_FusionGraphTriggers`); `coverage_clear_resume`→`/behavior_tree_node/clear_coverage_resume`; `reboot_board`→`/hardware_bridge/reboot_board`. All 10 s timeout.
 
 ### foxglove_bridge consumption (`gui/pkg/providers/ros.go`)
 | Logical key (browser) | ROS2 topic | Type | Adapter / decimation / throttle |
@@ -201,7 +202,7 @@ See `docs/UPDATE_CHECKS.md` for the behavior.
 | `wheelOdom` | `/wheel_odom` | `nav_msgs/msg/Odometry` | 80 / 100 ms; feeds session odometer |
 | `lidar` | `/scan` | `sensor_msgs/msg/LaserScan` | `adaptLidar` (≤360 beams); 80 / 100 ms |
 | `map` | *(virtual)* | `mowgli.Map` | `pollMap` every 5 s via `/map_server_node/get_mowing_area` + cached `/map_server_node/docking_pose` |
-| `path` / `plan` | `/coverage/full_plan` / `/plan` | `nav_msgs/msg/Path` | unthrottled |
+| `path` / `plan` | `/coverage/plan_preview` / `/plan` | `mowgli_interfaces/msg/CoveragePlanPreview` / `nav_msgs/msg/Path` | unthrottled |
 | `power`, `emergency` | `/hardware_bridge/power`, `/hardware_bridge/emergency` | `mowgli_interfaces/msg/{Power,Emergency}` | unthrottled |
 | `mowProgress` | `/map_server_node/mow_progress` | `nav_msgs/msg/OccupancyGrid` | 500 ms |
 | `lidarMap` | `/fusion_graph/lidar_map` | `nav_msgs/msg/OccupancyGrid` | 500 ms — fusion_graph's LiDAR anchor map; the map page draws it INSTEAD of the raw `/scan` points once it exists |

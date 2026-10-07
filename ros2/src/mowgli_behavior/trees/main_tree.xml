@@ -797,27 +797,46 @@
                       <AlwaysFailure/>
                     </Sequence>
                   </Fallback>
-                  <!-- Resume: only undock if we actually docked above
-                       (rain_mode >= 2). Otherwise we stayed in place and
-                       can resume directly. -->
+                  <!-- Pause-in-place resumes directly. Dock-and-pause may
+                       depart only when the mower is currently charging:
+                       RainNavOrStay can swallow a failed dock attempt, and
+                       an operator can remove a successfully docked mower
+                       during the rain wait. -->
                   <Fallback name="RainResume">
                     <Inverter><IsRainModeAtLeast mode="2"/></Inverter>
-                    <Sequence name="RainResumeFromDock">
-                      <IsResumeUndockAllowed max_attempts="3"/>
-                      <PublishHighLevelStatus state="2" state_name="RESUMING_AFTER_RAIN"/>
+                    <Sequence name="RainResumeDockCheck">
                       <WaitForDuration duration_sec="1.0"/>
-                      <Fallback name="RainResumeUndock">
-                        <!-- BackUp instead of UndockRobot: opennav_docking isDocked()
-                       uses geometric distance to dock pose which fails with
-                       RTK drift near the dock canopy. BackUp reliably reverses
-                       off the dock via Nav2 behavior_server. -->
-                        <BackUp backup_dist="{undock_distance}" backup_speed="{undock_speed}"/>
-                        <Sequence>
-                          <RecordResumeUndockFailure/>
-                          <ClearCommand/>
-                          <AlwaysFailure/>
+                      <!-- Sample dock contact after preparation, immediately
+                           before dispatch; departure itself releases contact. -->
+                      <IfThenElse name="RainDockedOrHold">
+                        <IsCharging/>
+                        <Sequence name="RainResumeFromDock">
+                          <IsResumeUndockAllowed max_attempts="3"/>
+                          <PublishHighLevelStatus state="2" state_name="RESUMING_AFTER_RAIN"/>
+                          <Fallback name="RainResumeUndock">
+                            <!-- BackUp instead of UndockRobot: opennav_docking isDocked()
+                                 uses geometric distance to dock pose which fails with
+                                 RTK drift near the dock canopy. BackUp reliably reverses
+                                 off the dock via Nav2 behavior_server. -->
+                            <BackUp backup_dist="{undock_distance}" backup_speed="{undock_speed}"/>
+                            <Sequence>
+                              <RecordResumeUndockFailure/>
+                              <ClearCommand/>
+                              <AlwaysFailure/>
+                            </Sequence>
+                          </Fallback>
                         </Sequence>
-                      </Fallback>
+                        <Sequence name="RainResumeNotDocked">
+                          <StopMoving/>
+                          <PublishHighLevelStatus state="1" state_name="RAIN_DOCK_FAILED"/>
+                          <ClearCommand/>
+                          <!-- Stay RUNNING until MowingCommandGuard observes the
+                               cleared command next tick. FAILURE here would
+                               fall through into CoverageEnded's docking action
+                               in this tick; SUCCESS would resume coverage. -->
+                          <KeepRunningUntilFailure><AlwaysSuccess/></KeepRunningUntilFailure>
+                        </Sequence>
+                      </IfThenElse>
                     </Sequence>
                   </Fallback>
                   <PublishHighLevelStatus state="2" state_name="MOWING"/>

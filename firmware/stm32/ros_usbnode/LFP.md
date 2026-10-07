@@ -1,8 +1,8 @@
 # Custom Yardforce 500B LFP firmware
 
 Maintain **`codex/lfp-firmware`** in `wjcloudy/mowglinext` from now on. It combines
-the three former firmware branches, now including upstream dev `b189aa4f`, protocol
-7, LFP charging, sensor recovery, temperature correction and blade reversal.
+the three former firmware branches, now including upstream dev `acf98611`, protocol
+8, LFP charging, sensor recovery, temperature correction and blade reversal.
 Acquisition and monitoring are independent compile-time choices.
 
 ## Build targets
@@ -58,7 +58,7 @@ Do not publish LFP binaries under stock release manifest entries; release packag
 and GUI build selection can be proposed separately upstream.
 
 HARDWARE_PENDING for the consolidated targets: use .118/500B LFP, record the exact
-commit, binary SHA256, target/flags and host digest; use a matching protocol 7 host.
+commit, binary SHA256, target/flags and host digest; use a matching protocol 8 host.
 With blades removed, clear rotor/wheels and accessible cutoff, verify IDLE/zero
 motion, progressing ADC/IMU data, healthy tilt, correct temperature and 28.5 V/1.8 A
 charge ceilings. Supervised redocking must cut duty on input loss and restart only
@@ -136,7 +136,8 @@ Runtime charge limits can lower the compiled envelope. This merge makes the
 LFP CC target and float current cap respect those limits too: a 27 V request
 constrains CC/CV to that target, and a 0.2 A request also reduces the float cap.
 The old `charger_set_end_voltage()` API remains, capped by the active ceiling.
-No packet change is needed; the current v6 host and firmware must be paired.
+Charge settings use the existing parameter packets; pair the current protocol 8
+firmware with a protocol 8 host.
 
 ## Custom hardware and startup
 
@@ -340,6 +341,43 @@ supervise redocking and require zero duty off-dock and bounded fresh-input resta
 verify the 28.5 V / 1.8 A limits. Overnight charging, onboard tilt response and
 physical blade reversal remain separate acceptance runs on that exact build;
 no prior hardware measurement proves their result after this merge.
+
+## Upstream dev refresh — 2026-10-07
+
+Merged upstream `acf98611e2eb01a3c5d7021c94798970996f7cdb`. This incorporates
+the F401 USB recovery state machine, physical D+ detach/PHY release, bounded
+HAL register polling and recovery counters. The full parameter log now keeps
+its last committed set across reboot; clearing it requires an explicit,
+request-ID guarded reset while stopped. This changes the wire protocol to **8**.
+Use a matching protocol-8 ROS2 stack when deploying; do not flash this build into
+the previously recorded protocol-7 stack without planning the paired update.
+
+Our motor-link rearm fix (#831) is now upstream and remains applied once.
+The merge retains all four LFP acquisition/monitoring targets, the **1385** PWM
+ceiling, -0.20 A electronics offset, 8S chemistry limits, PC3/channel-13 temperature
+input, blade reversal, I2C recovery and ABI-2 charge recorder. The parameter
+harness combines upstream reset/persistence coverage with the LFP envelope and
+cross-profile-load checks, including the existing MSVC build path.
+
+This is a source/build update only. The last .118 flash in this conversation
+was commit `20be5551d75c914d541a8b3a0876164a331a9d15`, firmware 1.11.229/protocol 7,
+`Yardforce500B_LFP_DMA_DIAG`. One-click dock calibration passed on that exact image
+with host patch `e5801265`; evidence is on .118 under
+`/home/pi/mower-backups/192.168.1.118/deployments/2026-10-03_motor-link-rearm-20be5551/`.
+That observation does not qualify these protocol-8 binaries.
+
+HARDWARE_PENDING for this refresh: record the new build commit, binary/ELF hashes,
+target, recorder symbol/size, board/ESC revisions and matching host digest before
+a separately authorized .118 flash. With blades removed, wheels secured and an
+accessible cutoff, pass requires compatible protocol 8, IDLE, no wheel/blade
+motion, fresh ADC/IMU readings, correct limits and charging. USB fault recovery
+needs a separate supervised disconnect/reconnect test: safety inhibition must
+remain active until the link and fresh zero/off authorization recover. Parameter
+log/reset acceptance must preserve a saved set through reboot and require an
+explicit safe operator reset; do not erase the installed parameter log merely
+to exercise it. Release wheels only for supervised movement/calibration with
+clear space. Observe at least one day of charging and contact recovery before
+claiming the delayed charge fault resolved; retain frozen evidence before reset.
 
 ## Upstream dev refresh — 2026-10-03
 

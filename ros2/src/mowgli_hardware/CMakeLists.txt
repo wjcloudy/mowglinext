@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.22.1)
 project(mowgli_hardware)
 
 # ---------------------------------------------------------------------------
@@ -155,6 +155,17 @@ if(BUILD_TESTING)
     mowgli_hardware_core
   )
 
+  # ---- test_odometry_publisher ----
+  ament_add_ros_isolated_gtest(test_odometry_publisher
+    test/test_odometry_publisher.cpp
+    src/odometry_publisher.cpp
+  )
+  target_link_libraries(test_odometry_publisher
+    mowgli_hardware_core
+    ${nav_msgs_TARGETS}
+    ${mowgli_interfaces_TARGETS}
+  )
+
   # ---- test_dig_detector ----
   # Header-only pure logic (dig_detector.hpp): no link against
   # mowgli_hardware_core needed, just the include path.
@@ -198,6 +209,16 @@ if(BUILD_TESTING)
     test/test_blade_gate.cpp
   )
   target_include_directories(test_blade_gate
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  # ---- test_blade_reassert ----
+  # Header-only pure logic (blade_reassert.hpp), same as test_blade_gate.
+  ament_add_gtest(test_blade_reassert
+    test/test_blade_reassert.cpp
+  )
+  target_include_directories(test_blade_reassert
     PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
@@ -304,6 +325,14 @@ if(BUILD_TESTING)
     test/test_firmware_params.cpp
   )
   target_include_directories(test_firmware_params
+    PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  )
+
+  ament_add_gtest(test_firmware_param_store_reset_gate
+    test/test_firmware_param_store_reset_gate.cpp
+  )
+  target_include_directories(test_firmware_param_store_reset_gate
     PRIVATE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   )
