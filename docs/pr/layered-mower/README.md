@@ -39,7 +39,7 @@ geometry acceptance have not been completed.
 
 `chassis-gallery.png` is a presentation fixture, not an additional application
 screen. It uses the production `LayeredMower` renderer with the same
-600 x 450 x 190 mm geometry for all four styles, 200 mm drive wheels,
+600 x 450 x 190 mm geometry for all five styles, 200 mm drive wheels,
 325 mm centre track, 40 mm tyre width and casters at X=390 mm / track=280 mm.
 Sensors are omitted to make the shell shapes easy to compare. Reproduce with:
 
@@ -65,3 +65,32 @@ coincident docked anchors, compact WebP asset budgets and unchanged artwork
 while the mower pose updates. Screenshots were visually inspected.
 
 Sensor-editor screenshots refreshed after the review fixes for independent drag/yaw targets and joint-relative visual origins.
+
+
+## Unified Hardware appearance update
+
+The gallery now includes five shells plus the shared paired dock. RM1000 was
+converted from a static map photo to the same independently scaled shell, wheels,
+casters, blade and sensors. Its generated side profile is illustrative; no side
+photo or new physical measurement supports it. The model preset's numerical
+geometry remains empty. Hardware presets can declare a chassis/dock appearance
+pair independently of ROS parameters. Both separate map appearance selectors
+are replaced by a Hardware link; legacy dock overrides are no longer read.
+
+`rm1000-hardware.png` and `rm1000-sensors.png` use illustrative 570 × 400 × 190 mm
+geometry, chassis centre X=0.18 m and bottom Z=-0.05 m; wheels radius=0.10 m,
+width=0.04 m, track=0.30 m; casters radius=0.04 m, X=0.39 m, track=0.26 m.
+GPS is at (0.15, 0, 0.148), LiDAR (0.28, 0, 0.143), IMU (0.035, -0.09, 0.005).
+The sensor heights meet the visible shell roof in this illustration. They are
+not recommended physical RM1000 mounting settings.
+
+`app-map-rm1000-desktop-docked.png` uses the same mock URDF as the earlier 500 map
+fixture, deliberately demonstrating that choosing a different shell does not
+change robot dimensions or anchors. It seeds the appearance from a legacy
+RM1000 selection and verifies that the old static image is not loaded.
+
+Validation of this final update: 51 focused unit tests, 23 application/browser
+cases, TypeScript, production build and lint (0 errors, 898 existing warnings).
+The final RM1000 capture and gallery were refreshed and individually rechecked.
+The earlier merged baseline passed 949 unit tests before the RM1000 conversion;
+that number is not a claim about the later removal of obsolete static-menu tests.

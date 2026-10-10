@@ -4,7 +4,7 @@ The shared renderer is used by Hardware, Sensors and the map's URDF appearance.
 It is a scaled illustration, not CAD or collision geometry.
 
 - Configure the shell once in Hardware. Sensors and Map inherit the selection.
-- Four shells: Rounded, Sculpted, Utility, Yardforce-inspired.
+- Five shells: Rounded, Sculpted, Utility, Yardforce-inspired, RM1000-inspired.
 - Style and transparency are display preferences saved in this browser.
 - All top views face up; all side views face left. The separate red stop button
   is always at the rear, regardless of shell style or transparency.
@@ -35,7 +35,7 @@ GPS/LiDAR/IMU box/cylinder visuals and direct joints. Other URDF layouts use the
 existing map fallback rather than claiming guessed geometry is authoritative.
 
 Source atlas bounds exclude transparent padding. A browser regression scans the
-actual alpha pixels of all eight shell projections (outside the configured crop
+actual alpha pixels of all ten shell projections (outside the configured crop
 as well) and requires their solid edges to match the crop exactly. The crop maps
 to chassis width/length in top view and length/height in side view. Viewport
 padding provides display space only; it cannot alter those physical extents. Caster artwork has a separate
@@ -67,8 +67,8 @@ Generation specification:
 - Dock: curved existing generic-station silhouette; head at top/left, horizontal
   contact pins towards the parking tray. Nominal illustrative footprint 67 × 46 cm,
   height 15 cm; not a physical URDF/collision object. The saved dock pose anchors
-  the parked rear axle, 10 cm ahead of the entry. Select Styled dock in the map
-  appearance menu; existing photo/marker selections remain available.
+  the parked rear axle, 10 cm ahead of the entry. Hardware supplies the paired
+  dock automatically; the map has no independent dock appearance selector.
 - Sensors have a thin mint silhouette highlight in the placement editor only.
 - For replacements, remeasure visible pixel bounds and tyre reference bounds;
   do not compensate padding by changing the physical URDF dimensions.
@@ -160,8 +160,8 @@ node --experimental-strip-types scripts/generate-map-artwork.mjs
 This deterministic crop/resize/WebP pipeline uses the existing pinned Playwright
 Chromium (install it with `npx playwright install chromium` if absent). Originals
 are never overwritten. Body/dock longest edge: 384 px; blade: 256 px; wheels and
-sensors: 128 px. WebP quality 0.85, preserved alpha. All 22 derivatives total
-189,832 bytes. No runtime image processing or new runtime dependency is added.
+sensors: 128 px. WebP quality 0.85, preserved alpha. All 24 derivatives total
+223,862 bytes. No runtime image processing or new runtime dependency is added.
 
 Memoized assembly content is reused between poses, geometry bounds are memoized,
 and identical map projection updates preserve state. No sensor glow is enabled
@@ -246,3 +246,45 @@ coverage. Input fallbacks use joint coordinates rather than artwork centres.
 Validation: 29 focused unit tests, 15 settings/map browser tests and three PR
 gallery captures pass; TypeScript, focused lint (zero errors) and production
 build pass. Sensor-editor screenshots refreshed after these changes.
+
+## Hardware appearance pairs
+
+Hardware presets may declare `appearance: {style: "yardforce", dockAppearance: "styled"}`
+in `constants/mowerModels.ts`. Applying a confirmed hardware preset selects both
+visual defaults; presets without a pair use the sculpted chassis and styled dock.
+Appearance metadata is separate from numerical `defaults` and is never sent to
+ROS. The 500/500B supply the Yardforce-inspired shell; RM1000 supplies its own
+layered shell. They currently share the illustrative styled dock, whose shape
+was already inspired by the RM1000 station. Neither choice measures a robot.
+
+The pair is stored with the existing browser-local visual preference. Existing
+preferences that only contain a shell style acquire the styled dock default.
+Hardware, Sensors and Map use the same preference. Changing the body style picks
+its registered hardware pair (or the generic styled dock); transparency remains
+independent. A confirmed model change applies that model's explicit pair.
+
+The map has one link to Hardware instead of independent mower/dock selectors.
+Old `gui.map.dock.appearance` settings no longer override the pair. Saved RM1000
+map choices seed the new RM1000 assembly when no explicit shell preference exists;
+existing RM1000 hardware installations likewise seed that style. The retired
+static generic mower becomes the shared assembly. No migration writes ROS config.
+
+Future dock artwork belongs in `DOCK_APPEARANCES`; a model can pair its ID with a
+chassis style. Photo docks use the existing calibrated MapImageMarker; a new
+assembled dock needs a renderer branch alongside StyledDockMarker. Old photo
+assets remain as contributed source/reference material, not selectable mower
+renderers. The obsolete static generic mower WebP is no longer shipped.
+
+### RM1000 artwork provenance
+
+`rm1000.png` was generated with the built-in imagegen tool from the contributed
+RM1000 overhead photograph plus `sculpted.png` as a style reference. It contains
+only a graphite/mint shell in top/front-up and side/front-left projections;
+wheels, sensors and the rear stop button are separate shared layers. The side
+profile is illustrative, inferred without a side photograph, not CAD. The exact
+prompt is in `rm1000-artwork-prompt.md` beside this file. The original remains in
+the generated-images archive; the project uses the committed copy and compact
+WebP derivatives. Top/side alpha >220 bounds are [73,48,624,804] and
+[758,401,973,357] in the 1774 × 887 atlas. Both solid and transparent modes use
+these same bounds. No RM1000 physical defaults have been invented; its geometry
+preset remains empty and existing/custom dimensions drive the renderer.

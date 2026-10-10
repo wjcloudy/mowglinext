@@ -1,3 +1,4 @@
+import {DockGraphic} from "../../../src/components/robot/DockGraphic";
 import {createRoot} from "react-dom/client";
 import {LayeredMower} from "../../../src/components/robot/LayeredMower";
 import {parseRobotUrdf, previewRobotGeometry} from "../../../src/utils/robotModel";
@@ -13,6 +14,7 @@ const styles=[
     ["sculpted","Sculpted","Flowing panels · contoured shoulders"],
     ["utility","Utility","Angular panels · geometric detail"],
     ["yardforce","Yardforce-inspired","Raised rails · familiar proportions"],
+    ["rm1000","RM1000-inspired","Recessed console · flowing shoulder panels"],
 ] as const;
 createRoot(document.getElementById("root")!).render(<main>
     <style>{`
@@ -29,7 +31,7 @@ createRoot(document.getElementById("root")!).render(<main>
         .caption{font-size:11px;letter-spacing:1.5px;color:#91b7a3;text-align:center;margin:8px 0 0}
         footer{display:flex;justify-content:space-between;color:#85a995;font-size:13px;margin-top:25px}
     `}</style>
-    <header><div><div className="eyebrow">MOWGLINEXT / CHASSIS COLLECTION</div><h1>Four styles. One robot model.</h1></div>
+    <header><div><div className="eyebrow">MOWGLINEXT / CHASSIS COLLECTION</div><h1>Five styles. One robot model.</h1></div>
         <p>Graphite shells · mint details · rear stop button<br/>Same 600 × 450 × 190 mm geometry in every view</p></header>
     <div className="grid">{styles.map(([style,label,description],i)=><article key={style}>
         <div className="title"><span className="number">0{i+1}</span><h2>{label}</h2></div><p>{description}</p>
@@ -40,6 +42,15 @@ createRoot(document.getElementById("root")!).render(<main>
             <path d="M -.49 .102 H .14" stroke="#476c59" strokeWidth=".001" strokeDasharray=".012 .012"/>
             <LayeredMower robot={robot} style={style} transparent={false} view="side" sensors={false} internalDetails={false}/>
         </svg><div className="caption">SIDE · FRONT ←</div></div></div>
-    </article>)}</div>
+    </article>)}<article>
+        <div className="title"><span className="number">06</span><h2>Paired dock</h2></div>
+        <p>Selected with the hardware appearance · one shared system</p>
+        <div className="views"><div className="view"><svg viewBox="-.26 -.60 .52 .73" aria-label="Paired dock top">
+            <DockGraphic/>
+        </svg><div className="caption">TOP · CHARGING HEAD ↑</div></div>
+        <div className="view"><svg viewBox="-.60 -.28 .73 .48" aria-label="Paired dock side">
+            <DockGraphic view="side"/>
+        </svg><div className="caption">SIDE · CHARGING HEAD ←</div></div></div>
+    </article></div>
     <footer><span>Choose once in Hardware · shared by Sensors and Map</span><span>Production renderer · illustrative shell artwork</span></footer>
 </main>);

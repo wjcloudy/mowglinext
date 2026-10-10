@@ -12,16 +12,16 @@ const exampleUrdf=ROBOT_URDF
     .replace('0 0.024 0.3','0.31 0 0.139')
     .replace('0 0 3.1408','0 0 0')
     .replace('0.18 -0.195 0.095','0.04 -0.09 0.015');
-for(const docked of [false,true])for(const mobile of [false,true])test(`full app map ${mobile ? "mobile" : "desktop"} with ${docked ? "docked" : "moving"} URDF assembly`,async({page})=>{
+for(const style of ["yardforce","rm1000"] as const)for(const docked of [false,true])for(const mobile of [false,true])test(`full app map ${style} ${mobile ? "mobile" : "desktop"} with ${docked ? "docked" : "moving"} URDF assembly`,async({page})=>{
     test.setTimeout(60000);
-    const suffix=`${mobile ? "mobile" : "desktop"}${docked ? "-docked" : ""}`;
+    const suffix=`${style === "rm1000" ? "rm1000-" : ""}${mobile ? "mobile" : "desktop"}${docked ? "-docked" : ""}`;
     mkdirSync(shots,{recursive:true});
     await page.setViewportSize(mobile ? {width:390,height:844} : {width:1440,height:1000});
-    await page.addInitScript(()=>{
+    await page.addInitScript(({style})=>{
         localStorage.setItem("mowglinext.lang","en");
         localStorage.setItem("mowgli.display-mode","efficient");
-        localStorage.setItem("mowgli.robot-visual.v1",JSON.stringify({style:"yardforce",transparent:false}));
-    });
+        localStorage.setItem("mowgli.robot-visual.v1",JSON.stringify(style === "rm1000" ? {transparent:false} : {style,transparent:false}));
+    },{style});
     await page.route("https://api.mapbox.com/**",route=>route.request().url().includes("/styles/")
         ? route.fulfill({json:{version:8,sources:{},glyphs:"https://api.mapbox.com/fonts/v1/mapbox/{fontstack}/{range}.pbf",layers:[{id:"background",type:"background",paint:{"background-color":"#112820"}}]}})
         : route.fulfill({body:Buffer.from([10,0])}));
@@ -29,7 +29,8 @@ for(const docked of [false,true])for(const mobile of [false,true])test(`full app
     const errors:string[]=[];page.on("pageerror",e=>errors.push(e.message));
     await installMockBackend(page,{...SCENARIOS[0],rest:{
         "/api/settings/yaml":{datum_lat:48.1,datum_lon:11.5},
-        "/api/config/keys/get":{"gui.map.mower.appearance":"urdf","gui.map.dock.appearance":"styled"},
+        // Exercise the retired persisted option on mobile as well as URDF on desktop.
+        "/api/config/keys/get":{"gui.map.mower.appearance":style === "rm1000" ? "biltema-rm1000" : mobile ? "generic" : "urdf", "gui.map.dock.appearance":"marker"},
     },topics:{...SCENARIOS[0].topics,robotDescription:{data:exampleUrdf},
         highLevelStatus:{...(SCENARIOS[0].topics!.highLevelStatus as object),state_name:docked ? "IDLE_DOCKED" : "IDLE"},
         pose:pose(0),map:{
@@ -40,6 +41,8 @@ for(const docked of [false,true])for(const mobile of [false,true])test(`full app
     await page.addStyleTag({content:readFileSync("node_modules/mapbox-gl/dist/mapbox-gl.css","utf8")});
     const marker=page.getByTestId("assembled-mower-marker");
     await expect(marker).toBeVisible();
+    await expect(marker.locator("[data-mower-style]")).toHaveAttribute("data-mower-style",style);
+    await expect(page.locator('img[src$="biltema-rm1000/mower.webp"]')).toHaveCount(0);
     await expect(page.getByTestId("styled-dock-marker")).toBeVisible();
     await page.evaluate(async()=>{
         await Promise.all([...document.querySelectorAll('image')].map(e=>{const img=new Image();img.src=e.getAttribute('href')!;return img.decode();}));
@@ -83,10 +86,10 @@ for(const docked of [false,true])for(const mobile of [false,true])test(`full app
     expect(errors).toEqual([]);
     await page.screenshot({path:`${shots}/app-map-${suffix}.png`,fullPage:true});
     await cdp.send("Emulation.setCPUThrottlingRate",{rate:1});
-    await page.evaluate(()=>{
-        localStorage.setItem("mowgli.robot-visual.v1",JSON.stringify({style:"yardforce",transparent:true}));
+    await page.evaluate(({style})=>{
+        localStorage.setItem("mowgli.robot-visual.v1",JSON.stringify({style,transparent:true}));
         window.dispatchEvent(new Event("mowgli-robot-visual"));
-    });
+    },{style});
     await expect(marker.locator('[data-layer="shell"]')).toHaveAttribute("opacity","0.24");
     await page.evaluate(async()=>{
         await Promise.all([...document.querySelectorAll('image')].map(e=>{const img=new Image();img.src=e.getAttribute('href')!;return img.decode();}));

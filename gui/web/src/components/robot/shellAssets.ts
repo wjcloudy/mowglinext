@@ -6,6 +6,7 @@ type Shell = {size: [number, number]; top: [number, number, number, number]; sid
  * source projection, verified against decoded PNG pixels in Playwright.
  * Both opacity modes use these exact same atlas regions. */
 export const SHELLS: Record<MowerStyle, Shell> = {
+    rm1000: {size: [1774,887], top: [73,48,624,804], side: [758,401,973,357]},
     rounded: {size: [1774,887], top: [75,63,620,788], side: [911,339,825,284]},
     sculpted: {size: [1774,887], top: [106,32,630,829], side: [795,302,931,338]},
     utility: {size: [1774,887], top: [117,48,607,816], side: [831,356,874,261]},

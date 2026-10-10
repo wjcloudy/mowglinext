@@ -4705,6 +4705,8 @@
     "sculpted": "Sculpté",
     "utility": "Utilitaire",
     "yardforce": "Inspiré Yardforce",
+    "rm1000": "Inspiré RM1000",
+    "hardwareLink": "Apparence tondeuse et base → Matériel",
     "transparent": "Coque transparente",
     "browserPreference": "Apparence · enregistrée dans ce navigateur",
     "top": "Dessus · avant ↑",
@@ -4713,6 +4715,6 @@
     "previewNote": "Aperçu des réglages en cours. La carte utilise la description du robot en service ; enregistrez et redémarrez ROS pour appliquer la géométrie.",
     "mapAlt": "Tondeuse assemblée selon la description du robot en service",
     "dockStyle": "Base stylisée",
-    "dockNote": "Base illustrative · 67 × 46 cm. Sélectionnez « Base stylisée » dans l’apparence de la carte pour l’afficher."
+    "dockNote": "Base illustrative · 67 × 46 cm. Associée au châssis dans Matériel et affichée automatiquement sur la carte."
   }
 }

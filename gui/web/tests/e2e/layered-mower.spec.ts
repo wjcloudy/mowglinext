@@ -19,11 +19,11 @@ test.beforeEach(async({page})=>{
     await installMockBackend(page,{...base,topics:{...base.topics,robotDescription:{data:ROBOT_URDF}},
         rest:{...base.rest,"/api/settings/yaml":settings}});
 });
-test("four styles keep the same shell and sensor positions in transparent views",async({page})=>{
+test("five styles keep the same shell and sensor positions in transparent views",async({page})=>{
     await page.goto("/#/settings?section=hardware");
     const preview=page.getByTestId("mower-preview");
     await expect(preview.locator('[data-layer="shell-art"]')).toHaveCount(2);
-    for(const [id,label] of [["rounded","Rounded"],["sculpted","Sculpted"],["utility","Utility"],["yardforce","Yardforce-inspired"]]){
+    for(const [id,label] of [["rounded","Rounded"],["sculpted","Sculpted"],["utility","Utility"],["yardforce","Yardforce-inspired"],["rm1000","RM1000-inspired"]]){
         await page.getByRole("combobox",{name:"Body style"}).press("ArrowDown");
         await page.getByText(label,{exact:true}).last().click();
         await page.getByRole("combobox",{name:"Body style"}).press("Escape");
@@ -125,7 +125,7 @@ test("all shell dimensions describe opaque chassis edges, excluding atlas margin
     await expect(page.getByTestId("mower-top")).toBeVisible();
     const measured=await page.evaluate(async()=>{
         const result:Record<string,Record<string,number[]>>={};
-        for(const style of ["rounded","sculpted","utility","yardforce"]){
+        for(const style of ["rounded","sculpted","utility","yardforce","rm1000"]){
             const image=new Image();image.src=`/assets/robots/layered/${style}.png`;await image.decode();
             const canvas=document.createElement("canvas");canvas.width=image.width;canvas.height=image.height;
             const ctx=canvas.getContext("2d",{willReadFrequently:true})!;ctx.drawImage(image,0,0);
@@ -133,7 +133,8 @@ test("all shell dimensions describe opaque chassis edges, excluding atlas margin
             result[style]={};
             // The two isolated projections are separated at x=768 in these
             // source atlases. Scan their whole cells, not just the crop metadata.
-            for(const [view,start,end] of [["top",0,768],["side",768,image.width]] as const){
+            const split = style === "rm1000" ? 740 : 768;
+            for(const [view,start,end] of [["top",0,split],["side",split,image.width]] as const){
                 let minX=image.width,minY=image.height,maxX=-1,maxY=-1;
                 for(let y=0;y<image.height;y++)for(let x=start;x<end;x++){
                     // Ignore the antialias fringe; alpha >220 defines solid shell.
@@ -199,6 +200,10 @@ test("full application hardware preset gallery on desktop and mobile",async({pag
             await page.getByRole("button",{name:"Apply preset",exact:true}).click();
             await expect(page.getByRole("dialog")).toHaveCount(0);
             await expect(page.getByRole("radio",{name:label,exact:true})).toHaveAttribute("aria-checked","true");
+            await expect(page.getByTestId("mower-top").locator("[data-mower-style]"))
+                .toHaveAttribute("data-mower-style", preset.appearance?.style ?? "sculpted");
+            expect(await page.evaluate(() => JSON.parse(localStorage.getItem("mowgli.robot-visual.v1")!).dockAppearance))
+                .toBe(preset.appearance?.dockAppearance ?? "styled");
             const side=page.getByTestId("mower-side");
             if(Object.keys(preset.defaults).length){
                 await expect(side.locator('[data-layer="shell-art"]')).toHaveAttribute("height",String(preset.defaults.chassis_height));

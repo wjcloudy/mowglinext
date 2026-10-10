@@ -1,3 +1,4 @@
+import {DEFAULT_MOWER_VISUAL, useMowerVisual} from "../../hooks/useMowerVisual";
 import {MowerPreview} from "../robot/MowerPreview";
 import React, { useState } from "react";
 import { App, Card, Col, Form, Input, InputNumber, Row, Space, Switch, Tag, Typography } from "antd";
@@ -36,6 +37,7 @@ export const HardwareSection: React.FC<Props> = ({
     const { colors } = useThemeMode();
     const { modal } = App.useApp();
     const [showAdvanced, setShowAdvanced] = useState(false);
+    const [, setVisual] = useMowerVisual(values.mower_model);
     const selectedModel = values.mower_model || "YardForce500";
 
     const fieldLabel = (key: string, label: React.ReactNode) => (
@@ -51,6 +53,7 @@ export const HardwareSection: React.FC<Props> = ({
     const applyModelPreset = (model: string) => {
         onChange("mower_model", model);
         const preset = MOWER_MODELS.find((m) => m.value === model);
+        setVisual(preset?.appearance ?? DEFAULT_MOWER_VISUAL);
         if (preset?.defaults && Object.keys(preset.defaults).length > 0) {
             onBulkChange(presetValuesForBackend(preset.defaults, backendDefaultOverrides));
         }

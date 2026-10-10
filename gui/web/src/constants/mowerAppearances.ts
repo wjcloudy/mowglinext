@@ -1,7 +1,6 @@
-/** Display-only mower imagery. Keep this separate from ROS hardware presets:
- * similar dimensions or electronics do not establish the external shell brand.
+/** Display-only dock registry. Hardware appearance pairs reference these IDs;
+ * image dimensions are visual metadata, never ROS/collision calibration.
  */
-export type MowerAppearanceId = "urdf" | "biltema-rm1000";
 
 export interface MapImageAppearance {
     src: string;
@@ -22,12 +21,6 @@ export interface MapImageAppearance {
     forwardOffsetM?: number;
 }
 
-export interface MowerAppearance {
-    id: MowerAppearanceId;
-    labelKey: string;
-    mowerImage?: MapImageAppearance;
-}
-
 export type DockAppearanceId = "marker" | "styled" | "generic" | "biltema-rm1000";
 
 export interface DockAppearance {
@@ -36,29 +29,9 @@ export interface DockAppearance {
     image?: MapImageAppearance;
     /** Optional foreground cutout for the dock's center tongue over the mower. */
     foregroundClipPath?: string;
-    onlyForMowerAppearance?: MowerAppearanceId;
 }
 
 export const DOCK_FOREGROUND_CLIP_PATH = "polygon(43% 78%, 57% 78%, 68% 83%, 68% 92%, 59% 96%, 41% 96%, 32% 92%, 32% 83%)";
-
-export const MOWER_APPEARANCES: Record<MowerAppearanceId, MowerAppearance> = {
-    urdf: {id: "urdf", labelKey: "mapToolbar.mowerAppearanceUrdf"},
-    "biltema-rm1000": {
-        id: "biltema-rm1000",
-        labelKey: "mapToolbar.mowerAppearanceBiltemaRm1000",
-        mowerImage: {
-            src: "/assets/robots/biltema-rm1000/mower.webp",
-            altKey: "mapToolbar.mowerAppearanceBiltemaRm1000Alt",
-            visibleLengthM: 0.57,
-            visibleLengthFraction: 0.9,
-            // The source's long axis runs front-to-back; the image pose point
-            // is near the rear axle, not at the visual center of the body.
-            poseAnchor: {x: 0.5, y: 0.77},
-            // The docked-photo review favored this slight display-only forward tuck.
-            forwardOffsetM: 0.02,
-        },
-    },
-};
 
 export const DOCK_APPEARANCES: Record<DockAppearanceId, DockAppearance> = {
     marker: {id: "marker", labelKey: "mapToolbar.dockAppearanceMarker"},
@@ -98,49 +71,12 @@ export const DOCK_APPEARANCES: Record<DockAppearanceId, DockAppearance> = {
             poseAnchor: {x: 0.5, y: 0.16},
             headingOffsetRad: Math.PI,
         },
-        onlyForMowerAppearance: "biltema-rm1000",
     },
 };
 
-export function getAvailableDockAppearances(mowerAppearanceId: MowerAppearanceId): DockAppearance[] {
-    return Object.values(DOCK_APPEARANCES)
-        .filter((appearance) => !appearance.onlyForMowerAppearance || appearance.onlyForMowerAppearance === mowerAppearanceId);
-}
-
-export function resolveDockAppearance(value: unknown, mowerAppearanceId: MowerAppearanceId): DockAppearance {
-    if (value === "styled") return DOCK_APPEARANCES.styled;
-    if (value !== "generic" && value !== "biltema-rm1000") return DOCK_APPEARANCES.marker;
-    const appearance = DOCK_APPEARANCES[value];
-    if (appearance.onlyForMowerAppearance && appearance.onlyForMowerAppearance !== mowerAppearanceId) {
-        return DOCK_APPEARANCES.marker;
-    }
-    return appearance;
-}
-
-/** Reset only model-specific dock choices made incompatible by a mower change. */
-export function getDockAppearanceResetForMowerChange(
-    selectedDockAppearance: DockAppearance,
-    nextMowerAppearanceId: MowerAppearanceId,
-): DockAppearanceId | undefined {
-    return selectedDockAppearance.onlyForMowerAppearance &&
-        selectedDockAppearance.onlyForMowerAppearance !== nextMowerAppearanceId
-        ? "marker"
-        : undefined;
-}
-
-/** Unknown/stale GUI values fail closed to the existing URDF drawing. */
-export function resolveMowerAppearance(value: unknown): MowerAppearance {
-    if (value === "biltema-rm1000") return MOWER_APPEARANCES["biltema-rm1000"];
-    return MOWER_APPEARANCES.urdf;
-}
-
-export function shouldDisplayMowerImage(
-    appearance: MowerAppearance,
-    loadedSrc: string | undefined,
-    hasPose: boolean,
-    hasHeading: boolean,
-): boolean {
-    return shouldDisplayMapImage(appearance.mowerImage, loadedSrc, hasPose, hasHeading);
+/** Docks are paired with the hardware appearance; there is no separate map override. */
+export function resolveDockAppearance(value: unknown): DockAppearance {
+    return Object.values(DOCK_APPEARANCES).find(({id}) => id === value) ?? DOCK_APPEARANCES.styled;
 }
 
 export function shouldDisplayMapImage(

@@ -4705,6 +4705,8 @@
     "sculpted": "Sculpted",
     "utility": "Utility",
     "yardforce": "Yardforce-inspired",
+    "rm1000": "RM1000-inspired",
+    "hardwareLink": "Mower & dock appearance → Hardware",
     "transparent": "Transparent shell",
     "browserPreference": "Appearance · saved in this browser",
     "top": "Top · front ↑",
@@ -4713,6 +4715,6 @@
     "previewNote": "Preview of edited settings. The map uses the running robot description; save and restart ROS to apply geometry changes.",
     "mapAlt": "Assembled mower from the running robot description",
     "dockStyle": "Styled dock",
-    "dockNote": "Illustrative dock · 67 × 46 cm. Select “Styled dock” in map appearance to show it on the map."
+    "dockNote": "Illustrative dock · 67 × 46 cm. Paired with the chassis in Hardware and shown automatically on the map."
   }
 }

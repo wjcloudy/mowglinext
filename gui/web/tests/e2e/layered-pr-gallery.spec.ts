@@ -11,7 +11,7 @@ const custom={mower_model:"CUSTOM",robot_name:"Angular custom concept",chassis_l
     wheel_track:.30,wheel_x_offset:0,caster_radius:.04,caster_track:.28,caster_x_offset:.39,blade_radius:.115,tool_width:.23,ticks_per_meter:300,
     gps_x:.16,gps_y:0,gps_z:0.13,lidar_x:.32,lidar_y:0,lidar_z:.131,lidar_yaw:0,
     imu_x:.035,imu_y:-.09,imu_z:.005,imu_yaw:0};
-for(const example of ["yardforce500","custom-angular"] as const){
+for(const example of ["yardforce500","custom-angular","rm1000"] as const){
     test(`PR screenshots ${example}`,async({page})=>{
         test.setTimeout(60000);
         mkdirSync(output,{recursive:true});
@@ -23,11 +23,14 @@ for(const example of ["yardforce500","custom-angular"] as const){
                 caster_x_offset:.40,caster_track:.30,
                 gps_x:.15,gps_y:0,gps_z:0.148,
                 lidar_x:.31,lidar_y:0,lidar_z:.139,lidar_yaw:0,
-                imu_x:.04,imu_y:-.09,imu_z:.015,imu_yaw:0} : custom;
+                imu_x:.04,imu_y:-.09,imu_z:.015,imu_yaw:0} : example === "rm1000" ? {...custom,mower_model:"BiltemaRM1000",robot_name:"RM1000 illustration",
+                chassis_length:.57,chassis_width:.40,chassis_height:.19,chassis_z_offset:-.05,
+                chassis_center_x:.18,wheel_width:.04,wheel_track:.30,caster_x_offset:.39,caster_track:.26,
+                blade_radius:.09,tool_width:.18,gps_x:.15,gps_z:.148,lidar_x:.28,lidar_z:.143} : custom;
         await page.addInitScript(({style})=>{
             localStorage.setItem("mowglinext.lang","en");
             localStorage.setItem("mowgli.robot-visual.v1",JSON.stringify({style,transparent:false}));
-        },{style:example === "yardforce500" ? "yardforce" : "utility"});
+        },{style:example === "yardforce500" ? "yardforce" : example === "rm1000" ? "rm1000" : "utility"});
         await installMockBackend(page,{...SCENARIOS[0],topics:{...SCENARIOS[0].topics,robotDescription:{data:ROBOT_URDF}},
             rest:{"/api/settings/yaml":values}},{liveStatusIntervalMs:1000});
         await page.goto("/#/settings?section=hardware");
@@ -48,7 +51,7 @@ for(const example of ["yardforce500","custom-angular"] as const){
         }
         await page.goto("/#/settings?section=sensors");
         await expect(page.getByTestId("mower-side")).toBeVisible();
-        if(example === "yardforce500")await page.getByRole("switch",{name:"Transparent shell"}).click();
+        if(example !== "custom-angular")await page.getByRole("switch",{name:"Transparent shell"}).click();
         await page.getByTestId("sensor-placement").evaluate(node=>node.scrollIntoView({block:"start"}));
         await page.waitForTimeout(500); // Let scroll and toggle transitions settle for the capture.
         await page.screenshot({path:`${output}/${example}-sensors.png`,fullPage:true});
@@ -66,8 +69,8 @@ test("chassis style gallery",async({page})=>{
     mkdirSync(output,{recursive:true});
     await page.setViewportSize({width:1600,height:1150});
     await page.goto("/tests/e2e/fixtures/chassis-gallery.html");
-    await expect(page.locator("article")).toHaveCount(4);
-    await expect(page.locator("[data-mower-style]")).toHaveCount(8);
+    await expect(page.locator("article")).toHaveCount(6);
+    await expect(page.locator("[data-mower-style]")).toHaveCount(10);
     await page.evaluate(async()=>{
         await Promise.all([...document.querySelectorAll("image")].map(e=>{
             const image=new Image();image.src=e.getAttribute("href")!;return image.decode();

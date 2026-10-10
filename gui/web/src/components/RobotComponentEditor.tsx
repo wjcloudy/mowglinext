@@ -326,7 +326,7 @@ export const RobotComponentEditor: React.FC<Props> = ({ values, onChange }) => {
 
     const liveRobot = useRobotDescription();
     const robot = useMemo(() => previewRobotGeometry(liveRobot, values), [liveRobot, values]);
-    const [visual] = useMowerVisual();
+    const [visual] = useMowerVisual(values.mower_model);
     const [dragBounds, setDragBounds] = useState<Bounds | null>(null);
     const bounds = dragBounds ?? assemblyBounds(robot, "top", .12);
     const svgWidth = isMobile ? 340 : 520;

@@ -1,3 +1,5 @@
+import type {MowerVisualPreset} from "../hooks/useMowerVisual";
+
 // Per-model physical presets applied by the GUI's "mower model" picker.
 //
 // PARITY CONTRACT (guarded by gui/pkg/api/schema_template_parity_test.go,
@@ -28,6 +30,8 @@ export type MowerModel = {
     label: string;
     description: string;
     tag?: string;
+    /** Optional matched chassis/dock appearance; never passed to ROS parameters. */
+    appearance?: MowerVisualPreset;
     defaults: Record<string, number>;
 };
 
@@ -36,6 +40,7 @@ export const MOWER_MODELS: MowerModel[] = [
         value: "YardForce500",
         label: "mowerModels.YardForce500.label",
         description: "mowerModels.YardForce500.description",
+        appearance: {style: "yardforce", dockAppearance: "styled"},
         tag: "mowerModels.YardForce500.tag",
         defaults: {
             wheel_radius: 0.1, wheel_track: 0.325, wheel_x_offset: 0.0,
@@ -54,6 +59,7 @@ export const MOWER_MODELS: MowerModel[] = [
         value: "YardForce500B",
         label: "mowerModels.YardForce500B.label",
         description: "mowerModels.YardForce500B.description",
+        appearance: {style: "yardforce", dockAppearance: "styled"},
         defaults: {
             wheel_radius: 0.1, wheel_track: 0.325, wheel_x_offset: 0.0,
             wheel_width: 0.04, chassis_height: 0.19, chassis_z_offset: -0.05, chassis_mass_kg: 8.76,
@@ -87,6 +93,7 @@ export const MOWER_MODELS: MowerModel[] = [
         value: "BiltemaRM1000",
         label: "mowerModels.BiltemaRM1000.label",
         description: "mowerModels.BiltemaRM1000.description",
+        appearance: {style: "rm1000", dockAppearance: "styled"},
         // RM1000-specific geometry has not been measured for this preset.
         // Keep it selectable without copying a different mower's calibration.
         defaults: {},
