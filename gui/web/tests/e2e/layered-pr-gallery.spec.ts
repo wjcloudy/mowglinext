@@ -25,8 +25,9 @@ for(const example of ["yardforce500","custom-angular","rm1000"] as const){
                 lidar_x:.31,lidar_y:0,lidar_z:.139,lidar_yaw:0,
                 imu_x:.04,imu_y:-.09,imu_z:.015,imu_yaw:0} : example === "rm1000" ? {...custom,mower_model:"BiltemaRM1000",robot_name:"RM1000 illustration",
                 chassis_length:.57,chassis_width:.40,chassis_height:.19,chassis_z_offset:-.05,
-                chassis_center_x:.18,wheel_width:.04,wheel_track:.30,caster_x_offset:.39,caster_track:.26,
-                blade_radius:.09,tool_width:.18,gps_x:.15,gps_z:.148,lidar_x:.28,lidar_z:.143} : custom;
+                // Illustrative body position centres the photo-based arch over the rear axle.
+                chassis_center_x:.145,wheel_width:.04,wheel_track:.30,caster_x_offset:.355,caster_track:.26,
+                blade_radius:.09,tool_width:.18,gps_x:.115,gps_z:.145,lidar_x:.245,lidar_z:.145} : custom;
         await page.addInitScript(({style})=>{
             localStorage.setItem("mowglinext.lang","en");
             localStorage.setItem("mowgli.robot-visual.v1",JSON.stringify({style,transparent:false}));

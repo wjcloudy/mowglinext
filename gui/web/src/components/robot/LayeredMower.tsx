@@ -17,7 +17,7 @@ function ShellSprite({style, view, x, y, width, height, artwork}: {
         <svg data-layer="shell-art" x={x} y={y} width={width} height={height}
         viewBox={[sx,sy,sw,sh].join(" ")} preserveAspectRatio="none" overflow="hidden">
         <rect data-shell-bounds x={sx} y={sy} width={sw} height={sh} fill="none"/>
-        <image onLoad={()=>setLoaded(true)} onError={()=>setLoaded(false)} href={artwork === "map" ? `/assets/robots/layered/map/${style}-${view}.webp` : `/assets/robots/layered/${style}.png`}
+        <image onLoad={()=>setLoaded(true)} onError={()=>setLoaded(false)} href={artwork === "map" ? `/assets/robots/layered/map/${style}-${view}.webp` : `/assets/robots/layered/${shell.files?.[view] ?? `${style}.png`}`}
             x={artwork === "map" ? sx : 0} y={artwork === "map" ? sy : 0}
             width={artwork === "map" ? sw : shell.size[0]} height={artwork === "map" ? sh : shell.size[1]}/>
     </svg></>;
@@ -63,7 +63,8 @@ export const LayeredMower = memo(function LayeredMower({robot: r, style, transpa
     robot: RobotGeometry; style: MowerStyle; transparent: boolean; view?: RobotView; sensors?: boolean; highlightSensors?: boolean; internalDetails?: boolean; artwork?:"full"|"map";
 }) {
     const id = useId();
-    const rearX = r.chassisCenterX-r.baseLength*.40;
+    const stopAnchor = SHELLS[style].stop;
+    const rearX = r.chassisCenterX+r.baseLength*(.5-stopAnchor.fromFront);
     const buttonW = Math.min(.095,r.baseWidth*.30), buttonD = Math.min(.04,r.baseLength*.08);
     const bodyZ = r.chassisCenterZ ?? r.baseHeight/2;
     const bladeX = r.bladeX ?? r.chassisCenterX;
@@ -97,7 +98,7 @@ export const LayeredMower = memo(function LayeredMower({robot: r, style, transpa
         </g>
         <g data-layer="stop" data-robot-x={rearX}>
             <rect x={view === "top" ? -buttonW/2 : -rearX-buttonD/2}
-                y={view === "top" ? -rearX-buttonD/2 : -bodyZ-r.baseHeight/2+.012}
+                y={view === "top" ? -rearX-buttonD/2 : -bodyZ-r.baseHeight/2+r.baseHeight*stopAnchor.roofFromTop-.011}
                 width={view === "top" ? buttonW : buttonD} height={view === "top" ? buttonD : .014}
                 rx={.005} fill={`url(#${id})`} stroke="#872b2a" strokeWidth={.002}/>
         </g>

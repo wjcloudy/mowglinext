@@ -126,15 +126,17 @@ test("all shell dimensions describe opaque chassis edges, excluding atlas margin
     const measured=await page.evaluate(async()=>{
         const result:Record<string,Record<string,number[]>>={};
         for(const style of ["rounded","sculpted","utility","yardforce","rm1000"]){
-            const image=new Image();image.src=`/assets/robots/layered/${style}.png`;await image.decode();
-            const canvas=document.createElement("canvas");canvas.width=image.width;canvas.height=image.height;
-            const ctx=canvas.getContext("2d",{willReadFrequently:true})!;ctx.drawImage(image,0,0);
-            const pixels=ctx.getImageData(0,0,image.width,image.height).data;
             result[style]={};
-            // The two isolated projections are separated at x=768 in these
-            // source atlases. Scan their whole cells, not just the crop metadata.
             const split = style === "rm1000" ? 740 : 768;
-            for(const [view,start,end] of [["top",0,split],["side",split,image.width]] as const){
+            for(const view of ["top","side"] as const){
+                const separateSide=style === "rm1000" && view === "side";
+                const image=new Image();image.src=`/assets/robots/layered/${style}${separateSide ? "-side" : ""}.png`;await image.decode();
+                const canvas=document.createElement("canvas");canvas.width=image.width;canvas.height=image.height;
+                const ctx=canvas.getContext("2d",{willReadFrequently:true})!;ctx.drawImage(image,0,0);
+                const pixels=ctx.getImageData(0,0,image.width,image.height).data;
+                // Scan the entire source cell, independent of crop metadata.
+                const start=separateSide || view === "top" ? 0 : split;
+                const end=separateSide || view === "side" ? image.width : split;
                 let minX=image.width,minY=image.height,maxX=-1,maxY=-1;
                 for(let y=0;y<image.height;y++)for(let x=start;x<end;x++){
                     // Ignore the antialias fringe; alpha >220 defines solid shell.

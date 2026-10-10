@@ -9,6 +9,7 @@ const robot=previewRobotGeometry(parseRobotUrdf(ROBOT_URDF)!,{
     chassis_length:.60,chassis_width:.45,chassis_height:.19,chassis_z_offset:-.05,
     wheel_radius:.1,wheel_width:.04,wheel_track:.325,caster_x_offset:.39,caster_track:.28,
 });
+const rm1000Robot=previewRobotGeometry(robot,{chassis_center_x:.15,caster_x_offset:.36});
 const styles=[
     ["rounded","Rounded","Soft curves · compact silhouette"],
     ["sculpted","Sculpted","Flowing panels · contoured shoulders"],
@@ -36,11 +37,11 @@ createRoot(document.getElementById("root")!).render(<main>
     <div className="grid">{styles.map(([style,label,description],i)=><article key={style}>
         <div className="title"><span className="number">0{i+1}</span><h2>{label}</h2></div><p>{description}</p>
         <div className="views"><div className="view"><svg viewBox="-.255 -.51 .51 .66" aria-label={label+" top"}>
-            <LayeredMower robot={robot} style={style} transparent={false} view="top" sensors={false} internalDetails={false}/>
+            <LayeredMower robot={style === "rm1000" ? rm1000Robot : robot} style={style} transparent={false} view="top" sensors={false} internalDetails={false}/>
         </svg><div className="caption">TOP · FRONT ↑</div></div>
         <div className="view"><svg viewBox="-.51 -.28 .66 .48" aria-label={label+" side"}>
             <path d="M -.49 .102 H .14" stroke="#476c59" strokeWidth=".001" strokeDasharray=".012 .012"/>
-            <LayeredMower robot={robot} style={style} transparent={false} view="side" sensors={false} internalDetails={false}/>
+            <LayeredMower robot={style === "rm1000" ? rm1000Robot : robot} style={style} transparent={false} view="side" sensors={false} internalDetails={false}/>
         </svg><div className="caption">SIDE · FRONT ←</div></div></div>
     </article>)}<article>
         <div className="title"><span className="number">06</span><h2>Paired dock</h2></div>

@@ -15,7 +15,9 @@ describe("layered mower",()=>{
             const wheels=container.querySelector('[data-layer="wheels"]')!.outerHTML;
             const sensors=Array.from(container.querySelectorAll("[data-sensor]")).map(s=>s.outerHTML);
             const stop=container.querySelector('[data-layer="stop"]')!;
-            expect(Number(stop.getAttribute("data-robot-x"))).toBeLessThan(robot.wheelXOffset);
+            // A rear console may be ahead of the drive axle but must stay in the rear half.
+            expect(Number(stop.getAttribute("data-robot-x"))).toBeLessThan(robot.chassisCenterX);
+            expect(Number(stop.getAttribute("data-robot-x"))).toBeGreaterThan(robot.chassisCenterX-robot.baseLength/2);
             expect(SHELLS[style].top[2]).toBeLessThan(SHELLS[style].size[0]);
             rerender(<svg><LayeredMower robot={robot} style={style} view={view} transparent/></svg>);
             expect(container.querySelector('[data-layer="shell"]')).toHaveAttribute("opacity","0.24");

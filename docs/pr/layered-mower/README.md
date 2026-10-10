@@ -41,6 +41,8 @@ geometry acceptance have not been completed.
 screen. It uses the production `LayeredMower` renderer with the same
 600 x 450 x 190 mm geometry for all five styles, 200 mm drive wheels,
 325 mm centre track, 40 mm tyre width and casters at X=390 mm / track=280 mm.
+RM1000 uses chassis centre X=150 mm and caster X=360 mm to align its rear
+wheel opening with the axle; the other gallery shells retain centre X=180 mm.
 Sensors are omitted to make the shell shapes easy to compare. Reproduce with:
 
 ```sh
@@ -71,16 +73,16 @@ Sensor-editor screenshots refreshed after the review fixes for independent drag/
 
 The gallery now includes five shells plus the shared paired dock. RM1000 was
 converted from a static map photo to the same independently scaled shell, wheels,
-casters, blade and sensors. Its generated side profile is illustrative; no side
-photo or new physical measurement supports it. The model preset's numerical
+casters, blade and sensors. Its side profile now follows the user-supplied RM1000 side photograph,
+restyled in graphite/mint. It remains an illustration, not a measured model. The model preset's numerical
 geometry remains empty. Hardware presets can declare a chassis/dock appearance
 pair independently of ROS parameters. Both separate map appearance selectors
 are replaced by a Hardware link; legacy dock overrides are no longer read.
 
-`rm1000-hardware.png` and `rm1000-sensors.png` use illustrative 570 × 400 × 190 mm
-geometry, chassis centre X=0.18 m and bottom Z=-0.05 m; wheels radius=0.10 m,
-width=0.04 m, track=0.30 m; casters radius=0.04 m, X=0.39 m, track=0.26 m.
-GPS is at (0.15, 0, 0.148), LiDAR (0.28, 0, 0.143), IMU (0.035, -0.09, 0.005).
+`rm1000-hardware.png` and `rm1000-sensors.png` use illustrative 570 Ã— 400 Ã— 190 mm
+geometry, chassis centre X=0.145 m and bottom Z=-0.05 m; wheels radius=0.10 m,
+width=0.04 m, track=0.30 m; casters radius=0.04 m, X=0.355 m, track=0.26 m.
+GPS is at (0.115, 0, 0.145), LiDAR (0.245, 0, 0.145), IMU (0.035, -0.09, 0.005).
 The sensor heights meet the visible shell roof in this illustration. They are
 not recommended physical RM1000 mounting settings.
 
@@ -94,3 +96,20 @@ cases, TypeScript, production build and lint (0 errors, 898 existing warnings).
 The final RM1000 capture and gallery were refreshed and individually rechecked.
 The earlier merged baseline passed 949 unit tests before the RM1000 conversion;
 that number is not a claim about the later removal of obsolete static-menu tests.
+
+## Photo-based RM1000 side and console anchors
+
+The supplied side photograph replaces the previously inferred side silhouette.
+The approved top source PNG and compact top WebP are byte-for-byte unchanged.
+The screenshot example moves the chassis 35 mm rearward relative to the axle,
+with its roof sensors and front casters following the body; wheel radius and
+wheel-centre track are unchanged. These are illustrative fixture values only.
+
+Stop buttons are SVG layers, not generated into the shell images. Each style now
+specifies its own rear-console position and local roof height, in visible-shell
+fractions. Top and side share the same fore/aft position; solid and transparent
+modes retain the same anchor. They do not change URDF geometry or robot controls.
+
+Validation: 16 renderer tests, TypeScript and targeted ESLint passed. All 22
+Hardware/Sensors/gallery/map browser cases passed after the side and anchor edits.
+Application screenshots use mocked telemetry; no robot was contacted.
