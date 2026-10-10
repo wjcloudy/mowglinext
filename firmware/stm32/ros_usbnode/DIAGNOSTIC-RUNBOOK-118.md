@@ -1,5 +1,11 @@
 # Mower .118: diagnostic processes and next steps
 
+**10 October update:** the standalone systemd saver and its current-deployment
+identity checks are described in [CHARGE-AUTOSAVE.md](CHARGE-AUTOSAVE.md). Prefer
+that procedure for the consolidated DMA diagnostic image. The address, image
+and detached-watch commands below describe the September baseline only; do not
+start that old watcher alongside the new service or reuse its old address.
+
 Updated 6 September 2026. This is the operational record for 192.168.1.118,
 not the standard 500 on .119. Full backups and captured evidence stay on the Pi.
 

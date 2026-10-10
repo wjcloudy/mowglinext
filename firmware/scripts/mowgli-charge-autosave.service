@@ -1,0 +1,19 @@
+[Unit]
+Description=Standalone Mowgli .118 charging evidence saver
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/mower-backups/192.168.1.118/tools/charge-autosave
+ExecStart=/usr/bin/python3 -u /home/pi/mower-backups/192.168.1.118/tools/charge-autosave/charge_diag_autosave.py
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=15
+# sudo -n openocd is the existing restricted hardware access route. Do not set
+# NoNewPrivileges here: it would prevent that read-only mem_ap helper running.
+
+[Install]
+WantedBy=multi-user.target

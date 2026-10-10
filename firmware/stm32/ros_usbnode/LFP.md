@@ -18,7 +18,8 @@ From `firmware/stm32/ros_usbnode`, use `pio run -e <environment>`. The default
 remains stock 500. `Yardforce500B_LFP` is the base IRQ target with monitoring off;
 `Yardforce500B_LFP_DIAG` remains a compatibility alias for **DMA + monitoring**.
 `Yardforce500B_LFP_DEBUG` retains the old IRQ remote-debug configuration.
-All LFP targets use PWM ceiling 1385 (29 September trial). Monitoring uses recorder ABI 2.
+All LFP targets use PWM ceiling 1380 (10 October trial). Monitoring uses recorder ABI 2.
+The separate Pi evidence saver is documented in [CHARGE-AUTOSAVE.md](CHARGE-AUTOSAVE.md).
 Use its matching ELF when obtaining recorder addresses; never reuse an address
 from another build. Plain LFP builds omit the diagnostic recorder.
 
@@ -103,7 +104,7 @@ rendering a stock configuration cannot turn the LFP build into a Li-ion profile.
 | Dock input threshold / disconnect debounce | 22.0 V / 20 cycles (~200 ms) |
 | CC-to-CV debounce / return hysteresis | 50 cycles (~500 ms) / 2.0 V |
 | CV deadband | +/-0.2 V |
-| PWM floor / ceiling | 39 / 1385 (timer period 1400; 29 September peak-duty trial, formerly 1390) |
+| PWM floor / ceiling | 39 / 1380 (timer period 1400; 10 October peak-duty trial, formerly 1385) |
 | Battery / charge-rail IIR weights | 0.05 / 0.10 |
 
 Bulk PWM rises one count at a time and backs off by 1/2/6/16 counts according

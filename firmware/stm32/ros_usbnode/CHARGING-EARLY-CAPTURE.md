@@ -1,5 +1,15 @@
 # Early charging capture: .118, 7 September 2026
 
+**1380 trial update (10 October):** .118 lost charging on the 1385 image
+`79127808` / 1.12.178 / protocol 8, with a reported docking-time dropout.
+The battery died and the ensuing power cycle erased the original RAM trace;
+the five-minute current graph cannot establish a hardware overcurrent trip.
+The user requested a further five-count reduction to 1380. With ARR=1400 and
+DTG=40, the remaining 21 counts still suppress the complementary pulse; this
+is an unproven peak-duty experiment. The charge envelope, offset, acquisition,
+protection and drive settings are unchanged. A separate Pi capture service is
+documented in [CHARGE-AUTOSAVE.md](CHARGE-AUTOSAVE.md).
+
 **1385 trial update (29 September):** the 1390 image on .118 again lost charge
 after extended operation. Its frozen diagnostic trace held requested and timer
 PWM at 1390 while regulated output and charge current fell; dock input stayed
