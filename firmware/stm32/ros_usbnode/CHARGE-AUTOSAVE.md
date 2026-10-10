@@ -26,7 +26,16 @@ firmware manifest, matching deployment location, Pi boot ID, ROS observation and
 running container identities. Duplicate frozen blobs are suppressed across service
 restarts. `diagnostics/autosave/` holds latest status/header/probe log and daily
 five-second telemetry JSONL. All evidence stays on the Pi; no Docker image backup
-is created. Logs currently remain until manually archived/removed.
+is created. Routine telemetry is rotated into approximately 10 MB chunks and
+limited to the latest seven UTC calendar days (today and six previous days)
+and 100 MB total, whichever limit removes logs first. Cleanup runs at service
+startup and after each five-second log append, deleting oldest chunks first.
+Only direct files named `YYYY-MM-DD_telemetry.jsonl` or
+`YYYY-MM-DD_telemetry-NNNN.jsonl` in `diagnostics/autosave/` are eligible.
+Symlinks, subdirectories and other names are excluded; cleanup never visits
+`incidents/` or `deployments/`. Fault captures and firmware backups are retained
+without this age/size limit. `retention.json` records routine-log usage/policy.
+System journal retention remains controlled by the Pi's existing journald config.
 
 ```sh
 systemctl status mowgli-charge-autosave

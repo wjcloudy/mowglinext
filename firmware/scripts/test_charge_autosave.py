@@ -1,5 +1,6 @@
 """Guard tests for the separate Pi evidence saver; no hardware/debug access."""
 import copy
+from datetime import date, datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -91,6 +92,80 @@ class AutosaveGuards(unittest.TestCase):
             self.assertEqual(len(incidents), 1)
             self.assertEqual((incidents[0]/'mcu-capture'/'recorder.bin').read_bytes(), blob)
             self.assertTrue((incidents[0]/'observation.json').exists())
+
+    def test_retention_age_size_and_protected_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = root/'diagnostics/autosave'
+            state.mkdir(parents=True)
+            protected = [state/'recorder.bin', state/'latest-header.json',
+                         state/'2026-99-99_telemetry.jsonl',
+                         root/'incidents/old/mcu-capture/recorder.bin',
+                         root/'deployments/old/firmware.bin']
+            for path in protected:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'KEEP evidence exactly')
+            before = {p:p.read_bytes() for p in protected}
+            # A directory whose name resembles a log must never be traversed.
+            nested = state/'2026-10-01_telemetry.jsonl'
+            nested.mkdir()
+            (nested/'firmware.bin').write_bytes(b'KEEP nested')
+            for name, size in [('2026-10-03_telemetry.jsonl',1),
+                               ('2026-10-04_telemetry.jsonl',40),
+                               ('2026-10-09_telemetry.jsonl',40),
+                               ('2026-10-10_telemetry.jsonl',40)]:
+                (state/name).write_bytes(b'x'*size)
+            report = saver.retain_telemetry(state, date(2026,10,10), max_bytes=100)
+            self.assertEqual(report['removed'], ['2026-10-03_telemetry.jsonl',
+                                                 '2026-10-04_telemetry.jsonl'])
+            self.assertEqual(report['retained_bytes'],80)
+            self.assertEqual({p:p.read_bytes() for p in protected}, before)
+            self.assertEqual((nested/'firmware.bin').read_bytes(), b'KEEP nested')
+
+    def test_retention_seven_day_boundary_and_chunk_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            for name in ('2026-10-04_telemetry.jsonl',
+                         '2026-10-10_telemetry.jsonl',
+                         '2026-10-10_telemetry-0001.jsonl'):
+                (state/name).write_bytes(b'x'*40)
+            report = saver.retain_telemetry(state, date(2026,10,10), max_bytes=120)
+            self.assertEqual(report['removed'], [])  # Oldest retained day, inclusive.
+            report = saver.retain_telemetry(state, date(2026,10,10), max_bytes=40)
+            self.assertEqual(report['removed'], ['2026-10-04_telemetry.jsonl',
+                                                 '2026-10-10_telemetry.jsonl'])
+            self.assertTrue((state/'2026-10-10_telemetry-0001.jsonl').exists())
+
+    def test_symlinks_are_not_followed_or_deleted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = root/'state'
+            state.mkdir()
+            backup = root/'firmware.bin'
+            backup.write_bytes(b'KEEP backup')
+            link = state/'2026-10-01_telemetry.jsonl'
+            try:
+                link.symlink_to(backup)
+            except OSError:
+                self.skipTest('Host cannot create symlinks')
+            self.assertEqual(saver.retain_telemetry(state, date(2026,10,10),0)['removed'], [])
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(backup.read_bytes(), b'KEEP backup')
+            redirected = root/'redirected'
+            redirected.symlink_to(state, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                saver.retain_telemetry(redirected)
+
+    def test_rotation_keeps_previous_chunk(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            day = datetime.now(timezone.utc).date()
+            original = state/f'{day}_telemetry.jsonl'
+            original.write_bytes(b'old\n')
+            with patch.object(saver, 'TELEMETRY_CHUNK_BYTES', 4):
+                saver.append_telemetry(state, dict(test='new'))
+            self.assertEqual(original.read_bytes(), b'old\n')
+            self.assertEqual(json.loads((state/f'{day}_telemetry-0001.jsonl').read_text()), dict(test='new'))
 
 
 if __name__ == '__main__':

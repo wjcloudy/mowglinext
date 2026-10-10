@@ -6,15 +6,80 @@ files into it. SWD reads are restricted to fresh IDLE/stationary observations.
 The deployment manifest and matching ELF own the recorder identity/address.
 """
 import argparse
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import selectors
+import stat
 import subprocess
 import tempfile
 import time
+
+TELEMETRY_DAYS = 7
+TELEMETRY_BYTES = 100_000_000  # 100 MB total, independent of the age limit.
+TELEMETRY_CHUNK_BYTES = 10_000_000
+TELEMETRY_NAME = re.compile(r'(\d{4}-\d{2}-\d{2})_telemetry(?:-(\d{4}))?\.jsonl')
+
+
+def telemetry_files(state):
+    """Only our directly owned routine logs; never walk incident/deployment trees."""
+    state = state.absolute()
+    if state.resolve() != state:
+        raise ValueError('Telemetry directory must not pass through a symlink')
+    files = []
+    for path in state.iterdir():
+        match = TELEMETRY_NAME.fullmatch(path.name)
+        if not match or not stat.S_ISREG(path.lstat().st_mode):
+            continue  # Symlinks, directories, captures and all other names survive.
+        try:
+            day = date.fromisoformat(match[1])
+        except ValueError:
+            continue
+        files.append((day, int(match[2] or 0), path, path.stat().st_size))
+    return sorted(files, key=lambda f: (f[0], f[1]))
+
+
+def retain_telemetry(state, today=None, max_bytes=TELEMETRY_BYTES):
+    """Keep seven UTC calendar days, then discard oldest logs to meet the cap."""
+    today = today or datetime.now(timezone.utc).date()
+    cutoff = today - timedelta(days=TELEMETRY_DAYS - 1)
+    files = telemetry_files(state)
+    total = sum(f[3] for f in files)
+    removed = []
+    for day, sequence, path, size in files:
+        if day < cutoff or total > max_bytes:
+            # Recheck the direct file immediately before unlinking. Do not follow
+            # links, recurse, truncate other files, or prune firmware/fault data.
+            if path.parent.resolve() != state.resolve() or not stat.S_ISREG(path.lstat().st_mode):
+                raise ValueError('Telemetry cleanup target changed')
+            path.unlink()
+            total -= size
+            removed.append(path.name)
+    return dict(days=TELEMETRY_DAYS, max_bytes=max_bytes, retained_bytes=total, removed=removed)
+
+
+def append_telemetry(state, row):
+    today = datetime.now(timezone.utc).date()
+    files = [f for f in telemetry_files(state) if f[0] == today]
+    line = json.dumps(row)+'\n'
+    index = files[-1][1] if files else 0
+    if files and files[-1][3] + len(line.encode('utf-8')) > TELEMETRY_CHUNK_BYTES:
+        index += 1
+    if index > 9999:
+        raise ValueError('Too many telemetry chunks for one UTC day')
+    suffix = '' if index == 0 else f'-{index:04d}'
+    path = state / f'{today}_telemetry{suffix}.jsonl'
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ValueError('Unsafe telemetry append target')
+    with path.open('a', encoding='utf-8') as f:
+        f.write(line)
+    report = retain_telemetry(state, today)
+    (state / 'retention.json').write_text(json.dumps(dict(utc=utc(), **report), indent=2)+'\n')
+    if report['removed']:
+        print('Routine telemetry cleanup: '+json.dumps(report), flush=True)
 
 # These topics provide observation timestamps. Only a changed acquisition stamp
 # renews their freshness; cached republication cannot keep the guard alive.
@@ -161,6 +226,10 @@ def main():
     # Same lock path is used by the flash helper. Stop this service first too.
     with (state / 'openocd.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        report = retain_telemetry(state)
+        (state / 'retention.json').write_text(json.dumps(dict(utc=utc(), **report), indent=2)+'\n')
+        if report['removed']:
+            print('Routine telemetry cleanup: '+json.dumps(report), flush=True)
         last_probe, last_log, idle_since = 0, 0, None
         while True:
             path, manifest = deployment(root)
@@ -189,8 +258,7 @@ def main():
                         if now-last_log >= 5:
                             row = dict(utc=utc(), deployment=str(path), **snapshot)
                             (state / 'status.json').write_text(json.dumps(row, indent=2)+'\n')
-                            with (state / (utc()[:10] + '_telemetry.jsonl')).open('a') as f:
-                                f.write(json.dumps(row)+'\n')
+                            append_telemetry(state, row)
                             last_log = now
                         if not eligible(snapshot, manifest):
                             idle_since = None
