@@ -38,7 +38,8 @@ const drop = (lng: number, lat: number) => act(() => seen.props?.onDragEnd?.({ln
 const renderMarker = (over: Partial<React.ComponentProps<typeof CoverageStartMarker>> = {}) => {
     const onMove = vi.fn();
     const props = {
-        longitude: 5.0005, latitude: 52.0, ring, settledCount: 0, onMove, title: "Drag to move the start", ...over,
+        longitude: 5.0005, latitude: 52.0, ring, settledCount: 0, draggable: true, onMove,
+        title: "Drag to move the start", ...over,
     };
     const utils = render(<CoverageStartMarker {...props}/>);
     return {onMove, props, ...utils, again: (next: Partial<typeof props>) =>
@@ -57,6 +58,18 @@ describe("coverage start marker", () => {
         expect(seen.props?.longitude).toBe(5.0005);
         expect(seen.props?.latitude).toBe(52.0);
         expect(seen.props?.anchor).toBe("center");
+    });
+
+    it("is not draggable outside edit mode, but still shows the start", () => {
+        renderMarker({draggable: false});
+        expect(seen.props?.draggable).toBe(false);
+        expect(seen.props?.longitude).toBe(5.0005);
+    });
+
+    it("becomes draggable when edit mode starts", () => {
+        const {again} = renderMarker({draggable: false});
+        again({draggable: true});
+        expect(seen.props?.draggable).toBe(true);
     });
 
     it("tells the operator it can be dragged", () => {

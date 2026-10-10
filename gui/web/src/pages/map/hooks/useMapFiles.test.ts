@@ -3,6 +3,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {useMapFiles} from './useMapFiles';
 import {MowingAreaFeature, NavigationFeature} from '../../../types/map.ts';
 import type {Api} from '../../../api/Api.ts';
+import {parseMapBackup} from '../utils/mapBackup.ts';
 
 vi.mock('react-i18next', () => ({useTranslation: () => ({t: (key: string) => key})}));
 
@@ -215,6 +216,56 @@ describe('useMapFiles backup carries the pre-shrink obstacle outlines', () => {
 
         const saved = JSON.parse(await blob!.text()) as {obstacle_originals: unknown};
         expect(saved.obstacle_originals).toEqual([kept]);
+    });
+});
+
+// An area's own mowing lines are part of the Map message, so "Backup map" carries them, and
+// "Restore map" followed by "Save map" must put them back on the same area.
+describe('useMapFiles backup and restore keep the mowing lines', () => {
+    const lines = {
+        has_mow_angle: true, mow_angle_deg: 35,
+        has_ring_direction: true, ring_direction: 2,
+        has_start_point: true, start_x: 9.5, start_y: 4,
+    };
+    const ring = {points: [{x: 0, y: 0, z: 0}, {x: 10, y: 0, z: 0}, {x: 10, y: 10, z: 0}, {x: 0, y: 10, z: 0}]};
+
+    it('writes them into map.json', async () => {
+        let blob: Blob | undefined;
+        Object.assign(window.URL, {createObjectURL: vi.fn((b: Blob) => { blob = b; return 'blob:x'; }), revokeObjectURL: vi.fn()});
+        vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+        const hook = renderHook(() => useMapFiles(backupOptions({
+            map: {working_area: [{name: 'Voor', id: 7, area: ring, obstacles: [], is_navigation_area: false, ...lines}], navigation_areas: []},
+        })));
+        hook.result.current.handleBackupMap();
+
+        const saved = JSON.parse(await blob!.text()) as {working_area: Array<Record<string, unknown>>};
+        expect(saved.working_area[0]).toMatchObject({id: 7, ...lines});
+    });
+
+    it('a restored backup saved again keeps them on the same area', async () => {
+        // Backup text -> parse (what Restore map does) -> the area the editor holds -> the save payload.
+        const parsed = parseMapBackup(JSON.stringify({
+            working_area: [{name: 'Voor', id: 7, area: ring, obstacles: [], ...lines}],
+            navigation_areas: [],
+        }));
+        expect(parsed.ok).toBe(true);
+        if (!parsed.ok) return;
+        const restored = new MowingAreaFeature('area-0-area-0', 1);
+        restored.setArea(parsed.map.working_area![0], 0, 0, [0, 0, 0]);
+
+        const putMowglinext = vi.fn().mockResolvedValue({});
+        const hook = renderHook(() => useMapFiles(backupOptions({
+            features: {[restored.id]: restored},
+            editMap: true,
+            guiApi: {mowglinext: {putMowglinext}} as unknown as Api<unknown>,
+        })));
+        await act(async () => {
+            await hook.result.current.handleSaveMap();
+        });
+
+        const sent = putMowglinext.mock.calls[0][0].areas as Array<{area: Record<string, unknown>}>;
+        expect(sent[0].area).toMatchObject({id: 7, ...lines});
     });
 });
 

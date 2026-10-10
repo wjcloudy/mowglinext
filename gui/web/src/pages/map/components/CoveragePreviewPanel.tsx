@@ -14,18 +14,18 @@ interface CoveragePreviewPanelProps {
     resumeAvailable?: boolean;
 }
 
-/// Controls for the "mowing lines" overlay: pick an area, try a mow angle and a
-/// perimeter direction, watch the planner's lines move, then save them for that
-/// area (or as the robot-wide default). The lines are the real planner's
-/// (preview_coverage); nothing here moves the robot.
+/// The "mowing lines" overlay's controls: pick an area, and see the planner's lines for it.
+/// Changing the angle, the perimeter direction or the start point is only possible while the map
+/// is being edited, and is then part of that edit: "Save map" keeps it, "Cancel" drops it, undo
+/// and redo cover it. Outside edit mode the same controls are shown read-only. The lines are the
+/// real planner's (preview_coverage); nothing here moves the robot.
 export const CoveragePreviewPanel = ({preview, areaLabel, resumeAvailable = false}: CoveragePreviewPanelProps) => {
     const {colors} = useThemeMode();
     const {t} = useTranslation();
     const {
-        areas, area, selectArea, hasAreaId, canEdit, choices, setAngleMode, setAngleDeg, setDirection,
-        setStart, startAdjustable,
-        robotWideAngle, robotWideDirection, shownAngle, dirty, differsFromRobotWide, reset, saveArea,
-        saveRobotWide, saving, loading, error, result,
+        areas, area, selectArea, editMode, choices, setAngleMode, setAngleDeg, commitAngle, setDirection,
+        setStart, startAdjustable, robotWideAngle, robotWideDirection, shownAngle, changedFromServer,
+        loading, error, result,
     } = preview;
 
     const label = {
@@ -48,15 +48,17 @@ export const CoveragePreviewPanel = ({preview, areaLabel, resumeAvailable = fals
 
     const fixed = choices.angleMode === "fixed";
     const sliderValue = Math.round(fixed ? choices.angleDeg : shownAngle) % 180;
-    const editable = canEdit && hasAreaId;
-    const hasOwnLines = choices.angleMode !== "global" || choices.direction !== "global";
-    // Swaths and perimeter rounds overlap slightly, so the planner's fraction can pass 1.
+    const hasOwnLines = choices.angleMode !== "global" || choices.direction !== "global" || choices.start !== null;
     const percent = Math.min(100, Math.round((result?.planned_fraction ?? 0) * 100));
+    const readOnly = !editMode;
 
     return (
         <div style={{padding: 12}}>
             <div style={{fontSize: 14, fontWeight: 600, color: colors.text}}>{t('coveragePreview.title')}</div>
             <div style={{fontSize: 12, color: colors.textSecondary, marginTop: 2}}>{t('coveragePreview.hint')}</div>
+            <div style={{fontSize: 12, color: colors.textSecondary, marginTop: 6}}>
+                {editMode ? t('coveragePreview.editHint') : t('coveragePreview.viewHint')}
+            </div>
 
             {areas.length > 1 && (
                 <>
@@ -76,6 +78,7 @@ export const CoveragePreviewPanel = ({preview, areaLabel, resumeAvailable = fals
                 size="small"
                 style={{width: '100%'}}
                 value={choices.angleMode}
+                disabled={readOnly}
                 onChange={(mode) => setAngleMode(mode)}
                 options={[
                     {value: "global", label: t('coveragePreview.angleModeGlobal', {value: robotWideAngleName})},
@@ -90,7 +93,9 @@ export const CoveragePreviewPanel = ({preview, areaLabel, resumeAvailable = fals
                     max={179}
                     step={1}
                     value={sliderValue}
+                    disabled={readOnly}
                     onChange={setAngleDeg}
+                    onChangeComplete={commitAngle}
                     tooltip={{formatter: (v) => t('coveragePreview.angleDeg', {deg: v})}}
                 />
                 <InputNumber
@@ -101,7 +106,10 @@ export const CoveragePreviewPanel = ({preview, areaLabel, resumeAvailable = fals
                     step={1}
                     precision={0}
                     value={sliderValue}
+                    disabled={readOnly}
                     onChange={(v) => v !== null && setAngleDeg(v)}
+                    onBlur={commitAngle}
+                    onPressEnter={commitAngle}
                 />
             </div>
             {!fixed && (
@@ -115,6 +123,7 @@ export const CoveragePreviewPanel = ({preview, areaLabel, resumeAvailable = fals
                 size="small"
                 style={{width: '100%'}}
                 value={choices.direction}
+                disabled={readOnly}
                 onChange={(d) => setDirection(d)}
                 options={[
                     {value: "global", label: t('coveragePreview.directionGlobal', {value: directionName(robotWideDirection)})},
@@ -130,8 +139,8 @@ export const CoveragePreviewPanel = ({preview, areaLabel, resumeAvailable = fals
                     ? t('coveragePreview.startNeedsRings')
                     : choices.start ? t('coveragePreview.startCustom') : t('coveragePreview.startAutomatic')}
             </div>
-            {startAdjustable && <div style={{...stat, marginTop: 2}}>{t('coveragePreview.startHint')}</div>}
-            {startAdjustable && choices.start && (
+            {startAdjustable && editMode && <div style={{...stat, marginTop: 2}}>{t('coveragePreview.startHint')}</div>}
+            {startAdjustable && editMode && choices.start && (
                 <Button size="small" type="link" style={{padding: 0}} onClick={() => setStart(null)}>
                     {t('coveragePreview.startReset')}
                 </Button>
@@ -150,29 +159,11 @@ export const CoveragePreviewPanel = ({preview, areaLabel, resumeAvailable = fals
             </div>
 
             <div style={{...stat, marginTop: 8}}>
-                {dirty
-                    ? t('coveragePreview.unsaved')
-                    : hasOwnLines ? t('coveragePreview.ownSettings') : t('coveragePreview.followsRobotWide')}
+                {hasOwnLines ? t('coveragePreview.ownSettings') : t('coveragePreview.followsRobotWide')}
             </div>
-            {!canEdit && <div style={{...stat, marginTop: 4}}>{t('coveragePreview.blockedMowing')}</div>}
-            {canEdit && !hasAreaId && <div style={{...stat, marginTop: 4}}>{t('coveragePreview.blockedNoId')}</div>}
-            {resumeAvailable && dirty && (
+            {resumeAvailable && changedFromServer && (
                 <Alert style={{marginTop: 8}} type="warning" showIcon message={t('coveragePreview.resumeWarning')}/>
             )}
-            <div style={{display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap'}}>
-                <Button size="small" type="primary" disabled={!dirty || !editable} loading={saving} onClick={() => void saveArea()}>
-                    {t('coveragePreview.saveArea')}
-                </Button>
-                <Button size="small" disabled={!dirty || saving} onClick={reset}>
-                    {t('coveragePreview.reset')}
-                </Button>
-            </div>
-            <div style={{marginTop: 6}}>
-                <Button size="small" type="link" style={{padding: 0}} disabled={!differsFromRobotWide || saving}
-                    onClick={() => void saveRobotWide()}>
-                    {t('coveragePreview.saveRobotWide')}
-                </Button>
-            </div>
         </div>
     );
 };

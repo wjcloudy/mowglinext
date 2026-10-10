@@ -1,7 +1,7 @@
 # Custom Yardforce 500B LFP firmware
 
 Maintain **`codex/lfp-firmware`** in `wjcloudy/mowglinext` from now on. It combines
-the three former firmware branches, now including upstream dev `acf98611`, protocol
+the three former firmware branches, now including upstream dev `96786160`, protocol
 8, LFP charging, sensor recovery, temperature correction and blade reversal.
 Acquisition and monitoring are independent compile-time choices.
 
@@ -341,6 +341,48 @@ supervise redocking and require zero duty off-dock and bounded fresh-input resta
 verify the 28.5 V / 1.8 A limits. Overnight charging, onboard tilt response and
 physical blade reversal remain separate acceptance runs on that exact build;
 no prior hardware measurement proves their result after this merge.
+
+## Upstream dev refresh — 2026-10-10
+
+Merged upstream `967861605d541bfddae2ee28621789304bbc11b9`, including charger
+fixes #880 and #881. The wire protocol remains **8**. Runtime voltage limits
+now bound the stock CC/CV target and charge rail; increasing a reduced effective
+end target resumes CC, while resending an unchanged limit preserves CV. The LFP
+controller retains its existing bounded target, battery-based CV debounce,
+float regulation and current backoff, and gains the same effective-target
+resume behavior. Regression cases cover both profiles.
+
+Aborting the stock dock offset measurement now restores TF4/powerbus before
+returning to IDLE. The LFP build still uses the fixed -0.20 A electronics offset
+and never turns TF4 off for that measurement, so its contact protection remains
+unchanged. All four IRQ/DMA and monitoring combinations, the **1385** PWM cap,
+28.5 V/1.8 A envelope, PC3/channel-13 temperature input, blade reversal, I2C/USB
+recovery, parameter persistence and ABI-2 recorder are retained. Upstream charger
+harnesses compile the production controller with a fresh-ADC stub; independent
+ADC tests exercise stale/invalid acquisition and immediate PWM cutoff.
+
+This refresh updates source and build artifacts only. The last recorded .118
+flash was `7eb9ddcedd94efe5f3696227ff659d3a8b25efd6`, firmware **1.12.148 / protocol 8**,
+`Yardforce500B_LFP_DMA_DIAG`, binary SHA256
+`08002c2507851021e6e06c8646950b34fc4cb05f6e21ebff7d4bf8b7ae0d0f7c`.
+Its records are on the Pi in
+`/home/pi/mower-backups/192.168.1.118/deployments/2026-10-07_protocol8-lfp-7eb9ddce/`.
+Preserve its parameter sector and calibrated encoder scale **319.306** when
+later deploying; the compiled 399 fallback is not the installed calibration.
+
+HARDWARE_PENDING for this refresh: baseline is .118/500B LFP with the exact new
+merge commit, binary/ELF SHA256, `Yardforce500B_LFP_DMA_DIAG`, board/ESC revisions,
+recorder symbol/size and the matching protocol-8 host image digest recorded
+before a separately authorized flash. With blades removed, wheels secured and
+an accessible cutoff, first require IDLE, no wheel/blade motion, compatible
+communication, fresh ADC/IMU and retained 28.5 V/1.8 A settings. Supervise contact
+loss/redocking: PWM must become zero on loss and restart only from zero after
+fresh stable input. Exercise a lower charge target, then raise it within the
+compiled envelope: CC must resume; repeating an unchanged target must not
+restart CV. Observe at least one day on the dock; pass requires controlled charge
+output/current without a latched failure. Capture the matching frozen recorder
+before any reset if the fault returns. Earlier images' observations do not
+qualify these newly built images.
 
 ## Upstream dev refresh — 2026-10-07
 

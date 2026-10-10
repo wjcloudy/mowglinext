@@ -16,8 +16,8 @@ const area = (id: string, name: string) => {
 };
 
 const fns = {
-    selectArea: vi.fn(), setAngleMode: vi.fn(), setAngleDeg: vi.fn(), setDirection: vi.fn(),
-    reset: vi.fn(), saveArea: vi.fn(), saveRobotWide: vi.fn(), setEnabled: vi.fn(), setStart: vi.fn(),
+    selectArea: vi.fn(), setAngleMode: vi.fn(), setAngleDeg: vi.fn(), commitAngle: vi.fn(),
+    setDirection: vi.fn(), setStart: vi.fn(), setEnabled: vi.fn(),
 };
 
 const follow: AreaChoices = {angleMode: 'global', angleDeg: 0, direction: 'global', start: null};
@@ -28,16 +28,13 @@ const makePreview = (over: Partial<Preview> = {}): Preview => {
         enabled: true,
         areas,
         area: areas[0],
-        hasAreaId: true,
-        canEdit: true,
+        editMode: true,
         startAdjustable: true,
         choices: follow,
         robotWideAngle: -1,
         robotWideDirection: 0,
         shownAngle: 72.4,
-        dirty: false,
-        differsFromRobotWide: false,
-        saving: false,
+        changedFromServer: false,
         loading: false,
         error: undefined,
         result: {success: true, swaths: [{}, {}, {}], headland_passes: 2, planned_fraction: 0.934, mow_angle_deg: 72.4},
@@ -97,91 +94,109 @@ describe('coverage preview panel', () => {
     });
 
     it('says an area has its own lines once it overrides something', () => {
-        show(makePreview({choices: {angleMode: 'fixed', angleDeg: 30, direction: 'global', start: null}}));
+        show(makePreview({choices: {...follow, angleMode: 'fixed', angleDeg: 30}}));
         expect(screen.getByText('This area has its own lines.')).toBeInTheDocument();
+        show(makePreview({choices: {...follow, start: {x: 1, y: 2}}}));
+        expect(screen.getAllByText('This area has its own lines.')).toHaveLength(2);
     });
 
-    it('keeps save and reset disabled until something changed', () => {
-        show(makePreview());
-        expect(button('Save for this area')).toBeDisabled();
-        expect(button('Reset')).toBeDisabled();
+    describe('in edit mode', () => {
+        it('says the changes are part of the map edit', () => {
+            show(makePreview());
+            expect(screen.getByText(/Save map keeps them, Cancel drops them/)).toBeInTheDocument();
+            expect(screen.queryByText(/Choose Edit map to change/)).not.toBeInTheDocument();
+        });
+
+        it('has no save or reset buttons of its own: Save map and Cancel do that', () => {
+            show(makePreview());
+            expect(screen.queryByRole('button', {name: /save/i})).not.toBeInTheDocument();
+            expect(screen.queryByRole('button', {name: 'Reset'})).not.toBeInTheDocument();
+            expect(screen.queryByRole('button', {name: 'Use for all areas'})).not.toBeInTheDocument();
+        });
+
+        it('enables every control', () => {
+            show(makePreview());
+            for (const combo of screen.getAllByRole('combobox')) expect(combo).toBeEnabled();
+            expect(screen.getByRole('spinbutton')).toBeEnabled();
+        });
+
+        it('picking a direction from the list sends that choice', () => {
+            show(makePreview());
+            fireEvent.mouseDown(screen.getAllByRole('combobox')[1]);
+            fireEvent.click(within(document.body).getByText('Counter-clockwise', {selector: '.ant-select-item-option-content'}));
+            expect(fns.setDirection).toHaveBeenCalledExactlyOnceWith(2);
+        });
+
+        it('picking a fixed angle from the list sends that mode', () => {
+            show(makePreview());
+            fireEvent.mouseDown(screen.getAllByRole('combobox')[0]);
+            fireEvent.click(within(document.body).getByText('Fixed angle', {selector: '.ant-select-item-option-content'}));
+            expect(fns.setAngleMode).toHaveBeenCalledExactlyOnceWith('fixed');
+        });
+
+        it('typing an angle moves the preview and commits when the field is left or Enter is pressed', () => {
+            show(makePreview({choices: {...follow, angleMode: 'fixed', angleDeg: 30}, shownAngle: 30}));
+            const input = screen.getByRole('spinbutton');
+            fireEvent.change(input, {target: {value: '45'}});
+            expect(fns.setAngleDeg).toHaveBeenCalledWith(45);
+            expect(fns.commitAngle).not.toHaveBeenCalled();
+            fireEvent.blur(input);
+            expect(fns.commitAngle).toHaveBeenCalledTimes(1);
+            fireEvent.keyDown(input, {key: 'Enter', code: 'Enter', keyCode: 13});
+            expect(fns.commitAngle).toHaveBeenCalledTimes(2);
+        });
+
+        it('says the planner picks the start until the operator chooses one', () => {
+            show(makePreview());
+            expect(screen.getByText('Start point')).toBeInTheDocument();
+            expect(screen.getByText('Automatic: the middle of the longest side.')).toBeInTheDocument();
+            expect(screen.getByText(/Drag the green dot to change where mowing starts/)).toBeInTheDocument();
+            expect(screen.queryByRole('button', {name: 'Back to automatic'})).not.toBeInTheDocument();
+        });
+
+        it('shows a chosen start and lets the operator go back to automatic', () => {
+            show(makePreview({choices: {...follow, start: {x: 3, y: 4}}}));
+            expect(screen.getByText('You chose where mowing starts.')).toBeInTheDocument();
+            fireEvent.click(button('Back to automatic'));
+            expect(fns.setStart).toHaveBeenCalledExactlyOnceWith(null);
+        });
+
+        it('explains why there is no start point to place with the perimeter rounds off', () => {
+            show(makePreview({startAdjustable: false, choices: {...follow, start: {x: 3, y: 4}}}));
+            expect(screen.getByText(/A start point needs the perimeter rounds/)).toBeInTheDocument();
+            expect(screen.queryByText(/Drag the green dot/)).not.toBeInTheDocument();
+            expect(screen.queryByRole('button', {name: 'Back to automatic'})).not.toBeInTheDocument();
+        });
+
+        it('warns that a paused mow resumes on a re-planned area, only when this session changed the lines', () => {
+            const {rerender} = show(makePreview({changedFromServer: true}), true);
+            expect(screen.getByText(/choose Start fresh instead of Resume/)).toBeInTheDocument();
+            rerender(<CoveragePreviewPanel preview={makePreview({changedFromServer: false})} areaLabel={() => ''} resumeAvailable/>);
+            expect(screen.queryByText(/choose Start fresh instead of Resume/)).not.toBeInTheDocument();
+            rerender(<CoveragePreviewPanel preview={makePreview({changedFromServer: true})} areaLabel={() => ''} resumeAvailable={false}/>);
+            expect(screen.queryByText(/choose Start fresh instead of Resume/)).not.toBeInTheDocument();
+        });
     });
 
-    it('saves this area and resets once the preview differs from what is stored', () => {
-        show(makePreview({dirty: true}));
-        expect(screen.getByText('Not saved yet. This only changes the preview.')).toBeInTheDocument();
-        fireEvent.click(button('Save for this area'));
-        expect(fns.saveArea).toHaveBeenCalledOnce();
-        fireEvent.click(button('Reset'));
-        expect(fns.reset).toHaveBeenCalledOnce();
-    });
+    describe('outside edit mode', () => {
+        it('tells the operator to choose Edit map', () => {
+            show(makePreview({editMode: false}));
+            expect(screen.getByText(/Choose Edit map to change the angle, direction or start point/)).toBeInTheDocument();
+            expect(screen.queryByText(/Save map keeps them/)).not.toBeInTheDocument();
+        });
 
-    it('cannot save an area while the mower is not idle, and says why', () => {
-        show(makePreview({dirty: true, canEdit: false}));
-        expect(button('Save for this area')).toBeDisabled();
-        expect(screen.getByText(/Stop the mower to change an area's lines/)).toBeInTheDocument();
-        // The preview itself stays usable.
-        expect(button('Reset')).toBeEnabled();
-    });
+        it('shows the same lines and numbers, read-only', () => {
+            show(makePreview({editMode: false}));
+            expect(screen.getByText('3 lines')).toBeInTheDocument();
+            for (const combo of screen.getAllByRole('combobox')) expect(combo).toBeDisabled();
+            expect(screen.getByRole('spinbutton')).toBeDisabled();
+        });
 
-    it('cannot save an area that has no id yet', () => {
-        show(makePreview({dirty: true, hasAreaId: false}));
-        expect(button('Save for this area')).toBeDisabled();
-        expect(screen.getByText('Save the map first: this area has no id yet.')).toBeInTheDocument();
-    });
-
-    it('warns that a paused mow resumes with a re-planned area, only when it matters', () => {
-        const {rerender} = show(makePreview({dirty: true}), true);
-        expect(screen.getByText(/choose Start fresh instead of Resume/)).toBeInTheDocument();
-        rerender(<CoveragePreviewPanel preview={makePreview({dirty: false})} areaLabel={() => ''} resumeAvailable/>);
-        expect(screen.queryByText(/choose Start fresh instead of Resume/)).not.toBeInTheDocument();
-        rerender(<CoveragePreviewPanel preview={makePreview({dirty: true})} areaLabel={() => ''} resumeAvailable={false}/>);
-        expect(screen.queryByText(/choose Start fresh instead of Resume/)).not.toBeInTheDocument();
-    });
-
-    it('offers the robot-wide save only when what is shown differs from it', () => {
-        const {rerender} = show(makePreview({differsFromRobotWide: false}));
-        expect(button('Use for all areas')).toBeDisabled();
-        rerender(<CoveragePreviewPanel preview={makePreview({differsFromRobotWide: true})} areaLabel={() => ''}/>);
-        fireEvent.click(button('Use for all areas'));
-        expect(fns.saveRobotWide).toHaveBeenCalledOnce();
-    });
-
-    it('picking a direction from the list sends that choice', () => {
-        show(makePreview());
-        const selects = screen.getAllByRole('combobox');
-        fireEvent.mouseDown(selects[1]);
-        fireEvent.click(within(document.body).getByText('Counter-clockwise', {selector: '.ant-select-item-option-content'}));
-        expect(fns.setDirection).toHaveBeenCalledWith(2);
-    });
-
-    it('picking a fixed angle from the list sends that mode', () => {
-        show(makePreview());
-        const selects = screen.getAllByRole('combobox');
-        fireEvent.mouseDown(selects[0]);
-        fireEvent.click(within(document.body).getByText('Fixed angle', {selector: '.ant-select-item-option-content'}));
-        expect(fns.setAngleMode).toHaveBeenCalledWith('fixed');
-    });
-
-    it('says the planner picks the start until the operator chooses one', () => {
-        show(makePreview());
-        expect(screen.getByText('Start point')).toBeInTheDocument();
-        expect(screen.getByText('Automatic: the middle of the longest side.')).toBeInTheDocument();
-        expect(screen.getByText(/Drag the green dot to change where mowing starts/)).toBeInTheDocument();
-        expect(screen.queryByRole('button', {name: 'Back to automatic'})).not.toBeInTheDocument();
-    });
-
-    it('shows a chosen start and lets the operator go back to automatic', () => {
-        show(makePreview({choices: {...follow, start: {x: 3, y: 4}}}));
-        expect(screen.getByText('You chose where mowing starts.')).toBeInTheDocument();
-        fireEvent.click(button('Back to automatic'));
-        expect(fns.setStart).toHaveBeenCalledExactlyOnceWith(null);
-    });
-
-    it('explains why there is no start point to place with the perimeter rounds off', () => {
-        show(makePreview({startAdjustable: false, choices: {...follow, start: {x: 3, y: 4}}}));
-        expect(screen.getByText(/A start point needs the perimeter rounds/)).toBeInTheDocument();
-        expect(screen.queryByText(/Drag the green dot/)).not.toBeInTheDocument();
-        expect(screen.queryByRole('button', {name: 'Back to automatic'})).not.toBeInTheDocument();
+        it('does not offer to change the start point', () => {
+            show(makePreview({editMode: false, choices: {...follow, start: {x: 3, y: 4}}}));
+            expect(screen.getByText('You chose where mowing starts.')).toBeInTheDocument();
+            expect(screen.queryByRole('button', {name: 'Back to automatic'})).not.toBeInTheDocument();
+            expect(screen.queryByText(/Drag the green dot/)).not.toBeInTheDocument();
+        });
     });
 });

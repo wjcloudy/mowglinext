@@ -2,7 +2,7 @@ import {formatArea} from "../utils/areaLabel.ts";
 import {mowingAreaIndexById} from "../utils/mapAreaIndex.ts";
 import "@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css";
 import {useApi} from "../hooks/useApi.ts";
-import {App} from "antd";
+import {App, Button} from "antd";
 import turfArea from "@turf/area";
 import React, {useCallback, useEffect, useMemo, useRef, useState} from "react";
 import {useTranslation} from "react-i18next";
@@ -38,7 +38,8 @@ import {EditAreaModal} from "./map/components/EditAreaModal.tsx";
 import {AreasListPanel} from "./map/components/AreasListPanel.tsx";
 import {TrackedObstaclesPanel} from "./map/components/TrackedObstaclesPanel.tsx";
 import {ObstacleProposalsPanel} from "./map/components/ObstacleProposalsPanel.tsx";
-import {CORRIDOR_COLOR, LidarCorridorsPanel} from "./map/components/LidarCorridorsPanel.tsx";
+import {CORRIDOR_COLOR, LidarCorridorsInfo, LidarCorridorsPanel} from "./map/components/LidarCorridorsPanel.tsx";
+import {MapSidebarAccordion} from "./map/components/MapSidebarAccordion.tsx";
 import {EditLidarCorridorModal} from "./map/components/EditLidarCorridorModal.tsx";
 import {DEFAULT_CORRIDOR_WIDTH_M, useLidarCorridors} from "./map/hooks/useLidarCorridors.ts";
 import {buildCorridorSideRuns, dropLiveVertex, simplifyPolyline, smoothPolyline, type XY} from "./map/utils/corridorGeometry.ts";
@@ -47,6 +48,7 @@ import {useCoveragePreview} from "./map/hooks/useCoveragePreview.ts";
 import {useCoverageResumeAvailable} from "../hooks/useCoverageResumeAvailable.ts";
 import {CoveragePreviewPanel} from "./map/components/CoveragePreviewPanel.tsx";
 import {CoverageStartMarker} from "./map/components/CoverageStartMarker.tsx";
+import type {AreaOverrideFields} from "./map/coveragePreview.ts";
 import {calculateMapViewportBounds} from "./map/utils/mapViewport.ts";
 
 // Distinct from the red drawn-obstacle fill, so the toggleable
@@ -57,7 +59,7 @@ const OBSTACLE_CLEARANCE_PREVIEW_COLOR = '#faad14';
 const COVERAGE_RING_COLOR = '#00d8ff';
 const COVERAGE_SWATH_COLOR = '#ffe14a';
 import {extractObstacleProposals, isDigProposal} from "./map/utils/obstacleProposals.ts";
-import {MapOffsetPanel} from "./map/components/MapOffsetPanel.tsx";
+import {MapOffsetPanel, MapRotationPanel} from "./map/components/MapOffsetPanel.tsx";
 import {MapImageMarker} from "./map/components/MapImageMarker.tsx";
 import {getMowerHeadingRad, hasValidMapPosition} from "./map/components/mapImageMarkerMath.ts";
 import {buildMapDisplayFeatures} from "./map/mapDisplayFeatures.ts";
@@ -927,6 +929,18 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
         (): MowingAreaFeature[] => Object.values(features).filter((f): f is MowingAreaFeature => f instanceof MowingAreaFeature),
         [features],
     );
+    // An edit of an area's mowing lines goes into the edit session like moving a polygon corner,
+    // so it is saved by Save map (which round-trips these fields), dropped by Cancel, and covered
+    // by undo/redo (the snapshots carry the area). A NEW area object replaces the old one: that is
+    // the same object the server map data holds, and changing it would survive a Cancel.
+    const commitCoverageLines = useCallback((featureId: string, overrides: Required<AreaOverrideFields>) => {
+        setFeatures((old) => {
+            const feature = old[featureId];
+            if (!(feature instanceof MowingAreaFeature) || !feature.area) return old;
+            feature.area = {...feature.area, ...overrides};
+            return {...old};
+        });
+    }, []);
     const coveragePreview = useCoveragePreview({
         areas: mowingAreaFeaturesList,
         obstacles: obstacleFeaturesList,
@@ -936,13 +950,32 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
         globalAngleDeg: Number(settings.mow_angle_deg ?? -1),
         globalDirection: Number(settings.mow_direction ?? 0),
         preferredAreaId: editMap ? selectedFeatureIds[0] : undefined,
-        // Idle only: an area's lines change its NEXT plan, and a mow in progress
-        // re-plans on resume. Fail closed until the first status frame arrives.
-        canEdit: highLevelStatus.highLevelStatus.state === 1,
+        // The lines can only be changed while the map is edited, and are then part of that
+        // edit: Save map keeps them, Cancel and undo drop them.
+        editMode: editMap,
+        onCommit: commitCoverageLines,
+        savedAreas: map?.working_area,
     });
     const coverageResumeAvailable = useCoverageResumeAvailable();
     const coveragePreviewAreaLabel = (index: number, name: string) =>
         name || t('mapAreasList.unnamedArea', {index: index + 1});
+
+    // Desktop sidebar: one section open at a time, Mowing areas by default.
+    const [sidebarOpen, setSidebarOpen] = useState<string | null>('areas');
+    // A section that is folded must not hide what the operator just asked for: turning
+    // the mowing-lines overlay on (toolbar) or starting to draw a LiDAR-ignore line
+    // (whose Finish/Cancel buttons live in that section) opens it. Adjusting state
+    // while rendering on a change is React's documented alternative to an effect.
+    const [prevPreviewEnabled, setPrevPreviewEnabled] = useState(coveragePreview.enabled);
+    if (coveragePreview.enabled !== prevPreviewEnabled) {
+        setPrevPreviewEnabled(coveragePreview.enabled);
+        if (coveragePreview.enabled) setSidebarOpen('lines');
+    }
+    const [prevCorridorDrawing, setPrevCorridorDrawing] = useState(corridorDrawing);
+    if (corridorDrawing !== prevCorridorDrawing) {
+        setPrevCorridorDrawing(corridorDrawing);
+        if (corridorDrawing) setSidebarOpen('lidar');
+    }
 
     // The gl-draw feature currently being drawn for a corridor: it is added to
     // gl-draw's OWN store the instant draw_line_string mode starts (onSetup)
@@ -1741,6 +1774,7 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                                     latitude={coveragePreview.startLonLat[1]}
                                     ring={coveragePreview.outerRingLonLat}
                                     settledCount={coveragePreview.settledCount}
+                                    draggable={editMap}
                                     onMove={coveragePreview.moveStartTo}
                                     title={t('coveragePreview.startMarkerTitle')}
                                 />
@@ -1874,15 +1908,17 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                 {/* Mobile: obstacle proposals need an accept/reject surface too — the
                     operator is usually standing next to the robot with a phone. The
                     mobile toolbar lives at the bottom, so this card takes the top. */}
-                {isMobile && !editMap && (obstacleProposals.length > 0 || coveragePreview.enabled) && (
+                {isMobile && ((!editMap && obstacleProposals.length > 0) || coveragePreview.enabled) && (
                     <div style={{position: 'absolute', top: 12, left: 12, right: 12, zIndex: 10, maxHeight: '45%', overflowY: 'auto', background: colors.glassBackground, borderRadius: 14, border: colors.glassBorder, boxShadow: colors.glassShadow}}>
-                        <ObstacleProposalsPanel
-                            proposals={obstacleProposals}
-                            selectedProposalId={selectedProposalId}
-                            onHoverProposal={setSelectedProposalId}
-                        />
+                        {!editMap && (
+                            <ObstacleProposalsPanel
+                                proposals={obstacleProposals}
+                                selectedProposalId={selectedProposalId}
+                                onHoverProposal={setSelectedProposalId}
+                            />
+                        )}
                         {coveragePreview.enabled && (
-                            <div style={{borderTop: obstacleProposals.length > 0 ? `1px solid ${colors.borderSubtle}` : undefined}}>
+                            <div style={{borderTop: !editMap && obstacleProposals.length > 0 ? `1px solid ${colors.borderSubtle}` : undefined}}>
                                 <CoveragePreviewPanel preview={coveragePreview} areaLabel={coveragePreviewAreaLabel} resumeAvailable={coverageResumeAvailable}/>
                             </div>
                         )}
@@ -1947,74 +1983,140 @@ export const MapPage: React.FC<{compact?: boolean}> = ({compact = false}) => {
                         />
                     </div>
                 )}
-                {/* Desktop: Right panel — areas list + offset */}
+                {/* Desktop: Right panel — collapsible sections, one open at a time */}
                 {!isMobile && (
                     <div style={{position: 'absolute', top: 12, right: 16, zIndex: 10, display: 'flex', flexDirection: 'column', gap: 0, width: 240, maxHeight: 'calc(100% - 32px)', background: colors.glassBackground, backdropFilter: displayMode === 'visual' ? 'blur(22px) saturate(140%)' : undefined, WebkitBackdropFilter: displayMode === 'visual' ? 'blur(22px) saturate(140%)' : undefined, borderRadius: 18, border: colors.glassBorder, boxShadow: colors.glassShadow, overflow: 'hidden'}}>
-                        <AreasListPanel
-                            areas={areasList}
-                            onAreaClick={editMap ? handleAreaSelect : undefined}
-                            onReorder={editMap ? handleReorder : undefined}
-                            selectedId={editMap ? selectedFeatureIds[0] : undefined}
+                        <MapSidebarAccordion
+                            openKey={sidebarOpen}
+                            onOpenChange={setSidebarOpen}
+                            sections={[
+                                {
+                                    key: 'areas',
+                                    title: t('mapAreasList.areasHeader', {count: areasList.filter(a => a.ftype === 'workarea').length}),
+                                    content: areasList.every(a => a.ftype === 'obstacle') ? (
+                                        <div style={{padding: 12, fontSize: 13, color: colors.textSecondary}}>{t('mapSidebar.noAreas')}</div>
+                                    ) : (
+                                        <AreasListPanel
+                                            areas={areasList.filter(a => a.ftype !== 'obstacle')}
+                                            hideHeader
+                                            onAreaClick={editMap ? handleAreaSelect : undefined}
+                                            onReorder={editMap ? handleReorder : undefined}
+                                            selectedId={editMap ? selectedFeatureIds[0] : undefined}
+                                        />
+                                    ),
+                                },
+                                {
+                                    key: 'obstacles',
+                                    title: t('mapSidebar.obstacles'),
+                                    badge: areasList.filter(a => a.ftype === 'obstacle').length + dynamicObstacles.length + obstacleProposals.length,
+                                    content: areasList.every(a => a.ftype !== 'obstacle') && dynamicObstacles.length === 0 && obstacleProposals.length === 0 ? (
+                                        <div style={{padding: 12, fontSize: 13, color: colors.textSecondary}}>{t('mapSidebar.noObstacles')}</div>
+                                    ) : (
+                                        <>
+                                            {areasList.some(a => a.ftype === 'obstacle') && (
+                                                <div>
+                                                    <div style={{
+                                                        padding: '8px 12px',
+                                                        fontSize: 12,
+                                                        fontWeight: 600,
+                                                        color: colors.muted,
+                                                        textTransform: 'uppercase',
+                                                        letterSpacing: '0.05em',
+                                                        borderBottom: `1px solid ${colors.borderSubtle}`,
+                                                    }}>
+                                                        {t('mapSidebar.drawnObstacles', {count: areasList.filter(a => a.ftype === 'obstacle').length})}
+                                                    </div>
+                                                    <AreasListPanel
+                                                        areas={areasList.filter(a => a.ftype === 'obstacle')}
+                                                        hideHeader
+                                                        onAreaClick={editMap ? handleAreaSelect : undefined}
+                                                        selectedId={editMap ? selectedFeatureIds[0] : undefined}
+                                                    />
+                                                </div>
+                                            )}
+                                            {dynamicObstacles.length > 0 && (
+                                                <div style={{borderTop: areasList.some(a => a.ftype === 'obstacle') ? `1px solid ${colors.borderSubtle}` : undefined}}>
+                                                    <TrackedObstaclesPanel
+                                                        obstacles={dynamicObstacles}
+                                                        obstacleAreaIndex={obstacleAreaIndex}
+                                                        areaNames={obstacleAreaNames}
+                                                        selectedObstacleId={selectedObstacleId}
+                                                        onHoverObstacle={setSelectedObstacleId}
+                                                    />
+                                                </div>
+                                            )}
+                                            {obstacleProposals.length > 0 && (
+                                                <div style={{borderTop: areasList.some(a => a.ftype === 'obstacle') || dynamicObstacles.length > 0 ? `1px solid ${colors.borderSubtle}` : undefined}}>
+                                                    <ObstacleProposalsPanel
+                                                        proposals={obstacleProposals}
+                                                        selectedProposalId={selectedProposalId}
+                                                        onHoverProposal={setSelectedProposalId}
+                                                    />
+                                                </div>
+                                            )}
+                                        </>
+                                    ),
+                                },
+                                {
+                                    key: 'lines',
+                                    title: t('mapSidebar.mowingLines'),
+                                    content: coveragePreview.enabled ? (
+                                        <CoveragePreviewPanel preview={coveragePreview} areaLabel={coveragePreviewAreaLabel} resumeAvailable={coverageResumeAvailable}/>
+                                    ) : (
+                                        <div style={{padding: '4px 12px 12px'}}>
+                                            <div style={{fontSize: 12, color: colors.textSecondary, marginBottom: 8}}>{t('mapSidebar.mowingLinesOff')}</div>
+                                            <Button size="small" onClick={() => coveragePreview.setEnabled(true)}>{t('mapSidebar.mowingLinesShow')}</Button>
+                                        </div>
+                                    ),
+                                },
+                                {
+                                    key: 'lidar',
+                                    title: t('mapLidarCorridors.header', {count: lidarCorridors.corridors.length}),
+                                    extra: <LidarCorridorsInfo editable={editMap}/>,
+                                    content: (
+                                        <LidarCorridorsPanel
+                                            hideHeader
+                                            corridors={lidarCorridors.corridors}
+                                            busy={lidarCorridors.busy}
+                                            editable={editMap}
+                                            drawing={corridorDrawing}
+                                            onFinishDraw={handleFinishDrawingCorridor}
+                                            onCancelDraw={handleCancelDrawingCorridor}
+                                            onSelect={(index) => {
+                                                const c = lidarCorridors.corridors[index];
+                                                if (c) handleAreaSelect(corridorDrawId(c));
+                                            }}
+                                            selectedIndex={selectedCorridorIndex >= 0 ? selectedCorridorIndex : null}
+                                            onSmooth={() => handleReshapeSelectedCorridor((pts) => smoothPolyline(pts))}
+                                            onSimplify={() => handleReshapeSelectedCorridor((pts) => simplifyPolyline(pts))}
+                                        />
+                                    ),
+                                },
+                                {
+                                    key: 'offset',
+                                    title: t('mapOffsetPanel.mapOffset'),
+                                    content: (
+                                        <div style={{padding: '4px 12px 12px'}}>
+                                            <MapOffsetPanel
+                                                offsetX={offsetX}
+                                                offsetY={offsetY}
+                                                onChangeX={handleOffsetX}
+                                                onChangeY={handleOffsetY}
+                                            />
+                                        </div>
+                                    ),
+                                },
+                                {
+                                    key: 'rotation',
+                                    title: t('mapOffsetPanel.mapRotation'),
+                                    content: (
+                                        <div style={{padding: '4px 12px 12px'}}>
+                                            <MapRotationPanel bearing={bearing} onChangeBearing={handleBearing}/>
+                                        </div>
+                                    ),
+                                },
+                            ]}
                         />
-                        {dynamicObstacles.length > 0 && (
-                            <div style={{borderTop: `1px solid ${colors.borderSubtle}`}}>
-                                <TrackedObstaclesPanel
-                                    obstacles={dynamicObstacles}
-                                    obstacleAreaIndex={obstacleAreaIndex}
-                                    areaNames={obstacleAreaNames}
-                                    selectedObstacleId={selectedObstacleId}
-                                    onHoverObstacle={setSelectedObstacleId}
-                                />
-                            </div>
-                        )}
-                        {obstacleProposals.length > 0 && (
-                            <div style={{borderTop: `1px solid ${colors.borderSubtle}`}}>
-                                <ObstacleProposalsPanel
-                                    proposals={obstacleProposals}
-                                    selectedProposalId={selectedProposalId}
-                                    onHoverProposal={setSelectedProposalId}
-                                />
-                            </div>
-                        )}
-                        {coveragePreview.enabled && (
-                            <div style={{borderTop: `1px solid ${colors.borderSubtle}`}}>
-                                <CoveragePreviewPanel preview={coveragePreview} areaLabel={coveragePreviewAreaLabel} resumeAvailable={coverageResumeAvailable}/>
-                            </div>
-                        )}
-                        {/* This wrapper must itself be a shrinkable flex participant
-                            (flex + minHeight:0), same as AreasListPanel's own root div
-                            above — otherwise it sizes to its content's natural (auto)
-                            height regardless of the panel's internal flex:1 list, the
-                            list never gets a bounded height to overflow against, and
-                            long corridor lists silently clip against this column's
-                            overflow:hidden instead of scrolling. */}
-                        <div style={{borderTop: `1px solid ${colors.borderSubtle}`, display: 'flex', flexDirection: 'column', flex: '1 1 auto', minHeight: 0}}>
-                            <LidarCorridorsPanel
-                                corridors={lidarCorridors.corridors}
-                                busy={lidarCorridors.busy}
-                                editable={editMap}
-                                drawing={corridorDrawing}
-                                onFinishDraw={handleFinishDrawingCorridor}
-                                onCancelDraw={handleCancelDrawingCorridor}
-                                onSelect={(index) => {
-                                    const c = lidarCorridors.corridors[index];
-                                    if (c) handleAreaSelect(corridorDrawId(c));
-                                }}
-                                selectedIndex={selectedCorridorIndex >= 0 ? selectedCorridorIndex : null}
-                                onSmooth={() => handleReshapeSelectedCorridor((pts) => smoothPolyline(pts))}
-                                onSimplify={() => handleReshapeSelectedCorridor((pts) => simplifyPolyline(pts))}
-                            />
-                        </div>
-                        <div style={{borderTop: `1px solid ${colors.borderSubtle}`, padding: 8}}>
-                            <MapOffsetPanel
-                                offsetX={offsetX}
-                                offsetY={offsetY}
-                                bearing={bearing}
-                                onChangeX={handleOffsetX}
-                                onChangeY={handleOffsetY}
-                                onChangeBearing={handleBearing}
-                            />
-                        </div>
                     </div>
                 )}
             </div>

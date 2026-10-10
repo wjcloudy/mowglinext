@@ -147,6 +147,14 @@ int main(void) {
     charger_set_charge_limits(40.0f, 9.0f);
     near(g_max_charge_voltage, 28.5f);
     near(g_max_charge_current, 1.8f);
+    assert(charger_state == CHARGER_STATE_CHARGING_CC); // higher effective target resumes bulk
+    charger_state = CHARGER_STATE_CHARGING_CV;
+    charger_set_charge_limits(28.5f, 1.8f);
+    assert(charger_state == CHARGER_STATE_CHARGING_CV); // unchanged target preserves float
+    charger_set_end_voltage(26.5f);
+    charger_set_charge_limits(27.0f, 1.8f);
+    charger_set_charge_limits(28.5f, 1.8f);
+    assert(charger_state == CHARGER_STATE_CHARGING_CV); // end target already below either ceiling
     charger_set_charge_limits(0.0f, 0.0f);
     near(g_max_charge_voltage, 28.5f);
     near(g_max_charge_current, 1.8f);

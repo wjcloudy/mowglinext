@@ -10,6 +10,8 @@ interface CoverageStartMarkerProps {
     ring: [number, number][] | null;
     /** Counts planner answers, so the marker knows when its dropped spot is superseded. */
     settledCount: number;
+    /** Only while the map is being edited; otherwise the start is shown but cannot be moved. */
+    draggable: boolean;
     /** The operator dropped the marker here (already on the ring). */
     onMove: (longitude: number, latitude: number) => void;
     /** Tooltip, which also tells the operator it can be dragged. */
@@ -28,7 +30,7 @@ type LngLat = [number, number];
 ///    corners, and answers with the real start, which the marker then moves to.
 /// Move is reported on DROP only, so the planner is asked once per placement, not per pixel.
 const CoverageStartMarkerImpl = ({
-    longitude, latitude, ring, settledCount, onMove, title,
+    longitude, latitude, ring, settledCount, draggable, onMove, title,
 }: CoverageStartMarkerProps) => {
     // Where the marker was dropped, until the planner's answer (or a new start) replaces it.
     const [dropped, setDropped] = useState<{at: LngLat; settledAtDrop: number; reported: LngLat} | null>(null);
@@ -58,7 +60,7 @@ const CoverageStartMarkerImpl = ({
             longitude={shown[0]}
             latitude={shown[1]}
             anchor="center"
-            draggable
+            draggable={draggable}
             onDragStart={() => setLive([shown[0], shown[1]])}
             onDrag={(event) => {
                 // Keep the marker on the ring while it is being dragged. The marker is set
@@ -73,7 +75,7 @@ const CoverageStartMarkerImpl = ({
                 setDropped({at: on, settledAtDrop: settledCount, reported: [longitude, latitude]});
                 onMove(on[0], on[1]);
             }}
-            style={{zIndex: 5, cursor: "grab"}}
+            style={{zIndex: 5, cursor: draggable ? "grab" : "default"}}
         >
             {/* 28 px: a green dot with a generous, touch-sized hit area. */}
             <div
@@ -113,6 +115,7 @@ export const CoverageStartMarker = memo(
         && a.latitude === b.latitude
         && a.ring === b.ring
         && a.settledCount === b.settledCount
+        && a.draggable === b.draggable
         && a.onMove === b.onMove
         && a.title === b.title,
 );

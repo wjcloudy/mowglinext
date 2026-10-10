@@ -1,7 +1,7 @@
 import {useCallback, useEffect, useMemo, useRef, useState} from "react";
-import {App} from "antd";
 import {useTranslation} from "react-i18next";
 import {useApi} from "../../../hooks/useApi.ts";
+import type {MapArea} from "../../../types/ros.ts";
 import type {MowingAreaFeature, ObstacleFeature} from "../../../types/map.ts";
 import {itranspose} from "../../../utils/map.tsx";
 import {
@@ -15,6 +15,7 @@ import {
     sameChoices,
     type AngleMode,
     type AreaChoices,
+    type AreaOverrideFields,
     type CoveragePreviewResult,
     type DirectionChoice,
     type MapPoint,
@@ -34,35 +35,40 @@ interface Args {
     globalDirection: number;
     /** Area to start on (e.g. the one selected in the editor). */
     preferredAreaId?: string;
-    /** false while the mower is mowing or its state is unknown: an area's lines are then read-only. */
-    canEdit: boolean;
+    /**
+     * The lines can only be changed while the map is being edited. A change is then part of that
+     * edit: it goes into the edit session (see onCommit), "Save map" keeps it and "Cancel" drops it.
+     */
+    editMode: boolean;
+    /** Put an area's new lines into the edit session (the page's `features`, so undo/redo and cancel see it). */
+    onCommit: (areaFeatureId: string, overrides: Required<AreaOverrideFields>) => void;
+    /** The areas as the server has them, to tell whether the session changed any lines. */
+    savedAreas?: MapArea[];
 }
 
 /// The Map page's "mowing lines" overlay. The lines come from coverage_server's
 /// preview_coverage service — the real planner run with the live geometry
 /// parameters — so what the operator sees is what the robot will drive. This hook
-/// only decides WHAT to ask: one chosen area, with the angle and perimeter
-/// direction the operator is trying. Each area either follows the robot-wide
-/// settings or carries its own; saving writes that area through
-/// set_area_coverage_lines, and "use for all areas" writes the robot-wide ones.
+/// only decides WHAT to ask: one chosen area, with the angle, perimeter direction
+/// and start point the operator is trying.
+///
+/// Viewing is always possible; changing is only possible in edit mode, where it is part
+/// of the map edit like moving a polygon corner: nothing is written until "Save map"
+/// (which already round-trips these fields) and "Cancel" throws it away. A slider drag
+/// or a half-typed number only moves the preview; it is committed to the edit session when
+/// the operator lets go, so undo gets one step per change instead of one per pixel.
 export const useCoveragePreview = ({
-    areas, obstacles, datum, offsetX, offsetY, globalAngleDeg, globalDirection, preferredAreaId, canEdit,
+    areas, obstacles, datum, offsetX, offsetY, globalAngleDeg, globalDirection, preferredAreaId,
+    editMode, onCommit, savedAreas,
 }: Args) => {
     const api = useApi();
-    const {notification} = App.useApp();
     const {t} = useTranslation();
 
     const [enabled, setEnabled] = useState(false);
     const [areaId, setAreaId] = useState<string | undefined>(preferredAreaId);
     const [draft, setDraft] = useState<Partial<AreaChoices>>({});
-    // The robot-wide values after a save from here; null = whatever the page loaded.
-    const [globalOverride, setGlobalOverride] = useState<{angle: number; direction: number} | null>(null);
-    // The area's overrides are mutated in place after a save (so a later map save
-    // writes them back); this makes React notice.
-    const [areaVersion, setAreaVersion] = useState(0);
     const [result, setResult] = useState<CoveragePreviewResult | undefined>();
     const [loading, setLoading] = useState(false);
-    const [saving, setSaving] = useState(false);
     const [error, setError] = useState<string | undefined>();
     // Counts planner answers (or failures) received for the CURRENT request, so the start marker
     // knows when to let go of the spot it was dropped on and show the planner's real start.
@@ -78,16 +84,19 @@ export const useCoveragePreview = ({
     }, [preferredAreaId, areas]);
 
     const area = useMemo(() => areas.find((a) => a.id === areaId) ?? areas[0], [areas, areaId]);
-    const mapAreaId = area?.area?.id ?? 0;
 
-    // A draft belongs to the area it was made on.
-    useEffect(() => { setDraft({}); }, [area?.id]);
+    // A half-made change belongs to the area and the edit session it was made in: leaving edit
+    // mode (Save or Cancel) or switching area drops it. Adjusting state while rendering on a change
+    // is React's documented alternative to an effect.
+    const draftScope = `${editMode ? "edit" : "view"}:${area?.id ?? ""}`;
+    const [prevDraftScope, setPrevDraftScope] = useState(draftScope);
+    if (draftScope !== prevDraftScope) {
+        setPrevDraftScope(draftScope);
+        setDraft({});
+    }
 
-    const robotWideAngle = globalOverride?.angle ?? globalAngleDeg;
-    const robotWideDirection = globalOverride?.direction ?? globalDirection;
-
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    const saved = useMemo(() => choicesFromArea(area?.area), [area, areaVersion]);
+    // What the edit session holds for this area right now (the feature carries it once committed).
+    const saved = useMemo(() => choicesFromArea(area?.area), [area]);
     const choices: AreaChoices = useMemo(() => ({
         angleMode: draft.angleMode ?? saved.angleMode,
         angleDeg: draft.angleDeg ?? saved.angleDeg,
@@ -95,13 +104,17 @@ export const useCoveragePreview = ({
         // null is a choice (the planner's own start), so only undefined means "no draft".
         start: draft.start === undefined ? saved.start : draft.start,
     }), [draft, saved]);
-    const dirty = !sameChoices(choices, saved);
     const requested = useMemo(
-        () => requestedValues(choices, robotWideAngle, robotWideDirection),
-        [choices, robotWideAngle, robotWideDirection],
+        () => requestedValues(choices, globalAngleDeg, globalDirection),
+        [choices, globalAngleDeg, globalDirection],
     );
-    const differsFromRobotWide = requested.mow_angle_deg !== robotWideAngle
-        || requested.ring_direction !== (robotWideDirection === 1 || robotWideDirection === 2 ? robotWideDirection : 0);
+
+    // Do this area's lines differ from what the server has? Then a paused mow resumes on a re-planned
+    // area, which the panel warns about.
+    const changedFromServer = useMemo(() => {
+        const server = savedAreas?.find((a) => a.id !== undefined && a.id === area?.area?.id);
+        return !!area?.area && !sameChoices(choicesFromArea(area.area), choicesFromArea(server));
+    }, [area, savedAreas]);
 
     // A content signature, not array identities: the caller rebuilds both lists
     // on every render, so keying the fetch on them would refetch constantly.
@@ -174,102 +187,47 @@ export const useCoveragePreview = ({
         setAreaId(id);
     }, []);
 
+    // Put `next` into the edit session and drop the draft: from here the feature carries it.
+    const commit = useCallback((next: AreaChoices) => {
+        if (!editMode || !area) return;
+        setDraft({});
+        onCommit(area.id, overridesFromChoices(next));
+    }, [editMode, area, onCommit]);
+
+    // Discrete choices commit at once; continuous ones (slider, typing) commit when released.
     const setAngleMode = useCallback((mode: AngleMode) => {
+        if (!editMode) return;
         // Switching to "fixed" starts from the angle the plan is using right now.
-        setDraft((d) => ({
-            ...d,
-            angleMode: mode,
-            ...(mode === "fixed" ? {angleDeg: Math.round(shownAngle) % 180} : {}),
-        }));
-    }, [shownAngle]);
-    const setAngleDeg = useCallback((deg: number) => setDraft((d) => ({...d, angleMode: "fixed", angleDeg: deg})), []);
-    const setDirection = useCallback((direction: DirectionChoice) => setDraft((d) => ({...d, direction})), []);
+        const angleDeg = mode === "fixed" ? Math.round(shownAngle) % 180 : choices.angleDeg;
+        commit({...choices, angleMode: mode, angleDeg});
+    }, [editMode, shownAngle, choices, commit]);
+    /** Moves the preview only; `commitAngle` makes it part of the edit. */
+    const setAngleDeg = useCallback((deg: number) => {
+        if (!editMode) return;
+        setDraft((d) => ({...d, angleMode: "fixed", angleDeg: deg}));
+    }, [editMode]);
+    const commitAngle = useCallback(() => commit(choices), [commit, choices]);
+    const setDirection = useCallback((direction: DirectionChoice) => commit({...choices, direction}), [commit, choices]);
     /** Where the route starts, or null for the planner's own start. The planner snaps it onto the outer ring. */
-    const setStart = useCallback((start: MapPoint | null) => setDraft((d) => ({...d, start})), []);
+    const setStart = useCallback((start: MapPoint | null) => commit({...choices, start}), [commit, choices]);
     /** The operator dropped the start marker at this spot on the map. */
     const moveStartTo = useCallback((lon: number, lat: number) => {
         const [x, y] = itranspose(offsetX, offsetY, datum, lat, lon);
         setStart({x, y});
     }, [offsetX, offsetY, datum, setStart]);
-    const reset = useCallback(() => setDraft({}), []);
-
-    // callCreate hands back {error: "reason"} for an application error and a
-    // rejected Response ({error: {error: "reason"}}) for a transport one.
-    const failure = (e: unknown) => {
-        const body = (e as {error?: unknown} | null)?.error;
-        notification.error({
-            message: t("coveragePreview.saveFailed"),
-            description: typeof body === "string"
-                ? body
-                : (body as {error?: string} | undefined)?.error ?? (e instanceof Error ? e.message : undefined),
-        });
-    };
-
-    /** Persist this area's own angle / direction (or clear them): applies from its next plan. */
-    const saveArea = useCallback(async () => {
-        if (!area?.area || !mapAreaId) return;
-        setSaving(true);
-        try {
-            const overrides = overridesFromChoices(choices);
-            const res = await api.mowglinext.callCreate("set_area_coverage_lines", {id: mapAreaId, ...overrides});
-            if (res.error) {
-                failure(res.error);
-                return;
-            }
-            // Keep the loaded map entry in step: a later "save map" writes these
-            // fields back, and the 5 s map poll may not have caught up yet.
-            Object.assign(area.area, overrides);
-            setAreaVersion((v) => v + 1);
-            setDraft({});
-            notification.success({
-                message: t("coveragePreview.savedArea"),
-                description: t("coveragePreview.savedAreaDescription"),
-            });
-        } catch (e) {
-            failure(e);
-        } finally {
-            setSaving(false);
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [api, area, mapAreaId, choices, notification, t]);
-
-    /** Make what is shown the robot-wide default for every area without its own. Needs a ROS2 restart. */
-    const saveRobotWide = useCallback(async () => {
-        setSaving(true);
-        try {
-            const angle = requested.mow_angle_deg;
-            const direction = requested.ring_direction;
-            const res = await api.settings.yamlCreate({mow_angle_deg: angle, mow_direction: direction});
-            if (res.error) {
-                failure(res.error);
-                return;
-            }
-            setGlobalOverride({angle, direction});
-            setDraft({angleMode: "global", direction: "global"});
-            notification.success({
-                message: t("coveragePreview.savedRobotWide"),
-                description: t("coveragePreview.savedRobotWideRestart"),
-            });
-        } catch (e) {
-            failure(e);
-        } finally {
-            setSaving(false);
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [api, requested, notification, t]);
 
     return {
         enabled, setEnabled,
-        areas, area, selectArea, hasAreaId: mapAreaId !== 0, canEdit,
-        choices, setAngleMode, setAngleDeg, setDirection, setStart, moveStartTo,
+        areas, area, selectArea, editMode,
+        choices, setAngleMode, setAngleDeg, commitAngle, setDirection, setStart, moveStartTo,
         // Where the route really starts (the planner snaps the chosen point onto the outer ring),
         // and whether a start can be placed at all (not with the headland rings off).
         startLonLat: layers.startLonLat,
         outerRingLonLat: layers.outerRingLonLat,
         settledCount,
         startAdjustable: result?.start_adjustable !== false,
-        robotWideAngle, robotWideDirection, shownAngle,
-        dirty, differsFromRobotWide, reset, saveArea, saveRobotWide, saving,
+        robotWideAngle: globalAngleDeg, robotWideDirection: globalDirection, shownAngle,
+        changedFromServer,
         loading, error, result, layers,
     };
 };

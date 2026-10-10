@@ -70,8 +70,10 @@ describe("buildPreviewLayers", () => {
         };
         const {lines, arrows} = buildPreviewLayers(res, datum, 0, 0);
         const swaths = lines.features.filter((f) => f.properties?.kind === "swath");
-        expect(swaths.map((f) => f.properties?.index)).toEqual([0, 1]);
-        const bearings = arrows.features.filter((f) => f.properties?.kind === "swath-arrow").map((f) => f.properties?.bearing);
+        expect(swaths.map((f) => (f.properties as {index: number}).index)).toEqual([0, 1]);
+        const bearings = arrows.features
+            .filter((f) => f.properties?.kind === "swath-arrow")
+            .map((f) => (f.properties as {bearing: number}).bearing);
         expect(bearings[0]).toBeCloseTo(90, 5);
         expect(bearings[1]).toBeCloseTo(270, 5);
         // With no rings the route starts at the first swath.
