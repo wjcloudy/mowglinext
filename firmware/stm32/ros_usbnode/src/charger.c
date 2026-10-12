@@ -611,7 +611,7 @@ charge_accounting:
 
     /*Check the PWM value for safety */
 #if BOARD_YARDFORCE500B_LFP
-    if (chargecontrol_pwm_val > MAX_PWM_VALUE){  //CLOUDY raised from 1350 (TIM1 period is 1400)
+    if (chargecontrol_pwm_val > MAX_PWM_VALUE){  //CLOUDY LFP ceiling (board_defaults.h: must leave OC1N > dead time)
         chargecontrol_pwm_val = MAX_PWM_VALUE;
     }
 #else

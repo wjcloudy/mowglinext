@@ -70,10 +70,16 @@
 /// PWM safety ceiling (TIM1 period is 1400; stock cap was 1350).
 /// An 8S LFP at ~28.5V on the ~29-30V rail has little buck headroom, so it
 /// needs more duty to reach full current ("different charge-current/PWM curve").
-/// CLOUDY 2026-10-10 trial: reduce 1385 to 1380 after a reported docking dropout.
-/// This still suppresses OC1N with DTG=40; it is a peak-duty experiment, not a
-/// dead-time fix. Keep the ABI-2 recorder and compare overnight stability.
-#define MAX_PWM_VALUE 1380
+/// CLOUDY 2026-10-12: back to the stock 1350. TIM1 runs 1401 counts with DTG=40
+/// dead time, so any ceiling above 1360 leaves the complementary (OC1N) pulse
+/// shorter than the dead time and the hardware drops it. Every trial ceiling
+/// (1395/1390/1385/1380) did exactly that and every one lost charge the same
+/// way: on a ~28.2 V dock the pack never reaches the 28.5 V CV trip, so CC pins
+/// the duty at the ceiling for hours, OC1N never fires, and the high side
+/// eventually stops conducting at constant duty (11 Oct .118 frozen trace:
+/// input rose, output sagged, PWM unchanged). 1350 keeps an 11-count OC1N
+/// pulse every period at the cost of a slightly lower reachable charge voltage.
+#define MAX_PWM_VALUE 1350
 /// PWM floor kept while still actively regulating (was the magic value 39)
 #define MIN_PWM_VALUE 39
 /// Fixed current-sensor offset [A]. Replaces auto-zeroing at dock, which is wrong

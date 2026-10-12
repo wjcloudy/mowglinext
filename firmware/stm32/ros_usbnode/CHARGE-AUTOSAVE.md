@@ -62,4 +62,4 @@ Pass requires stable charge regulation and preserved limits; if it fails, a stab
 frozen dump with matching provenance must be saved before reset/battery shutdown.
 Check counters, sample gaps, input/output rails, PWM and faults in the saved trace.
 Do not deliberately provoke an electrical trip. Waveforms/current spikes need
-separate safe measurements; 1380 remains an unproven duty-ceiling experiment.
+separate safe measurements; the 1350 ceiling still needs an overnight charge.

@@ -1,5 +1,16 @@
 # Early charging capture: .118, 7 September 2026
 
+**1350 update (12 October):** the 1380 image failed the same way. The
+autosave frozen trace (2026-10-11 08:43:47Z) shows hours in CC at PWM 1380 with
+`cv_count` 0: the dock supplies ~28.2 V, below the 28.5 V CV trip, so the loop
+can never leave CC and pins the duty at the ceiling. At the trip the input rail
+rose ~1 % while the output sagged at constant duty, i.e. the high-side switch
+stopped conducting. The output fault then latched (no retry by design) and the
+pack discharged for 12.7 h until the Pi browned out. Every trial ceiling
+(1380-1395) suppresses OC1N; the ceiling returns to stock 1350, which keeps an
+11-count complementary pulse. CC termination on a dock supply below the CV
+trip remains a separate follow-up.
+
 **1380 trial update (10 October):** .118 lost charging on the 1385 image
 `79127808` / 1.12.178 / protocol 8, with a reported docking-time dropout.
 The battery died and the ensuing power cycle erased the original RAM trace;
