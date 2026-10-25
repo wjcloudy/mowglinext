@@ -6,18 +6,21 @@
 Launches the REAL bridge through its production launch file against the
 emulated LowLevel board + xESC controllers (openmower_v1_emulator.py), drives
 it over ROS the way MowgliNext does, and checks what the emulated hardware
-actually received. Timings are measured on the emulator's clock.
+actually received. Command receipt timings use the emulator's clock; native
+emission/guard observations keep their own monotonic and ROS clock domains.
 
   python3 run_simulation.py --esc xesc_2040        # one controller type
   python3 run_simulation.py                        # both (default)
 
-Needs a sourced workspace with mowgli_interfaces + mowgli_openmower_bridge.
+Needs a sourced workspace with mowgli_interfaces + mowgli_openmower_bridge,
+built for this bench with -DOPENMOWER_SIMULATION_TRACE=ON (production default OFF).
 Exit status 0 only when every check passes.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import signal
@@ -43,7 +46,9 @@ from std_msgs.msg import Bool
 from std_srvs.srv import SetBool, Trigger
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from openmower_v1_emulator import OpenMowerV1Rig  # noqa: E402
+from openmower_v1_emulator import HEARTBEAT_MILLIS, OpenMowerV1Rig  # noqa: E402
+from measurements import calibration_attempt, drives_running, odometry_mean, run_scenario  # noqa: E402
+from native_trace import NativeTrace, blade_receipts, commanded_zero, heartbeat_cadence, matching_blade_write, stale_blade_window, wheel_recovery  # noqa: E402
 
 AUTONOMOUS, IDLE = 2, 1
 # xesc_odometry.hpp kMaxPlausibleWheelSpeedMps: no wheel of this robot goes faster.
@@ -54,6 +59,7 @@ ROBOT_TEMPLATE = os.path.normpath(os.path.join(
     'ros2', 'src', 'mowgli_bringup', 'config', 'mowgli_robot.yaml'))
 BACKEND_DEFAULTS = os.path.join(os.path.dirname(ROBOT_TEMPLATE), 'backends', 'openmower.yaml')
 DRIVES = ('left', 'right')
+HLS_PERIOD_S = 0.5  # Original 2 Hz publication cadence, also the stale observation unit.
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +120,7 @@ class Probe(Node):
         self.fw_debug = self.create_client(SetBool, '/hardware_bridge/set_firmware_debug')
         self.get_params = self.create_client(GetParameters, '/hardware_bridge/get_parameters')
         self.create_timer(0.05, self._publish_cmd)
-        self.create_timer(0.5, self._publish_hl)
+        self.create_timer(HLS_PERIOD_S, self._publish_hl)
 
     def _keeper(self, key):
         def cb(msg):
@@ -159,12 +165,14 @@ class Probe(Node):
         self.cmd_pub.publish(m)
 
     def _publish_hl(self):
-        state = self.hl_state
-        if state is None:
-            return
-        m = HighLevelStatus()
-        m.state = state
-        self.hl_pub.publish(m)
+        # Silence can be synchronized with an in-flight timer publication.
+        with self.lock:
+            state = self.hl_state
+            if state is None:
+                return
+            m = HighLevelStatus()
+            m.state = state
+            self.hl_pub.publish(m)
 
     # helpers
     def get(self, key):
@@ -177,17 +185,37 @@ class Probe(Node):
             data = [s[idx] for s in getattr(self, series) if s[0] >= since]
         return (statistics.fmean(data), len(data)) if data else (float('nan'), 0)
 
-    def odom_distance_mean(self, since: float, idx: int):
-        """Distance over time from /wheel_odom: each message's rate times the
-        interval its header stamp covers, which is what a consumer integrating
-        the odometry gets. A plain mean of jittery windows is biased up (0.03 +
-        0.71 averages 0.37), and receive times carry the probe's own latency."""
+    def odom_ground_means(self, rig, since: float, idx: int):
+        """Compare integration over the SAME header-stamp interval on both sides."""
         with self.lock:
-            data = [(s[3], s[idx]) for s in self.odom if s[0] >= since]
-        if len(data) < 2:
-            return float('nan'), len(data)
-        num = sum(v * (t - t_prev) for (t_prev, _), (t, v) in zip(data, data[1:]))
-        return num / (data[-1][0] - data[0][0]), len(data)
+            data = [s for s in self.odom if s[0] >= since]
+        try:
+            means, start, end = odometry_mean(data)
+            with rig.lock:
+                epoch = len(rig.clock_steps)
+                ground_start = rig.clock.to_monotonic(start)
+                ground_end = rig.clock.to_monotonic(end)
+            # The fitted last stamp can be slightly ahead of the fixture's
+            # latest integration step. Wait for coverage, without extrapolating
+            # or changing the selected odometry interval.
+            def covered():
+                with rig.lock:
+                    return rig.motion.rows[-1][0] >= ground_end
+            if not wait_for(covered, 1.0):
+                raise ValueError('ground history did not reach the odometry stamp')
+            with rig.lock:
+                if len(rig.clock_steps) != epoch:
+                    raise ValueError('clock epoch changed during measurement')
+                ground = rig.motion.mean(ground_start, ground_end)
+            return means[idx - 1], ground[idx - 1], len(data)
+        except ValueError as exc:
+            print(f'    invalid odometry measurement: {exc}', flush=True)
+            with rig.lock:
+                print(f'    odom interval {data[0][3] if data else None}..'
+                      f'{data[-1][3] if data else None}; ground monotonic history '
+                      f'{rig.motion.rows[0][0]}..{rig.motion.rows[-1][0]}; '
+                      f'host clock {time.time()}', flush=True)
+            return float('nan'), float('nan'), len(data)
 
     def call(self, client, request, timeout=5.0):
         if not client.wait_for_service(timeout_sec=timeout):
@@ -252,7 +280,12 @@ def start_bridge(rig, esc_type, workdir, log_path, extra_yaml='', env_override=N
                OPENMOWER_XESC_RIGHT_PORT=rig.paths['right'], OPENMOWER_XESC_MOW_PORT=rig.paths['mow'],
                OPENMOWER_XESC_TYPE=esc_type, OPENMOWER_ROBOT_CONFIG=cfg,
                OPENMOWER_ROBOT_TEMPLATE=ROBOT_TEMPLATE,
-               OPENMOWER_BACKEND_DEFAULTS=BACKEND_DEFAULTS)
+               OPENMOWER_BACKEND_DEFAULTS=BACKEND_DEFAULTS,
+               # Read the bridge's C logger while it is still alive. With
+               # stdout redirected, its default block buffer hides calibration
+               # events and can be lost by the intentional SIGKILL.
+               RCUTILS_LOGGING_BUFFERED_STREAM='0')
+    env['OPENMOWER_SIMULATION_TRACE_PATH'] = log_path + '.native.jsonl'
     env.update(env_override or {})
     log = open(log_path, 'w', encoding='utf-8')
     return subprocess.Popen(['ros2', 'launch', 'mowgli_openmower_bridge', 'openmower_bridge.launch.py'],
@@ -325,8 +358,19 @@ def s01_boot(probe, rig, R, esc):
             _bridge_param(probe, 'ticks_per_meter') == 1600.0, f"{_bridge_param(probe, 'ticks_per_meter')}")
     hb = [t for (t, _, _) in rig.ll.heartbeats if t > rig.now_ms() - 3000]
     gaps = [b - a for a, b in zip(hb, hb[1:])]
-    R.check(S, 'heartbeat never gaps near the 500 ms board timeout',
-            bool(gaps) and max(gaps) < 150, f'max gap {max(gaps):.0f} ms over {len(gaps)}' if gaps else 'none')
+    end_ns = time.monotonic_ns()
+    ok, detail = heartbeat_cadence(probe.native_trace.read(), end_ns)
+    R.check(S, 'native heartbeat emissions stay below 150 ms (including a silent tail)', ok, detail)
+    R.check(S, 'LowLevel currently services heartbeat; Python pass timing is a separate observation',
+            rig.ll.ros_running and rig.now_ms()-rig.ll.last_heartbeat_ms <= 500,
+            f'Python service max gap {max(gaps):.0f} ms over {len(gaps)}; '
+            f'board latch={rig.ll.latch}' if gaps else 'no Python service observations')
+    rows = probe.native_trace.read()
+    first_ll = next((r['mono_ns'] for r in rows if r['event'] == 'll_rx'), None)
+    unavailable = [r for r in rows if r['event'] == 'gate' and first_ll is not None
+                   and r['mono_ns'] >= first_ll and not r['ll_alive']]
+    print(f'    [OBSERVE] LowLevel unavailable after initial receipt: {len(unavailable)} native '
+          'control samples; this is independent of native heartbeat cadence', flush=True)
     if esc == 'xesc_2040':
         R.check(S, 'every xESC 2040 received its settings',
                 all(rig.escs[n].settings_received for n in ('left', 'right', 'mow')))
@@ -383,13 +427,13 @@ def s03_straight(probe, rig, R, esc):
     # Means over the window: an instantaneous plant speed or a single odometry
     # window is just jitter on a loaded runner.
     plant_v = forward_speed(s0, snap)
-    odom_vx, n = probe.odom_distance_mean(t_meas, 1)
-    if abs(plant_v - 0.30) >= 0.03 or abs(odom_vx - plant_v) >= 0.03:
+    odom_vx, ground_vx, n = probe.odom_ground_means(rig, t_meas, 1)
+    if abs(plant_v - 0.30) >= 0.03 or not abs(odom_vx - ground_vx) < 0.03:
         print('    diag: ' + _drive_diagnostics(probe, rig, t_meas, t_meas_ms, x_meas), flush=True)
     R.check(S, 'true ground speed tracks 0.30 m/s (closed loop beats the 0.85 motor gain)',
             abs(plant_v - 0.30) < 0.03, f"plant mean v={plant_v:.3f} m/s")
-    R.check(S, '/wheel_odom vx matches the ground', abs(odom_vx - plant_v) < 0.03,
-            f'odom vx={odom_vx:.3f} over {n} msgs')
+    R.check(S, '/wheel_odom vx matches the ground', abs(odom_vx - ground_vx) < 0.03,
+            f'odom vx={odom_vx:.3f}, same-window ground={ground_vx:.3f} over {n} msgs')
     R.check(S, 'no spurious rotation', abs(snap['w']) < 0.05, f"w={snap['w']:.3f}")
     R.check(S, 'real wiring: left duty > 0, right duty < 0',
             snap['duty']['left'] > 0.05 and snap['duty']['right'] < -0.05,
@@ -407,12 +451,12 @@ def s04_pivot(probe, rig, R, esc):
     # Mean yaw rate over the window (2 s at 0.6 rad/s never wraps past pi).
     plant_w = math.atan2(math.sin(snap['theta'] - s0['theta']), math.cos(snap['theta'] - s0['theta'])) \
         / ((snap['t'] - s0['t']) / 1000.0)
-    odom_w, _ = probe.odom_distance_mean(t_meas, 2)
+    odom_w, ground_w, _ = probe.odom_ground_means(rig, t_meas, 2)
     imu_w, _ = probe.mean_since('imu', t_meas, 1)
     R.check(S, 'true yaw rate tracks +0.6 rad/s, counter-clockwise', abs(plant_w - 0.6) < 0.08,
             f"plant mean w={plant_w:+.3f}")
-    R.check(S, '/wheel_odom angular.z agrees in sign and size', abs(odom_w - plant_w) < 0.08,
-            f'odom w={odom_w:+.3f}')
+    R.check(S, '/wheel_odom angular.z agrees in sign and size', abs(odom_w - ground_w) < 0.08,
+            f'odom w={odom_w:+.3f}, same-window ground={ground_w:+.3f}')
     R.check(S, '/imu/data gyro z agrees in sign and size', abs(imu_w - plant_w) < 0.08,
             f'imu gz={imu_w:+.3f}')
     R.check(S, 'no translation', abs(snap['v']) < 0.03, f"v={snap['v']:+.3f}")
@@ -435,9 +479,12 @@ def s05_slew(probe, rig, R, esc):
 def s06_cmd_timeout(probe, rig, R, esc):
     S = 'cmd_vel timeout'
     drive(probe, rig, 0.3, 0.0, 3.0)
+    if not R.check(S, 'both drives running before command publisher stops',
+                   drives_running(rig.snapshot()['effective'])):
+        return
     probe.cmd = None  # the publisher dies mid-drive
     t0 = rig.now_ms()
-    tz = rig.first_time_effective_zero(DRIVES, t0, 3000)
+    tz = rig.first_time_all_zero(DRIVES, t0, 3000)
     R.check(S, 'drives commanded to zero within 1.0 s timeout + one tick',
             tz is not None and tz - t0 < 1250, f'{(tz - t0) if tz else float("nan"):.0f} ms')
     wait_for(lambda: abs(rig.snapshot()['v']) < 0.01, 3)
@@ -506,8 +553,15 @@ def s10_lift(probe, rig, R, esc):
         rig.ll.lifted_wheels = 2
         t0 = rig.now_ms()
     tz = rig.first_time_effective_zero(DRIVES, t0, 3000)
-    R.check(S, "both wheels lifted: zero within the board's 100 ms lift period + chain (< 300 ms)",
-            tz is not None and tz - t0 < 300, f'{(tz - t0) if tz else float("nan"):.0f} ms')
+    # Controller command receipts have timestamps; polling effective duty
+    # every 2 ms introduces scheduler jitter. Explicit zero commands also
+    # guarantee that an ESC watchdog alone cannot make this test pass.
+    zeros = [rig.first_zero_command(name, t0, 3000) for name in DRIVES]
+    t_cmd = max(zeros) if all(t is not None for t in zeros) else None
+    R.check(S, "both wheels lifted: zero duty received within 100 ms + chain (< 300 ms)",
+            t_cmd is not None and tz is not None and t_cmd - t0 < 300,
+            f'cmd={(t_cmd - t0) if t_cmd is not None else float("nan"):.0f} ms; '
+            f'polled={(tz - t0) if tz is not None else float("nan"):.0f} ms')
     em = probe.get('emergency')
     wait_for(lambda: probe.get('emergency').reason == 'Lift detected', 1)
     R.check(S, 'reason "Lift detected"', probe.get('emergency').reason == 'Lift detected')
@@ -533,9 +587,12 @@ def s10_lift(probe, rig, R, esc):
 def s11_software_estop(probe, rig, R, esc):
     S = 'software e-stop'
     drive(probe, rig, 0.3, 0.0, 2.5)
+    if not R.check(S, 'both drives running before e-stop',
+                   drives_running(rig.snapshot()['effective'])):
+        return
     t0 = rig.now_ms()
     estop(probe, 1)
-    tz = rig.first_time_effective_zero(DRIVES, t0, 1000)
+    tz = rig.first_time_all_zero(DRIVES, t0, 1000)
     R.check(S, 'drives at zero within 100 ms of the service call',
             tz is not None and tz - t0 < 100, f'{(tz - t0) if tz else float("nan"):.0f} ms')
     R.check(S, 'board latched through the heartbeat request', wait_for(lambda: rig.snapshot()['latch'], 1))
@@ -544,6 +601,118 @@ def s11_software_estop(probe, rig, R, esc):
     R.check(S, 'Emergency latched', probe.get('emergency').latched_emergency)
     R.check(S, 'reset clears it', reset_emergency(probe, rig))
     stop_driving(probe, rig)
+
+
+def native_gate(probe, predicate, after_ns, timeout):
+    """A decision and its actual UART write must both be present."""
+    found = []
+
+    def ready():
+        rows = probe.native_trace.read()
+        for row in rows:
+            if (row['event'] == 'gate' and row['mono_ns'] >= after_ns
+                    and predicate(row) and matching_blade_write(rows, row) is not None):
+                found[:] = [row]
+                return True
+        return False
+    return found[0] if wait_for(ready, timeout) else None
+
+
+def blade_silence_scenario(probe, rig, R, S):
+    # Obtain a genuinely new receipt, rather than treating a remembered mode
+    # or the local publication intent as the origin of the five-second timer.
+    fresh_after = time.monotonic_ns()
+    probe._publish_hl()
+    def received():
+        return any(r['event'] == 'hl_rx' and r['mode'] == AUTONOMOUS
+                   and r['mono_ns'] >= fresh_after for r in probe.native_trace.read())
+    if not R.check(S, 'fresh native HLS receipt before testing silence', wait_for(received, 2)):
+        return False
+
+    with probe.lock:
+        probe.hl_state = None
+    start_ns = time.monotonic_ns()
+    with rig.lock:
+        start_ms = rig.now_ms()
+        rig.ll.status_paused = True
+    try:
+        held = native_gate(probe, lambda g: not g['ll_alive'] and g['hl_fresh']
+                           and not g['emergency'] and g['requested'] and g['mode'] == AUTONOMOUS,
+                           start_ns, 2)
+        stopped = held is not None and not held['allowed'] and commanded_zero(probe.native_trace.read(), held)
+        if not R.check(S, 'LowLevel status loss commands blade zero while HLS is still fresh', stopped):
+            return False
+        zero = rig.first_zero_command('mow', start_ms, 2000)
+        R.check(S, 'ESC receives that LowLevel stop within the existing 700 ms link-loss bound',
+                zero is not None and zero-start_ms < 700, f'{zero-start_ms:.0f} ms' if zero else 'no zero command')
+        R.check(S, 'status-only interruption preserves LowLevel heartbeat and does not create a latch',
+                rig.ll.ros_running and not rig.snapshot()['latch'])
+    finally:
+        with rig.lock:
+            rig.ll.status_paused = False
+
+    recovered = native_gate(probe, lambda g: g['ll_alive'] and g['hl_fresh'] and g['allowed']
+                            and not g['emergency'] and g['requested'] and g['mode'] == AUTONOMOUS,
+                            held['mono_ns'] + 1, 2)
+    resumed = (recovered is not None and
+               abs(matching_blade_write(probe.native_trace.read(), recovered)['duty']) > 0.9 and
+               matching_blade_write(probe.native_trace.read(), recovered)['written'] == 1)
+    if not R.check(S, 'LowLevel recovery reauthorizes only while every blade gate still permits it', resumed):
+        return False
+
+    # Keep silence through expiry and its entire observation window. An early
+    # zero from LL/ESC is not the BT event and cannot re-enable publication.
+    expired = native_gate(probe, lambda g: not g['hl_fresh'], recovered['mono_ns']+1, 6)
+    rows = probe.native_trace.read()
+    known_receipt = expired is not None and any(r['event'] == 'hl_rx'
+                          and r['mode'] == AUTONOMOUS
+                          and r['ros_ns'] == expired['hl_stamp_ns'] for r in rows)
+    age_ns = expired['ros_ns']-expired['hl_stamp_ns'] if known_receipt else 0
+    if not R.check(S, 'HLS expires five seconds after its actual native ROS receipt',
+                   known_receipt and 5_000_000_000 < age_ns < 6_000_000_000
+                   and expired['ll_alive'] and not expired['emergency']
+                   and expired['requested'] and expired['mode'] == AUTONOMOUS
+                   and not expired['allowed'] and commanded_zero(rows, expired),
+                   f'{age_ns/1e6:.3f} ms since receipt'):
+        return False
+
+    end_ns = expired['mono_ns'] + int(2*HLS_PERIOD_S*1e9)
+    # Wait for a complete native decision/write beyond the boundary, not an
+    # arbitrary synchronization sleep or an assumed network cancellation.
+    covered = native_gate(probe, lambda g: True, end_ns, 2*HLS_PERIOD_S+1)
+    rows = probe.native_trace.read()
+    ok, detail = stale_blade_window(rows, expired, end_ns)
+    if not R.check(S, 'stale HLS continuously emits zero; no spontaneous blade reactivation',
+                   covered is not None and ok, detail):
+        return False
+    with rig.lock:
+        commands = list(rig.escs['mow'].commands)
+        capacity = rig.escs['mow'].commands.maxlen
+    # A previous fresh command may arrive after expiry. Qualify its origin
+    # through the complete ordered UART prefix, never by receipt time alone.
+    rows = probe.native_trace.read()
+    ok, detail = blade_receipts(rows, commands, expired, end_ns, int(rig._t0*1e9), capacity)
+    with open(os.path.join(R.logdir, f'blade-receipts-{rig.esc_type}.json'), 'w') as output:
+        json.dump(dict(origin_ns=int(rig._t0*1e9), expired=expired, end_ns=end_ns,
+                       commands=commands, result=ok, detail=detail), output)
+    R.check(S, 'stale zero is a received bridge command, not merely an autonomous ESC watchdog',
+            ok, detail)
+    ok, detail = heartbeat_cadence(rows, end_ns, start_ns)
+    R.check(S, 'native heartbeat cadence stays below 150 ms throughout the BT observation', ok, detail)
+
+    renewed_after = time.monotonic_ns()
+    with probe.lock:
+        probe.hl_state = AUTONOMOUS
+    probe._publish_hl()  # An explicit new valid publication, not a retry loop.
+    renewed = native_gate(probe, lambda g: g['hl_fresh'] and g['allowed']
+                          and g['hl_stamp_ns'] != expired['hl_stamp_ns'], renewed_after, 2)
+    R.check(S, 'blade recovery requires a new HLS receipt and the other guards still open',
+            renewed is not None and any(r['event'] == 'hl_rx' and r['mono_ns'] >= renewed_after
+                                        and r['mode'] == AUTONOMOUS
+                                        and r['ros_ns'] == renewed['hl_stamp_ns']
+                                        for r in probe.native_trace.read())
+            and wait_for(lambda: abs(rig.snapshot()['duty']['mow']) > 0.9, 2))
+    return True
 
 
 def s12_blade(probe, rig, R, esc):
@@ -559,22 +728,26 @@ def s12_blade(probe, rig, R, esc):
     R.check(S, 'Status.mow_enabled + blade_requested_direction "reverse"',
             st.mow_enabled and st.blade_requested_direction == 'reverse', st.blade_requested_direction)
     wait_for(lambda: rig.snapshot()['blade_rpm'] > 2000, 3)
-    wait_for(lambda: probe.get('status').mower_motor_rpm > 1000 or esc == 'xesc_2040', 2)
+    # Status.mower_motor_rpm is a SPEED (the STM32 sends a uint16): map_server
+    # stamps mow progress only above mow_progress_min_blade_rpm (1000), and the
+    # GUI shows the blade off at <= 0. The 2040 reports no speed of its own.
+    R.check(S, 'Status.mower_motor_rpm reports the spinning blade',
+            wait_for(lambda: probe.get('status').mower_motor_rpm > 1000, 2),
+            f"{probe.get('status').mower_motor_rpm:.0f} rpm (plant {rig.snapshot()['blade_rpm']:.0f})")
     mower(probe, 1, 0)
     R.check(S, 'direction 0 reverses the duty', wait_for(lambda: rig.snapshot()['duty']['mow'] < -0.9, 2))
+    wait_for(lambda: rig.snapshot()['blade_rpm'] < -2000, 3)
+    R.check(S, '...and the reversed blade still reads as spinning (speed, not direction)',
+            wait_for(lambda: probe.get('status').mower_motor_rpm > 1000, 2),
+            f"{probe.get('status').mower_motor_rpm:.0f} rpm (plant {rig.snapshot()['blade_rpm']:.0f})")
     t0 = rig.now_ms()
     probe.hl_state = IDLE
     tz = rig.first_time_effective_zero(('mow',), t0, 2000)
     R.check(S, 'IDLE stops the blade', tz is not None and tz - t0 < 800, f'{(tz - t0) if tz else float("nan"):.0f} ms')
     probe.hl_state = AUTONOMOUS
     R.check(S, 'blade back in AUTONOMOUS', wait_for(lambda: abs(rig.snapshot()['duty']['mow']) > 0.9, 2))
-    probe.hl_state = None  # behavior_tree_node dies
-    t1 = rig.now_ms()
-    tz = rig.first_time_effective_zero(('mow',), t1, 8000)
-    R.check(S, 'behaviour tree silent 5 s -> blade off (watchdog on the last reported mode)',
-            tz is not None and 4500 < tz - t1 < 6000, f'{(tz - t1) if tz else float("nan"):.0f} ms')
-    probe.hl_state = AUTONOMOUS
-    wait_for(lambda: abs(rig.snapshot()['duty']['mow']) > 0.9, 3)
+    if not blade_silence_scenario(probe, rig, R, S):
+        return
     t2 = rig.now_ms()
     estop(probe, 1)
     # From the controller's command log: estop() blocks on the service reply,
@@ -656,8 +829,13 @@ def s15_esc_reboot(probe, rig, R, esc):
 
 def s16_docking(probe, rig, R, esc):
     S = 'docking (v1-fw)'
+    if not R.check(S, 'bridge calibration requires 200 raw IMU samples',
+                   _bridge_param(probe, 'imu_cal_samples') == 200):
+        return
     probe.hl_state = IDLE
     with rig.lock:
+        stimulus_ms = rig.now_ms()
+        stimulus_host = time.time()
         rig.ll.gyro_bias_z = 0.03
         rig.ll.v_battery = 27.0
         rig.ll.v_charge = 29.6
@@ -681,13 +859,41 @@ def s16_docking(probe, rig, R, esc):
     took = time.monotonic() - t_dock
     R.check(S, 'docked IMU calibration removes the 0.03 rad/s gyro bias', ok,
             f'gz={trailing_gz()[0]:+.4f}, {took:.1f} s after contact')
-    R.check(S, '...not before the wheels settled (1 s + 200 samples at 50 Hz)', took > 4.5,
-            f'{took:.1f} s')
+    # Battery DDS receipt is not when wheels became stationary. Inspect the
+    # bridge's actual calibration events against ground wheel-tick history;
+    # the default estimator's exact 200-sample contract has its own regression.
+    bridge_log = os.path.join(R.logdir, f'bridge-{esc}.log')
+    with open(bridge_log, encoding='utf-8') as fh:
+        lines = fh.read().splitlines()
+    start, rest, raw_samples = None, float('nan'), 0
+    try:
+        start, ready = calibration_attempt(lines, stimulus_host)
+        with rig.lock:
+            rest = rig.motion.stationary_for(rig.clock.to_monotonic(start))
+            raw_samples = sum(stamp_host <= ready for stamp, stamp_host in rig.ll.imu_sent
+                              if stamp >= stimulus_ms)
+    except ValueError as exc:
+        print(f'    invalid calibration measurement: {exc}', flush=True)
+        with rig.lock:
+            print(f'    calibration start={start}; '
+                  f'ground monotonic history={rig.motion.rows[0][0]}..{rig.motion.rows[-1][0]}; '
+                  f'host clock={time.time()}', flush=True)
+    R.check(S, 'calibration starts only after 1 s with stationary wheel ticks',
+            rest >= 1.0, f'rest at actual start={rest:.3f} s')
+    # Source emission bounds the maximum possible collection, not which
+    # packets Feed consumed. The parameter check and estimator tests
+    # separately pin the exact collection requirement, including abort/retry.
+    R.check(S, 'at least 200 biased raw IMU samples emitted before completion',
+            raw_samples >= 200, f'{raw_samples} raw samples since bias injection')
     time.sleep(1.5)  # crossing the threshold is not removal: check steady state
     steady, n = probe.mean_since('imu', time.monotonic() - 1.0, 1)
     # n only proves the stream is alive (a loaded runner delivers fewer of the
     # 50 Hz samples); the residual is the check.
-    R.check(S, 'steady-state residual after calibration < 0.002 rad/s', n > 20 and abs(steady) < 0.002,
+    with rig.lock:
+        raw_n = sum(stamp >= rig.now_ms() - 1000.0 for stamp, _ in rig.ll.imu_sent)
+    R.check(S, 'steady-state IMU delivery supplies >20 new samples/s', n > 20,
+            f'{n} received, {raw_n} raw samples emitted')
+    R.check(S, 'steady-state residual after calibration < 0.002 rad/s', abs(steady) < 0.002,
             f'gz={steady:+.5f} over {n}')
     t = time.monotonic() - 2.0
     vx, n = probe.mean_since('odom', t, 1)
@@ -777,38 +983,168 @@ def s19_contract(probe, rig, R, esc):
             f'last mode {modes[-1] if modes else None}')
 
 
-def s19b_starved(probe, rig, R, esc, bridge):
-    """The bridge process is starved for 350 ms mid-drive (a loaded Pi, a GC
-    pause in a neighbour): under every 500 ms watchdog, so the robot keeps
-    going. /wheel_odom must still report the true speed afterwards — the 1.x
-    bridge divided three periods of ticks by one clamped control period."""
-    S = 'bridge starved 350 ms'
-    drive(probe, rig, 0.3, 0.0, 3.0)
-    t0, s0 = time.monotonic(), rig.snapshot()
+def pause_bridge(probe, bridge, pause_s):
+    """Measure signal requests, observed stopped state, and first native tick.
+
+    The requested 350 ms is a fault duration, never proof of actual scheduling
+    or of the age of a status already cached before the fault.
+    """
+    pid = probe.native_trace.read()[0]['pid']
+    requested = time.monotonic_ns()
     os.killpg(bridge.pid, signal.SIGSTOP)
-    time.sleep(0.35)
-    os.killpg(bridge.pid, signal.SIGCONT)
-    time.sleep(1.5)
-    snap = rig.snapshot()
-    with probe.lock:
-        vx = [v for (t, v, *_) in probe.odom if t >= t0]
-    plant_v = forward_speed(s0, snap)
-    odom_v, _ = probe.odom_distance_mean(t0, 1)
-    worst = max((abs(v) for v in vx), default=float('nan'))
-    # The exact arithmetic (a 350 ms stall divided by 350 ms, not by a clamped
-    # control period) is pinned by WheelTickSampler.AStalledBridgeMeasures-
-    # TheWholeStall; here, what a consumer of the running bridge can see.
-    R.check(S, 'the robot kept driving through the stall', abs(plant_v - 0.3) < 0.05,
-            f'plant mean v={plant_v:.3f} m/s')
-    R.check(S, '/wheel_odom agrees with the ground on average', abs(odom_v - plant_v) < 0.05,
-            f'odom mean {odom_v:.3f} over {len(vx)} msgs')
-    if not worst < MAX_PLAUSIBLE_WHEEL_SPEED_MPS:
-        print('    diag: vx series ' + ' '.join(f'{v:.2f}' for v in vx), flush=True)
-    R.check(S, f'no physically impossible window (< {MAX_PLAUSIBLE_WHEEL_SPEED_MPS} m/s)',
-            worst < MAX_PLAUSIBLE_WHEEL_SPEED_MPS, f'max |vx|={worst:.2f} m/s')
-    R.check(S, 'board did not latch (stall shorter than its 500 ms heartbeat timeout)',
-            not snap['latch'])
-    stop_driving(probe, rig)
+    stopped = None
+    try:
+        def is_stopped():
+            with open(f'/proc/{pid}/status') as status:
+                return any(line.startswith('State:') and 'T' in line for line in status)
+        if not wait_for(is_stopped, 2):
+            raise RuntimeError('native bridge never observed stopped')
+        stopped = time.monotonic_ns()
+        time.sleep(pause_s)
+    finally:
+        resumed = time.monotonic_ns()
+        os.killpg(bridge.pid, signal.SIGCONT)
+    def tick_returned():
+        return any(r['event'] == 'wheel_control' and r['mono_ns'] >= resumed
+                   for r in probe.native_trace.read())
+    if not wait_for(tick_returned, 2):
+        raise RuntimeError('native bridge did not resume control')
+    controls = [r for r in probe.native_trace.read() if r['event'] == 'wheel_control']
+    before = [r for r in controls if r['mono_ns'] < requested][-1]
+    after = next(r for r in controls if r['mono_ns'] >= resumed)
+    return dict(requested_s=pause_s, stop_request_ns=requested, stopped_observed_ns=stopped,
+                resume_request_ns=resumed, first_tick_ns=after['mono_ns'],
+                stopped_observed_ms=(resumed-stopped)/1e6,
+                native_gap_ms=(after['mono_ns']-before['mono_ns'])/1e6)
+
+
+def starvation_evidence(probe, rig, R, events):
+    # Keep the complete fault windows plus the original 3 s established run,
+    # rather than serializing the entire preceding simulation history.
+    first_ns = min((e['stop_request_ns'] for e in events), default=time.monotonic_ns())
+    since = first_ns/1e9-3.0
+    with rig.lock, probe.lock:
+        since_ms = (since-rig._t0)*1000
+        data = dict(origin_ns=int(rig._t0*1e9), events=events,
+                    commands={n: [(t, d) for t, d in e.commands if t >= since_ms]
+                              for n, e in rig.escs.items()},
+                    heartbeats=[h for h in rig.ll.heartbeats if h[0] >= since_ms],
+                    latches=[t for t in rig.ll.latch_events if t >= since_ms],
+                    applied=[v for v in probe.applied if v[0] >= since],
+                    odom=[v for v in probe.odom if v[0] >= since],
+                    motion=[v for v in rig.motion.rows if v[0] >= since],
+                    clock_steps=list(rig.clock_steps))
+    with open(os.path.join(R.logdir, f'starvation-{rig.esc_type}.json'), 'w') as output:
+        json.dump(data, output)
+
+
+def s19b_starved(probe, rig, R, esc, bridge):
+    """Separate a qualified 350 ms stall from a real status-age safety stop."""
+    S = 'bridge starved 350 ms'
+    pause_s = 0.350
+    events = []
+    try:
+        drive(probe, rig, 0.3, 0.0, 3.0)
+        fresh_after = time.monotonic_ns()
+        fresh = wait_for(lambda: any(r['event'] == 'll_rx' and r['mono_ns'] >= fresh_after
+                                    for r in probe.native_trace.read()), 2)
+        if not R.check(S, 'nominal stall starts after a genuinely new LowLevel receipt', fresh):
+            return
+        s0 = rig.snapshot()
+        if not R.check(S, 'requested 0.30 m/s is established before suspension', abs(s0['v']-0.3) < 0.05):
+            return
+        t0 = time.monotonic()
+        pause = pause_bridge(probe, bridge, pause_s)
+        events.append(dict(phase='fresh-status', **pause))
+        time.sleep(1.5)  # Original post-stall observation interval.
+        snap = rig.snapshot()
+        controls = [r for r in probe.native_trace.read() if r['event'] == 'wheel_control'
+                    and pause['first_tick_ns'] <= r['mono_ns'] <= time.monotonic_ns()]
+        R.check(S, 'qualified stall stays inside the original LowLevel watchdog budget',
+                pause['native_gap_ms'] < HEARTBEAT_MILLIS and all(c['allowed'] for c in controls),
+                f"requested 350 ms; stopped observed {pause['stopped_observed_ms']:.3f} ms; "
+                f"native control gap {pause['native_gap_ms']:.3f} ms")
+        with probe.lock:
+            vx = [v for (t, v, *_) in probe.odom if t >= t0]
+        plant_v = forward_speed(s0, snap)
+        odom_v, ground_v, _ = probe.odom_ground_means(rig, t0, 1)
+        worst = max((abs(v) for v in vx), default=float('nan'))
+        events[-1]['window'] = dict(start=s0, end=snap, plant_mean=plant_v,
+                                   odom_mean=odom_v, same_window_ground=ground_v)
+        R.check(S, 'the robot kept driving through the qualified stall', abs(plant_v - 0.3) < 0.05,
+                f'plant mean v={plant_v:.3f} m/s')
+        R.check(S, '/wheel_odom agrees with the ground on average', abs(odom_v - ground_v) < 0.05,
+                f'odom mean {odom_v:.3f}, same-window ground={ground_v:.3f} over {len(vx)} msgs')
+        R.check(S, f'no physically impossible window (< {MAX_PLAUSIBLE_WHEEL_SPEED_MPS} m/s)',
+                worst < MAX_PLAUSIBLE_WHEEL_SPEED_MPS, f'max |vx|={worst:.2f} m/s')
+        R.check(S, 'board did not latch during the qualified stall', not snap['latch'])
+
+        # Reproduce the independent, valid safety path seen on CI: a status
+        # already old before SIGSTOP can expire although the stop lasts <500ms.
+        # Age target is derived from the original timeout, fault and one tick.
+        rate = _bridge_param(probe, 'control_rate')
+        acceleration = _bridge_param(probe, 'cmd_vel_linear_accel_limit')
+        if not rate or not acceleration:
+            R.check(S, 'original control parameters are available', False)
+            return
+        age_ns = int((HEARTBEAT_MILLIS/1000-pause_s+1/rate)*1e9)
+        guard_start = time.monotonic_ns()
+        with rig.lock:
+            rig.ll.status_paused = True
+        try:
+            def old_status():
+                gates = [r for r in probe.native_trace.read() if r['event'] == 'gate']
+                return gates and gates[-1]['ll_alive'] and gates[-1]['ros_ns']-gates[-1]['ll_stamp_ns'] >= age_ns
+            if not R.check(S, 'controlled status age consumes the pre-stall freshness budget', wait_for(old_status, 2)):
+                return
+            pause = pause_bridge(probe, bridge, pause_s)
+            events.append(dict(phase='aged-status', **pause))
+            held = wait_for(lambda: any(r['event'] == 'wheel_control' and r['mono_ns'] >= guard_start
+                                       and not r['ll_alive'] and not r['allowed'] and r['applied_vx'] == 0
+                                       and r['cmd_fresh'] and r['drives_ok'] and not r['emergency']
+                                       for r in probe.native_trace.read()), 2)
+            R.check(S, 'old status plus actual suspension inhibits wheels and commands zero', held,
+                    f"requested 350 ms; stopped observed {pause['stopped_observed_ms']:.3f} ms; "
+                    f"native control gap {pause['native_gap_ms']:.3f} ms")
+            def received_zeros():
+                with rig.lock:
+                    since_ms = (guard_start/1e9-rig._t0)*1000
+                    return all(any(t >= since_ms and d == 0 for t, d in rig.escs[n].commands)
+                               for n in DRIVES)
+            R.check(S, 'both ESCs received zero from the bridge, not just a watchdog stop',
+                    wait_for(received_zeros, 0.7))
+        finally:
+            with rig.lock:
+                rig.ll.status_paused = False
+
+        # Wait for the original ramp, then measure a NEW established window;
+        # never pretend that its real deceleration was a 0.30 m/s plateau.
+        def at_target():
+            controls = [r for r in probe.native_trace.read() if r['event'] == 'wheel_control']
+            return (controls and controls[-1]['allowed'] and abs(controls[-1]['applied_vx']-0.3) < 1e-9
+                    and abs(rig.snapshot()['v']-0.3) < 0.05)
+        recovered = wait_for(at_target, 0.3/acceleration+3.0)
+        R.check(S, 'fresh status recovers the requested speed without a watchdog latch',
+                recovered and not rig.snapshot()['latch'])
+        if not recovered:
+            return
+        ok, detail = wheel_recovery(probe.native_trace.read(), guard_start,
+                                    time.monotonic_ns(), acceleration, 0.3)
+        R.check(S, 'the original stop and acceleration ramp are preserved', ok, detail)
+        t1, s1 = time.monotonic(), rig.snapshot()
+        time.sleep(1.5)
+        s2 = rig.snapshot()
+        mean = forward_speed(s1, s2)
+        odom_v, ground_v, _ = probe.odom_ground_means(rig, t1, 1)
+        events[-1]['recovery_window'] = dict(start=s1, end=s2, plant_mean=mean,
+                                            odom_mean=odom_v, same_window_ground=ground_v)
+        R.check(S, 'post-recovery established speed still meets the original tolerance',
+                abs(mean-0.3) < 0.05, f'plant mean v={mean:.3f} m/s')
+        R.check(S, 'post-recovery odometry matches the same physical window',
+                abs(odom_v-ground_v) < 0.05, f'odom {odom_v:.3f}; same-window ground {ground_v:.3f}')
+    finally:
+        starvation_evidence(probe, rig, R, events)
+        stop_driving(probe, rig)
 
 
 def s20_crash(probe, rig, R, esc, bridge):
@@ -825,9 +1161,14 @@ def s20_crash(probe, rig, R, esc, bridge):
     wait_for(lambda: rig.snapshot()['latch'], 1.5)
     with rig.lock:
         latched = [t for t in rig.ll.latch_events if t >= t0]
-    dt = (latched[0] - t0) if latched else float('nan')
-    R.check(S, 'board latched on the missing heartbeat (~500 ms)', bool(latched) and 450 < dt < 650,
-            f'{dt:.0f} ms')
+        last_heartbeat = rig.ll.last_heartbeat_ms
+    # The watchdog starts at the last heartbeat, not at SIGKILL. The latter
+    # may occur partway through the 500 ms heartbeat period.
+    dt = (latched[0] - last_heartbeat) if latched else float('nan')
+    kill_dt = (latched[0] - t0) if latched else float('nan')
+    R.check(S, 'board latched 500 ms after its last heartbeat',
+            bool(latched) and 500 < dt < 650,
+            f'heartbeat age={dt:.0f} ms; after kill={kill_dt:.0f} ms')
     R.check(S, 'robot physically stopped', wait_for(lambda: abs(rig.snapshot()['v']) < 0.01, 2))
 
 
@@ -842,8 +1183,10 @@ def run_one(esc: str, R: Report, logdir: str, only=None):
     workdir = tempfile.mkdtemp(prefix=f'omsim-{esc}-')
     rig = OpenMowerV1Rig(workdir, esc)
     rig.start()
-    bridge = start_bridge(rig, esc, workdir, os.path.join(logdir, f'bridge-{esc}.log'))
+    bridge_log = os.path.join(logdir, f'bridge-{esc}.log')
+    bridge = start_bridge(rig, esc, workdir, bridge_log)
     probe = Probe()
+    probe.native_trace = NativeTrace(bridge_log + '.native.jsonl')
     ex = MultiThreadedExecutor(num_threads=4)
     ex.add_node(probe)
     spinner = spin_in_background(ex)
@@ -852,18 +1195,18 @@ def run_one(esc: str, R: Report, logdir: str, only=None):
             if only and sc.__name__ not in only:
                 continue
             print(f'-- {esc} / {sc.__name__}', flush=True)
-            try:
-                sc(probe, rig, R, esc)
-            except Exception as exc:  # a crashed scenario is a failure, not an abort
-                R.check(sc.__name__, 'scenario raised', False, f'{exc!r}')
-                traceback.print_exc()
+            if not run_scenario(sc, R, probe, rig, R, esc, fixture=rig):
+                print(f'    remaining {esc} scenarios NOT RUN: {sc.__name__} failed', flush=True)
+                return
             probe.cmd = None
         if not only or 's19b_starved' in only:
             print(f'-- {esc} / s19b_starved', flush=True)
-            s19b_starved(probe, rig, R, esc, bridge)
+            if not run_scenario(s19b_starved, R, probe, rig, R, esc, bridge, fixture=rig):
+                print(f'    {esc} / s20_crash NOT RUN: s19b_starved failed', flush=True)
+                return
         if not only or 's20_crash' in only:
             print(f'-- {esc} / s20_crash', flush=True)
-            s20_crash(probe, rig, R, esc, bridge)
+            run_scenario(s20_crash, R, probe, rig, R, esc, bridge, fixture=rig)
     finally:
         try:
             os.killpg(bridge.pid, signal.SIGKILL)
@@ -939,6 +1282,7 @@ def main():
     args = ap.parse_args()
     rclpy.init()
     R = Report()
+    R.logdir = args.logdir
     try:
         for esc in (['xesc_mini', 'xesc_2040'] if args.esc == 'both' else [args.esc]):
             # the R rows carry the scenario name; prefix with the controller

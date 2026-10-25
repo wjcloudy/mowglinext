@@ -71,6 +71,12 @@ target_link_libraries(openmower_bridge_node
   ${mowgli_interfaces_TARGETS}
 )
 
+# Only the simulation job enables this; image/production builds keep it OFF.
+option(OPENMOWER_SIMULATION_TRACE "Record native simulation observations" OFF)
+if(OPENMOWER_SIMULATION_TRACE)
+  target_compile_definitions(openmower_bridge_node PRIVATE OPENMOWER_SIMULATION_TRACE)
+endif()
+
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
@@ -116,7 +122,8 @@ if(BUILD_TESTING)
       test_imu_bias_estimator
       test_blade_policy
       test_power_semantics
-      test_request_stamps)
+      test_request_stamps
+      test_blade_speed)
     ament_add_gtest(${test_name} test/${test_name}.cpp)
     target_link_libraries(${test_name} mowgli_openmower_bridge_core)
   endforeach()

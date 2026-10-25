@@ -7,6 +7,19 @@
 
 ## Documents added after index generation
 
+- [Garden global costmap](../GARDEN_GLOBAL_COSTMAP.md) — **current**, contributor: fixed
+  global geometry, edit/readiness synchronization, resource budgets, observation clearing
+  and hardware acceptance procedure.
+- [Transit authorization](../TRANSIT_AUTHORIZATION.md) — **current**, operator/contributor:
+  normal transit polygon authorization, bounded terminal legs, explicit recovery,
+  and required physical acceptance procedure.
+  perf/authorized-transit-planning
+- [Transit planner performance](../TRANSIT_PLANNER_PERFORMANCE.md) — **current**, contributor:
+  optimization evidence, reproducible benchmarks and required Pi 4 validation.
+- [Automatic blackbox](../BLACKBOX.md) — **current**, operator/contributor:
+  passive RAM recorder, triggers, Diagnostics controls, resource/storage limits
+  and target-system validation procedure.
+
 - [Nav2 Lyrical controller review](../NAV2_LYRICAL_CONTROLLER_REVIEW.md) — **current**, contributor:
   why FTC stays the coverage controller after the Lyrical migration, what Nav2 1.5.1 actually adds
   (DWPP, TrackingFeedback, AxisGoalChecker, custom_inscribed_radius), what was evaluated and

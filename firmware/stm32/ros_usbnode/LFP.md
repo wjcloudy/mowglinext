@@ -59,7 +59,7 @@ Do not publish LFP binaries under stock release manifest entries; release packag
 and GUI build selection can be proposed separately upstream.
 
 HARDWARE_PENDING for the consolidated targets: use .118/500B LFP, record the exact
-commit, binary SHA256, target/flags and host digest; use a matching protocol 8 host.
+commit, binary SHA256, target/flags and host digest; use a matching protocol 9 host.
 With blades removed, clear rotor/wheels and accessible cutoff, verify IDLE/zero
 motion, progressing ADC/IMU data, healthy tilt, correct temperature and 28.5 V/1.8 A
 charge ceilings. Supervised redocking must cut duty on input loss and restart only
@@ -67,6 +67,45 @@ on fresh stable input. For monitoring builds, require a frozen dump with the cor
 sample provenance and no loss of charging protection. Overnight charging and blade
 reversal require separate field acceptance; earlier images' measurements do not
 qualify these newly built targets.
+
+## Upstream protocol 9 refresh — 2026-10-25
+
+Merged upstream dev `59eb466fb7b866cd677fe8d7f10729083ac8975a`, including
+the odometry acquisition-time correction (#1008) and custom Yardforce500 build /
+ARM64 toolchain correction (#1012). Protocol **9** replaces the 16-bit packet
+interval with a 32-bit encoder acquisition tick; odometry grows from 17 to
+19 bytes. The matching host subtracts timestamps and cumulative encoder counts
+between the same received samples, preserving elapsed time across USB drops.
+Encoder filtering now bounds each source acquisition's movement before USB
+gating and handles plausible counter wraps. IMU timing is unchanged.
+
+The latest fork baseline `7a7768b6` is retained, including its **1350 PWM cap**;
+this refresh does not restore any previous 1380–1395 trial ceiling. The 8S charge
+envelope (28.5 V / 1.8 A), -0.20 A electronics offset, float settings, PC3/channel-13
+temperature selection, bumper overlay, blade reversal, I2C/USB recovery, persisted
+parameters, both ADC paths and optional ABI-2 recorder remain present. Standalone
+Pi autosave and its seven-day / 100 MB routine-telemetry retention are unchanged;
+fault evidence and firmware backups remain outside that cleanup policy.
+
+This updates source/builds only and does not flash .118 or alter its containers.
+Deploy protocol-9 ROS2 and firmware as a matched pair: an older host is incompatible.
+Before a later authorized flash, save existing evidence and stop the Pi saver,
+preserve the F401 parameter sector, then record the new binary/ELF hashes and
+recorder address in a verified deployment manifest before resuming the saver.
+Do not reuse an old address or infer the installed .118 image from this branch.
+
+HARDWARE_PENDING: use .118/500B LFP with this exact merge commit, selected target,
+binary/ELF hashes, recorder symbol/size, board/ESC revisions and matching protocol-9
+host image digest. With blades removed, wheels secured and cutoff accessible,
+pass requires compatible communication, IDLE/zero wheel/blade motion, fresh IMU/ADC,
+preserved charge limits and encoder calibration. Release wheels only for a separate
+supervised clear-space odometry run: compare physical travel with received encoder
+deltas/acquisition times, including a controlled USB telemetry interruption, and
+require no spurious jump or unintended motion after reconnection. Supervise dock
+loss/recovery and at least one day charging: input loss must cut PWM, recovery
+must start from zero after stable input, and charge output/current must stay
+controlled without a latched fault. Save a matching frozen trace before reset if
+it fails. Software tests and older firmware observations do not qualify this image.
 
 ## Blade reversal synchronization
 

@@ -1,58 +1,26 @@
-import { useEffect, useState } from "react";
-import { useApi } from "./useApi.ts";
-import {
-    DEFAULT_HARDWARE_BACKEND,
-    HardwareBackendInfo,
-    normalizeHardwareBackend,
-} from "../constants/hardwareBackends.ts";
+import {useEffect, useState} from 'react';
+import {isJsonObject} from '../utils/json';
+import {useApi} from './useApi';
+import {parseHardwareBackendInfo, unconfirmedHardwareBackend, type HardwareBackendInfo} from '../constants/hardwareBackends';
 
-const FALLBACK: HardwareBackendInfo = { backend: DEFAULT_HARDWARE_BACKEND, defaultOverrides: {}, robotName: "" };
-
-/**
- * The robot's hardware backend. Falls back to "mowgli" (the stock path) while
- * loading or when the backend predates the route, so the page never hides the
- * STM32 settings of a robot that has them.
- */
-export const useHardwareBackend = (): HardwareBackendInfo & { loading: boolean } => {
+export const useHardwareBackend = (): HardwareBackendInfo & {loading: boolean} => {
     const guiApi = useApi();
-    const [info, setInfo] = useState<HardwareBackendInfo>(FALLBACK);
-    const [loading, setLoading] = useState(true);
-
+    const [info, setInfo] = useState<HardwareBackendInfo>(() => unconfirmedHardwareBackend('loading'));
     useEffect(() => {
-        let cancelled = false;
-        void (async () => {
-            try {
-                const res = await guiApi.request({
-                    path: "/settings/hardware-backend",
-                    method: "GET",
-                    format: "json",
-                });
-                if (cancelled || res.error) return;
-                const data = (res.data ?? {}) as {
-                    backend?: unknown;
-                    default_overrides?: unknown;
-                    robot_name?: unknown;
-                };
-                const overrides =
-                    data.default_overrides && typeof data.default_overrides === "object"
-                        ? (data.default_overrides as Record<string, unknown>)
-                        : {};
-                setInfo({
-                    backend: normalizeHardwareBackend(data.backend),
-                    defaultOverrides: overrides,
-                    robotName: typeof data.robot_name === "string" ? data.robot_name.trim() : "",
-                });
-            } catch {
-                /* keep the mowgli fallback */
-            } finally {
-                if (!cancelled) setLoading(false);
-            }
-        })();
-        return () => {
-            cancelled = true;
+        let active = true;
+        const failed = (error: unknown) => {
+            const absent = typeof error === 'object' && error !== null && 'status' in error && (error.status === 404 || error.status === 405);
+            const payload = typeof error === 'object' && error !== null && 'error' in error ? error.error : undefined;
+            const unsupported = isJsonObject(payload) && payload.state === 'unsupported';
+            if (active) setInfo(unconfirmedHardwareBackend(unsupported ? 'unsupported' : absent ? 'legacy_absent' : 'unavailable'));
         };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
-
-    return { ...info, loading };
+        void guiApi.request<unknown>({path: '/settings/hardware-backend', method: 'GET', format: 'json'})
+            .then(response => {
+                if (!active) return;
+                if (response.error || !response.ok) { failed(response); return; }
+                setInfo(parseHardwareBackendInfo(response.data));
+            }).catch(failed);
+        return () => { active = false; };
+    }, [guiApi]);
+    return {...info, loading: info.authority === 'loading'};
 };

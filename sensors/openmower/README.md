@@ -104,6 +104,16 @@ The installer prepares the Pi the way OpenMowerOS does
 On an older kernel (< 6.1.28) OpenMower used `ttyAMA4/2/3` for
 left/right/mow and `ttyAMA1` for the GPS — set the ports accordingly.
 
+### Updates
+
+The host updater manages this backend like the Mowgli board: the installer
+installs it (`bash install/mowglinext.sh --only=updater` adds it to an existing
+install), and each release ships the `openmower` image with the rest of the
+stack. The release's mainboard firmware protocol is the Mowgli STM32 one and is
+not checked here (the bridge reports 0); an update still waits for the mower
+to be idle, stopped and blade-off, with the bridge reaching the LowLevel board
+and both drive xESCs (`firmware_compatible`). See `docs/UPDATES.md`.
+
 ## Settings: shared with every backend, OpenMower defaults
 
 A setting MowgliNext already has keeps its MowgliNext key and its usual place
@@ -153,7 +163,7 @@ hidden on an OpenMower robot.
 
 | Surface | Source |
 |---------|--------|
-| `/hardware_bridge/status` | LowLevel `ll_status` bits (initialized, rain, UI board) + mow ESC telemetry (rpm, current, temperatures). `is_charging` means **on the dock** and comes from the charge-contact voltage (`power_semantics.hpp`), not from status bit 2 (see *Firmware facts* below). `firmware_compatible` is **true only when the LowLevel stream is live and both drive ESCs are connected** — PreFlightCheck refuses to mow otherwise. `firmware_version` names the ESC type and firmware versions. |
+| `/hardware_bridge/status` | LowLevel `ll_status` bits (initialized, rain, UI board) + mow ESC telemetry (rpm, current, temperatures). `mower_motor_rpm` is a speed (≥ 0) on both ESC types, as on the STM32: the xESC mini's signed eRPM is divided by `motor_pole_pairs` and made positive, and the xESC 2040, which reports no speed, gets it from its hall counter (6 steps per electrical revolution, `blade_speed.hpp`). The direction is `blade_requested_direction`. map_server only records mowing progress above 1000 rpm. `is_charging` means **on the dock** and comes from the charge-contact voltage (`power_semantics.hpp`), not from status bit 2 (see *Firmware facts* below). `firmware_compatible` is **true only when the LowLevel stream is live and both drive ESCs are connected** — PreFlightCheck refuses to mow otherwise. `firmware_version` names the ESC type and firmware versions. |
 | `/hardware_bridge/emergency` | LowLevel emergency bitmask (STOP button, lift/tilt, latch) plus the host request; reasons match the STM32 bridge |
 | `/hardware_bridge/power`, `/battery_state` | `v_charge`, `v_system`, `charging_current`, SoC; current is `abs(charge)` while docked, else 0 (docking convention); `Power.charge_current` is also 0 off the dock (the sensor reads ~0.05 A of nothing). `charger_enabled` means ON THE DOCK, as on the STM32 — the behaviour tree reports it as `HighLevelStatus.is_charging`; it is never the charge relay, which v0.13 firmware keeps closed while mowing. The relay shows in `charger_status`: a docked robot whose relay opened (full battery) reads `docked, not charging` / `POWER_SUPPLY_STATUS_NOT_CHARGING` and stays docked. |
 | `/imu/data`, `/imu/mag_raw` | LowLevel `ll_imu`, frame `imu_link`. The at-rest gyro/accel bias is removed by a calibration that is armed on every dock visit and starts once the wheels have been still for 1 s; an attempt aborted by the robot creeping onto the contacts is retried. Off the dock it runs after 15 s at rest if none has completed yet. |
@@ -244,7 +254,7 @@ the LowLevel board and three xESC controllers with the firmware rules above,
 plus a differential-drive plant with deliberately imperfect motors (0.85 m/s
 per unit duty, a deadband, a 120 ms lag) so an open-loop bridge visibly misses
 its target. It drives the bridge over ROS like the stack does and checks what
-the emulated hardware received, timed on the emulator's clock: boot handshake
+the emulated hardware received, with motor receipts timed on the emulator's clock: boot handshake
 and the config the board keeps, closed-loop speed and yaw rate, the
 acceleration limit, cmd_vel / behaviour-tree / LowLevel / controller timeouts,
 stop button, lift and tilt, software e-stop, the release-while-held case, blade
@@ -257,6 +267,42 @@ from the template + OpenMower defaults, exactly as on a robot; a last run
 saves the wiring and a lift delay "from the GUI" while `docker/.env` names the
 wrong ports and controller type, and checks the GUI values win and a 0 ms
 period is refused.
+
+Stop latency is measured from received motor-command history, so a delayed
+service response does not change the result. Odometry and ground motion are
+integrated over the same message-stamp interval. Calibration checks the actual
+start against stationary wheel ticks and pins the 200-sample requirement;
+insufficient IMU delivery remains a separate failure. A failed scenario stops
+dependent scenarios for that controller without resetting its latch. The other
+controller still runs, and the overall result stays failed.
+Ground history uses monotonic time mapped to ROS stamps through independently
+measured clock bounds. A clock-epoch change invalidates the crossing measurement
+and remains a fixture failure.
+
+The simulation build enables `OPENMOWER_SIMULATION_TRACE` to record native
+heartbeat write timestamps, HLS/LowLevel receipts and blade decisions in
+`*.native.jsonl` beside the bridge logs. The 150 ms cadence bound applies to
+completed native UART writes, including a silent tail; Python service gaps
+are reported independently. A status-only LowLevel interruption tests the
+immediate blade inhibit and its qualified recovery, then HLS expiry is measured
+from the actual receipt and zero commands must persist until a new HLS arrives.
+Missing, truncated or replaced native evidence cannot silently pass the test.
+Blade receipts are correlated with the complete successful-write prefix on
+their dedicated ordered UART, including direct emergency/destructor writes
+outside control ticks. A fresh nonzero command still in transit at
+HLS expiry is reported as such, rather than attributed to a later stale
+decision; mismatched or truncated packet histories fail the measurement.
+The 350 ms starvation scenario starts its nominal phase with a new LowLevel
+receipt. A separate phase deliberately ages that status before suspension
+and requires the real guard stop, original acceleration ramp and recovered
+speed with the original tolerance. Requested suspension, observed stopped
+state and native control gap are recorded separately. Blade packets and
+starvation commands/heartbeats/physical history are retained as JSON beside
+the logs, so a lower real speed cannot be explained away by matching odometry.
+Use a fresh log directory for each run. The trace option defaults to OFF and
+is compiled out of production/image builds; it changes no safety thresholds.
+Use a separate simulation workspace and do not deploy its instrumented binary.
+For a previously instrumented CMake cache, explicitly set the option back to OFF.
 
 `sim/run_stack_integration.py` adds the real `mowgli_bringup/launch/mowgli.launch.py`:
 exactly one `/hardware_bridge` with `HARDWARE_BACKEND=openmower`, a command on
@@ -292,6 +338,9 @@ colcon test --packages-select mowgli_openmower_bridge && colcon test-result --ve
 python3 -m pytest sensors/openmower/mowgli_openmower_bridge/test/test_launch_config.py  # launch layering
 
 # simulation (needs the workspace above + mowgli_bringup for the stack check)
+colcon build --packages-select mowgli_openmower_bridge --cmake-args -DOPENMOWER_SIMULATION_TRACE=ON
+source install/setup.bash
+python3 -m unittest discover -s sensors/openmower/sim -p 'test_*.py'  # measurement and native trace regressions
 python3 sensors/openmower/sim/run_simulation.py            # both controller types
 python3 sensors/openmower/sim/run_stack_integration.py
 ```

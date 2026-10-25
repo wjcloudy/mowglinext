@@ -284,6 +284,9 @@ export const enum GnssStatusConstants {
   FIX_TYPE_RTK_FLOAT = 2,
   FIX_TYPE_RTK_FIXED = 3,
   FIX_TYPE_DEAD_RECKONING = 4,
+  FIX_TYPE_2D_FIX = 5,
+  FIX_TYPE_3D_FIX = 6,
+  FIX_TYPE_DGPS = 7,
   RTK_MODE_UNKNOWN = 0,
   RTK_MODE_NONE = 1,
   RTK_MODE_FLOAT = 2,
@@ -405,6 +408,8 @@ export type GnssStatus = {
   correction_source?: string;
   correction_forwarding_source?: string;
   msm_summary_source?: string;
+  source_id?: string;
+  source_incarnation?: string;
 };
 
 export const enum HighLevelStatusConstants {
@@ -430,6 +435,8 @@ export type HighLevelStatus = {
   battery_percent?: number;
   is_charging?: boolean;
   emergency?: boolean;
+  stop_reason?: string;
+  stop_detail?: string;
 };
 
 export type ImuRaw = {

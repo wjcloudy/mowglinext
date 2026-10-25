@@ -56,6 +56,7 @@ target_include_directories(mowgli_map_lib PUBLIC
 )
 
 target_link_libraries(mowgli_map_lib
+  ${visualization_msgs_TARGETS}
   ${rclcpp_TARGETS}
   ${std_msgs_TARGETS}
   ${std_srvs_TARGETS}
@@ -232,6 +233,12 @@ if(BUILD_TESTING)
     ${mowgli_interfaces_TARGETS}
   )
   target_include_directories(test_map_replace PUBLIC ${grid_map_ros_INCLUDE_DIRS})
+
+  ament_add_ros_isolated_gtest(test_corridor_transaction
+    test/test_corridor_transaction.cpp
+    TIMEOUT 120
+  )
+  target_link_libraries(test_corridor_transaction mowgli_map_lib ${CMAKE_DL_LIBS})
 
   ament_add_ros_isolated_gtest(test_mow_progress
     test/test_mow_progress.cpp

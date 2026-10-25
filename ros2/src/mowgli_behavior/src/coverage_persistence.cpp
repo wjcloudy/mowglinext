@@ -15,6 +15,7 @@
 
 #include "mowgli_behavior/coverage_persistence.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -54,6 +55,14 @@ void writeCrossHatch(std::ostream& out, const std::map<uint32_t, CrossHatch>& ar
 
 bool writeSnapshot(const BTContext& ctx, const std::string& contents)
 {
+  const auto failed = [&ctx]()
+  {
+    if (ctx.node)
+      RCLCPP_WARN(ctx.node->get_logger(),
+                  "Coverage checkpoint write failed for '%s'; checkpoint was not saved",
+                  ctx.coverage_resume_path.c_str());
+    return false;
+  };
   // Atomic replace: write a sibling temp file then rename over the target so a
   // reader never sees a half-written file (mirrors persist_dock_pose_yaw).
   const std::string tmp_path = ctx.coverage_resume_path + ".tmp";
@@ -61,18 +70,67 @@ bool writeSnapshot(const BTContext& ctx, const std::string& contents)
     std::ofstream f(tmp_path, std::ios::trunc);
     if (!f)
     {
-      return false;
+      return failed();
     }
     f << contents;
     f.flush();
+    f.close();
     if (!f)
     {
-      return false;
+      return failed();
     }
   }
-  return std::rename(tmp_path.c_str(), ctx.coverage_resume_path.c_str()) == 0;
+  if (std::rename(tmp_path.c_str(), ctx.coverage_resume_path.c_str()) != 0)
+    return failed();
+  return true;
 }
 }  // namespace
+
+bool hasCoverageResumeState(const BTContext& ctx)
+{
+  return !ctx.area_resume_pose_index.empty() || !ctx.area_unit_progress.empty() ||
+         !ctx.completed_areas.empty() ||
+         std::any_of(ctx.area_completed_swaths.begin(),
+                     ctx.area_completed_swaths.end(),
+                     [](const auto& area)
+                     {
+                       return !area.second.empty();
+                     });
+}
+
+RestoredCommandPolicy applyRestoredCommandPolicy(BTContext& ctx)
+{
+  constexpr uint8_t kCommandStart = 1;  // HighLevelControl::Request::COMMAND_START
+  constexpr uint8_t kCommandStop = 8;  // HighLevelControl::Request::COMMAND_STOP
+  RestoredCommandPolicy policy;
+  policy.auto_continue = ctx.current_command == kCommandStart && hasCoverageResumeState(ctx);
+  policy.preserve_stop_hold =
+      ctx.current_command == kCommandStop && ctx.critical_charge_stop_latched;
+  ctx.restored_mow_charge_check_pending = policy.auto_continue;
+  if (!policy.auto_continue && !policy.preserve_stop_hold)
+  {
+    ctx.current_command = 0;  // IDLE — require an explicit operator start
+  }
+  if (!policy.auto_continue && ctx.battery_charge_pending)
+  {
+    ctx.battery_charge_pending = false;
+    ctx.critical_dock_failure_persistence_requested = true;
+    policy.cleared_charge_pending = true;
+  }
+  return policy;
+}
+
+void observeRestoredMowPower(BTContext& ctx, bool charging)
+{
+  if (!ctx.restored_mow_charge_check_pending)
+    return;
+  ctx.restored_mow_charge_check_pending = false;
+  if (charging && ctx.current_command == 1)
+  {
+    ctx.battery_charge_pending = true;
+    ctx.critical_dock_failure_persistence_requested = true;
+  }
+}
 
 bool beginCoverageOrientation(BTContext& ctx, uint32_t area)
 {
@@ -126,6 +184,8 @@ bool saveCoverageResumeState(const BTContext& ctx)
     areas.insert(idx);
   for (const auto& [idx, _] : ctx.area_resume_pose_index)
     areas.insert(idx);
+  for (const auto& [idx, _] : ctx.area_unit_progress)
+    areas.insert(idx);
   for (const auto& [idx, _] : ctx.area_completed_swaths)
     areas.insert(idx);
   for (uint32_t idx : ctx.completed_areas)
@@ -151,6 +211,7 @@ bool saveCoverageResumeState(const BTContext& ctx)
   // the cursors, retaining only cross-hatch metadata when needed.
   out << "current_command " << static_cast<unsigned>(ctx.current_command) << '\n';
   out << "critical_charge_stop_latched " << (ctx.critical_charge_stop_latched ? 1 : 0) << '\n';
+  out << "battery_charge_pending " << (ctx.battery_charge_pending ? 1 : 0) << '\n';
   out << "critical_dock_failure_latched " << (ctx.critical_dock_failure_latched ? 1 : 0) << '\n';
   // Single-area mode (a ~/start_in_area targeted run). Persisted for the same
   // reason as current_command: a restart mid-run auto-re-enters MowingSequence,
@@ -202,6 +263,15 @@ bool saveCoverageResumeState(const BTContext& ctx)
       for (std::size_t s : it->second)
         out << ' ' << s;
     out << '\n';
+  }
+  // Per-unit progress of interrupted units (area unit offset). A separate line type, so a file
+  // without it (older versions) simply loads with no per-unit progress.
+  for (const auto& [idx, units] : ctx.area_unit_progress)
+  {
+    for (const auto& [unit, offset] : units)
+    {
+      out << "unit_progress " << idx << ' ' << unit << ' ' << offset << '\n';
+    }
   }
 
   return writeSnapshot(ctx, out.str());
@@ -280,6 +350,13 @@ bool loadCoverageResumeState(BTContext& ctx)
       if (ls >> v && (v == 0 || v == 1))
         ctx.critical_charge_stop_latched = v != 0;
     }
+    else if (tag == "battery_charge_pending")
+    {
+      // Optional v3 row: older snapshots remain resumable unchanged.
+      int v = 0;
+      if (ls >> v && (v == 0 || v == 1))
+        ctx.battery_charge_pending = v != 0;
+    }
     else if (tag == "critical_dock_failure_latched")
     {
       // Optional in v2 snapshots written before critical docking failures were
@@ -319,6 +396,16 @@ bool loadCoverageResumeState(BTContext& ctx)
       while (ls >> idx)
         ctx.completed_areas.insert(idx);
     }
+    else if (tag == "unit_progress")
+    {
+      uint32_t area;
+      std::size_t unit;
+      std::size_t offset;
+      if (ls >> area >> unit >> offset)
+      {
+        ctx.area_unit_progress[area][unit] = offset;
+      }
+    }
     else if (tag == "area")
     {
       uint32_t idx;
@@ -327,7 +414,8 @@ bool loadCoverageResumeState(BTContext& ctx)
       uint64_t fingerprint;
       int64_t resume;
       std::string completed_tag;
-      if (!(ls >> idx >> id >> pose_count >> fingerprint >> resume >> completed_tag))
+      if (!(ls >> idx >> id >> pose_count >> fingerprint >> resume >> completed_tag) ||
+          completed_tag != "completed")
       {
         continue;  // malformed row — skip, don't abort the whole load
       }

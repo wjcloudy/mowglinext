@@ -39,7 +39,7 @@ func TestUpdaterMutationsRequireSameOriginJSON(t *testing.T) {
 func TestUpdateReadinessRequiresLiveStoppedHardware(t *testing.T) {
 	ros := types.NewMockRosProvider()
 	r := gin.New()
-	UpdaterRoutes(r.Group("/api"), ros)
+	UpdaterRoutes(r.Group("/api"), ros, types.NewMockDBProvider())
 	now := time.Now()
 	stamp := map[string]any{"sec": now.Unix(), "nanosec": now.Nanosecond()}
 	emit := func(topic string, data any) { body, _ := json.Marshal(data); ros.Dispatch(topic, body) }
@@ -142,6 +142,51 @@ func TestUpdateReadinessRequiresLiveStoppedHardware(t *testing.T) {
 	}
 }
 
+// The OpenMower bridge talks to stock firmware and reports protocol 0; there,
+// firmware_compatible (LowLevel + xESCs answering) is the whole firmware
+// verdict. Every other backend still needs the STM32 handshake.
+func TestUpdateReadinessOnOpenMowerNeedsNoMowgliProtocol(t *testing.T) {
+	for _, test := range []struct {
+		backend    string
+		compatible bool
+		want       bool
+	}{
+		{"openmower", true, true},
+		{"openmower", false, false},
+		{"mowgli", true, false},
+		{"", true, false},
+	} {
+		// The GUI container gets no HARDWARE_BACKEND: only docker/.env names it.
+		t.Setenv("HARDWARE_BACKEND", "")
+		envFile := filepath.Join(t.TempDir(), ".env")
+		if err := os.WriteFile(envFile, []byte("HARDWARE_BACKEND="+test.backend+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		db := types.NewMockDBProvider()
+		if err := db.Set("system.mower.runtimeEnvFile", []byte(envFile)); err != nil {
+			t.Fatal(err)
+		}
+		ros := types.NewMockRosProvider()
+		r := gin.New()
+		UpdaterRoutes(r.Group("/api"), ros, db)
+		now := time.Now()
+		stamp := map[string]any{"sec": now.Unix(), "nanosec": now.Nanosecond()}
+		emit := func(topic string, data any) { body, _ := json.Marshal(data); ros.Dispatch(topic, body) }
+		emit("highLevelStatus", map[string]any{"state": 1})
+		emit("wheelOdom", map[string]any{"header": map[string]any{"stamp": stamp}})
+		emit("status", map[string]any{"stamp": stamp, "blade_status_stamp": stamp, "firmware_protocol_version": 0, "firmware_compatible": test.compatible, "mow_enabled": false, "mower_motor_rpm": 0})
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/api/system/update-readiness", nil))
+		var result updater.Readiness
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		if result.Ready != test.want || result.FirmwareProtocol != 0 {
+			t.Fatalf("%q compatible=%v: %+v", test.backend, test.compatible, result)
+		}
+	}
+}
+
 // fakeUpdater serves a minimal /v1/state on a unix socket, like the host updater.
 type fakeUpdater struct {
 	mu        sync.Mutex
@@ -180,7 +225,7 @@ func startFakeUpdater(t *testing.T) *fakeUpdater {
 func TestUpdaterStateIsRevalidatedWithETag(t *testing.T) {
 	fake := startFakeUpdater(t)
 	r := gin.New()
-	UpdaterRoutes(r.Group("/api"), types.NewMockRosProvider())
+	UpdaterRoutes(r.Group("/api"), types.NewMockRosProvider(), types.NewMockDBProvider())
 	get := func(inm string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("GET", "/api/system/updater/state", nil)
 		if inm != "" {
@@ -226,7 +271,7 @@ func TestUpdaterStateErrorsAreNotCachedOrRevalidated(t *testing.T) {
 	fake := startFakeUpdater(t)
 	fake.status = 409
 	r := gin.New()
-	UpdaterRoutes(r.Group("/api"), types.NewMockRosProvider())
+	UpdaterRoutes(r.Group("/api"), types.NewMockRosProvider(), types.NewMockDBProvider())
 	req := httptest.NewRequest("GET", "/api/system/updater/state", nil)
 	req.Header.Set("If-None-Match", "*")
 	w := httptest.NewRecorder()

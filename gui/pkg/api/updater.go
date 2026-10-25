@@ -86,7 +86,7 @@ func updaterETagMatches(header, etag string) bool {
 // @Failure 409 {object} ErrorResponse
 // @Failure 503 {object} ErrorResponse
 // @Router /system/updater/{operation} [post]
-func UpdaterRoutes(r *gin.RouterGroup, ros types.IRosProvider) {
+func UpdaterRoutes(r *gin.RouterGroup, ros types.IRosProvider, db types.IDBProvider) {
 	socket := os.Getenv("MOWGLI_UPDATER_SOCKET")
 	if socket == "" {
 		socket = "/run/mowgli-updater/updater.sock"
@@ -239,7 +239,7 @@ func UpdaterRoutes(r *gin.RouterGroup, ros types.IRosProvider) {
 			// A protocol-first upgrade can leave the old ROS bridge incompatible.
 			// This verdict proves only safe maintenance entry from live telemetry;
 			// it must never authorize motion or release the maintenance gate.
-			result.MaintenanceReady = status.FirmwareProtocolVersion > 0
+			result.MaintenanceReady = status.FirmwareProtocolVersion > 0 || !firmwareProtocolApplies(db)
 			result.Ready = result.MaintenanceReady && status.FirmwareCompatible
 			if !result.Ready {
 				result.Reason = "Firmware communication is incompatible"
@@ -252,6 +252,17 @@ func UpdaterRoutes(r *gin.RouterGroup, ros types.IRosProvider) {
 		c.JSON(200, result)
 	})
 }
+
+// firmwareProtocolApplies is false on the OpenMower backend: its bridge talks
+// to the stock LowLevel and xESC firmware, so it reports protocol 0, and
+// firmware_compatible alone says it reaches the boards. Read from docker/.env
+// like every other backend switch: the GUI container is not given
+// HARDWARE_BACKEND (only the ROS containers are), so its process environment
+// always said "mowgli" and OpenMower robots were refused every update.
+func firmwareProtocolApplies(db types.IDBProvider) bool {
+	return activeHardwareBackendForDB(db) != "openmower"
+}
+
 func updateSampleFresh(stamp, now time.Time) bool {
 	return !stamp.IsZero() && now.Sub(stamp) < 3*time.Second && now.Sub(stamp) > -time.Second
 }
